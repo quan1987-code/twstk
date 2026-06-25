@@ -1,0 +1,53 @@
+name: daily-screener
+
+on:
+  schedule:
+    - cron: '30 9 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Restore price DB
+        uses: actions/cache/restore@v4
+        with:
+          path: twstock.db
+          key: twstockdb-${{ github.run_id }}
+          restore-keys: twstockdb-
+      - name: Run screener
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python tw_volume_breakout_screener_v2.py
+      - name: Build site
+        run: python build_site.py
+      - name: Save price DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: twstock.db
+          key: twstockdb-${{ github.run_id }}
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
