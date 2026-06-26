@@ -167,21 +167,31 @@ def fetch_tpex_daily(sess):
     return pd.DataFrame(rows)
 
 
-def get_today_snapshot(sess):
-    """抓上市+上櫃當日，過濾普通股，回傳 (price_df, info_df)。"""
-    twse = fetch_twse_daily(sess)
-    tpex = fetch_tpex_daily(sess)
-    snap = pd.concat([twse, tpex], ignore_index=True)
-    snap = snap[snap["stock_id"].map(is_common_stock)].copy()
-    snap = snap.dropna(subset=["date", "close"])
-    snap = snap[snap["close"] > 0]
-    info = snap[["stock_id", "name", "market"]].drop_duplicates("stock_id")
-    price = snap[["stock_id", "date", "open", "high", "low", "close", "volume", "amount"]]
-    twse_n = (twse["stock_id"].map(is_common_stock)).sum()
-    tpex_n = (tpex["stock_id"].map(is_common_stock)).sum()
-    d0 = snap["date"].max()
-    print(f"當日快照：上市 {twse_n} 檔 / 上櫃 {tpex_n} 檔（最新日期 {d0}）")
-    return price, info
+def get_today_snapshot(sess, retries=3):
+    """抓上市+上櫃當日，過濾普通股，回傳 (price_df, info_df)。失敗會自動重試。"""
+    last = None
+    for k in range(retries):
+        try:
+            twse = fetch_twse_daily(sess)
+            tpex = fetch_tpex_daily(sess)
+            snap = pd.concat([twse, tpex], ignore_index=True)
+            snap = snap[snap["stock_id"].map(is_common_stock)].copy()
+            snap = snap.dropna(subset=["date", "close"])
+            snap = snap[snap["close"] > 0]
+            if snap.empty:
+                raise RuntimeError("官方 API 回傳空資料")
+            info = snap[["stock_id", "name", "market"]].drop_duplicates("stock_id")
+            price = snap[["stock_id", "date", "open", "high", "low", "close", "volume", "amount"]]
+            twse_n = int((twse["stock_id"].map(is_common_stock)).sum())
+            tpex_n = int((tpex["stock_id"].map(is_common_stock)).sum())
+            print(f"當日快照：上市 {twse_n} 檔 / 上櫃 {tpex_n} 檔（最新日期 {snap['date'].max()}）")
+            return price, info
+        except Exception as e:
+            last = e
+            print(f"  抓當日資料第 {k + 1}/{retries} 次失敗：{e}")
+            if k < retries - 1:
+                time.sleep(10)
+    raise last
 
 
 # ============================================================
@@ -403,6 +413,19 @@ def output(sel, newest):
     print("\n提醒：機械式初篩，進場前仍需看籌碼(三大法人/主力)、消息面與基本面。")
 
 
+def write_empty_csv(newest=None):
+    """無入選或抓不到當日資料時，仍輸出一份只有表頭的 CSV，
+    確保看板程式一定找得到檔案，整條流程不會中斷。"""
+    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    dstr = (pd.to_datetime(newest).strftime("%Y%m%d") if newest is not None
+            else dt.date.today().strftime("%Y%m%d"))
+    cols = ["代號", "名稱", "市場", "資料日", "收盤", "漲跌%", "成交量(張)", "月均量(張)",
+            "量比", "5日量/月量", "季線乖離%", "評分", "強度標記"]
+    path = os.path.join(CONFIG["OUTPUT_DIR"], f"breakout_{dstr}.csv")
+    pd.DataFrame(columns=cols).to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"已輸出空清單：{path}")
+
+
 # ============================================================
 #  主程式
 # ============================================================
@@ -417,34 +440,37 @@ def main():
     con = init_db(CONFIG["DB_PATH"])
     sess = _session()
 
-    # 1) 抓當日全市場（官方免費）→ 取得 universe 並寫入 DB
-    if args.skip_update:
-        info = pd.read_sql("SELECT * FROM stock", con)
-        universe = set(info["stock_id"])
-    else:
+    # 1) 抓當日全市場（官方免費）→ 寫入 DB。抓失敗不中止，改用資料庫既有資料選股。
+    snap_ids = set()
+    if not args.skip_update:
         try:
             price, info = get_today_snapshot(sess)
+            upsert_price(con, price)
+            upsert_info(con, info)
+            snap_ids = set(info["stock_id"])
         except Exception as e:
-            print(f"抓當日資料失敗：{e}\n（官方站偶有維護/改版，請稍後再試或回報此訊息）"); return
-        upsert_price(con, price)
-        upsert_info(con, info)
-        universe = set(info["stock_id"])
+            print(f"抓當日資料失敗：{e}\n→ 改用資料庫既有最新資料選股（不影響整體流程）。")
+
+    # 標的清單：資料庫 ∪ 當日快照（首次執行資料庫為空，靠快照）
+    info_all = pd.read_sql("SELECT * FROM stock", con)
+    universe = set(info_all["stock_id"]) | snap_ids
+    if not universe:
+        print("無可用標的（首次執行卻抓不到當日資料）。請稍後重新執行。")
+        write_empty_csv(); con.close(); return
+    info_map = {r.stock_id: (r.name, r.market) for r in info_all.itertuples()}
 
     # 2) 一次性歷史回補（FinMind 免費逐檔）
     run_backfill(con, CONFIG["FINMIND_TOKEN"], universe, args)
 
-    # 3) 載入歷史、計算、選股、輸出
-    info_all = pd.read_sql("SELECT * FROM stock", con)
-    info_map = {r.stock_id: (r.name, r.market) for r in info_all.itertuples()}
-    universe = set(info_all["stock_id"])
+    # 3) 載入歷史、計算、選股、輸出（無論有無入選都輸出 CSV）
     hist = load_history(con, universe)
     if hist.empty:
-        print("DB 無歷史資料，請先完成回補。"); con.close(); return
+        print("DB 無歷史資料，請先完成回補。"); write_empty_csv(); con.close(); return
 
     sel, newest = screen(hist, PARAMS, info_map)
     if sel.empty:
-        print(f"\n{pd.to_datetime(newest).date()} 無符合條件之標的"
-              f"（可調寬 VOL_MULT / MAX_BIAS60，或確認回補是否完成）。")
+        print(f"\n{pd.to_datetime(newest).date()} 無符合條件之標的，輸出空清單。")
+        write_empty_csv(newest)
     else:
         output(sel, newest)
     con.close()

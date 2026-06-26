@@ -73,18 +73,24 @@ def build_html(results, history, date, count, db_ok, gentime):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
+    gentime = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
     if not path or not os.path.exists(path):
-        print("找不到 CSV（output\\breakout_*.csv）。請先執行選股程式。")
-        sys.exit(1)
+        print("找不到 CSV（output\\breakout_*.csv），產生佔位頁面（不中斷流程）。")
+        os.makedirs(OUT_DIR, exist_ok=True)
+        with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
+            f.write(build_html([], {}, "", 0, False, gentime))
+        with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"name": "爆量起漲選股", "short_name": "爆量起漲", "display": "standalone",
+                       "orientation": "portrait", "background_color": "#0a0f1a",
+                       "theme_color": "#0a0f1a", "start_url": "."}, f, ensure_ascii=False)
+        return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
     results = df.to_dict(orient="records")
     if not results:
-        # 沒有入選也要產生頁面，避免 Pages 壞掉
         results = []
     date = results[0].get("資料日", "") if results else ""
     ids = [r.get("代號", "") for r in results if r.get("代號")]
     history, db_ok = load_history(ids, DB_PATH)
-    gentime = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
