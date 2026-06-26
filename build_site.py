@@ -29,12 +29,14 @@ except Exception:
 
 DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
+TRUST_CHART_BARS = 320   # 投信候選嵌入較短歷史以控制檔案大小
 OUT_DIR = "site"
 
 # 首頁三標的：(代碼, yfinance符號, 顯示名, 數值型態 'index'整數 / 'price'兩位小數)
 MARKET_TARGETS = [
     ("TWII", "^TWII", "台股加權指數", "index"),
     ("SOX",  "^SOX",  "費城半導體 SOX", "index"),
+    ("KOSPI", "^KS11", "韓國 KOSPI", "index"),
     ("TSMC", "2330.TW", "台積電 2330", "price"),
 ]
 
@@ -60,7 +62,7 @@ def load_trust():
         return {}
 
 
-def load_history(stock_ids, db_path):
+def load_history(stock_ids, db_path, limit=LOOKBACK_BARS):
     hist = {}
     if not os.path.exists(db_path):
         return hist, False
@@ -69,7 +71,7 @@ def load_history(stock_ids, db_path):
         try:
             rows = con.execute(
                 "SELECT date,open,high,low,close,volume FROM price "
-                "WHERE stock_id=? ORDER BY date DESC LIMIT ?", (sid, LOOKBACK_BARS)).fetchall()
+                "WHERE stock_id=? ORDER BY date DESC LIMIT ?", (sid, limit)).fetchall()
         except sqlite3.Error:
             rows = []
         rows = rows[::-1]
@@ -199,6 +201,13 @@ def main():
     date = results[0].get("資料日", "") if results else ""
     ids = [r.get("代號", "") for r in results if r.get("代號")]
     history, db_ok = load_history(ids, DB_PATH)
+    # 投信候選也嵌入歷史（較短），讓投信頁名稱可點開 K 線
+    tdata = trust.get("data", {}) if isinstance(trust, dict) else {}
+    tsids = [s for s in tdata.keys() if s and s not in history]
+    if tsids:
+        th, tok = load_history(tsids, DB_PATH, limit=TRUST_CHART_BARS)
+        history.update(th)
+        db_ok = db_ok or tok
     write_page(results, history, market, trust, date, db_ok, gentime)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
     print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)} 檔・投信候選 {tcount} 檔・資料日 {date}・更新 {gentime}）")
@@ -292,6 +301,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .thrlbl{font-size:12px; color:var(--dim); margin-right:2px;}
   .thrbtn{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:7px 13px; font-size:13px; cursor:pointer; font-weight:700;}
   .thrbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  .zone{display:inline-block; padding:2px 7px; border-radius:6px; font-size:11px; font-weight:700; border:1px solid; white-space:nowrap;}
+  .z-value{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.45);}
+  .z-upper{background:var(--blue-s); color:var(--blue); border-color:rgba(77,159,255,.3);}
+  .z-above{background:rgba(94,111,134,.14); color:var(--muted); border-color:rgba(94,111,134,.3);}
+  .z-below{background:rgba(94,111,134,.1); color:var(--dim); border-color:rgba(94,111,134,.25);}
+  .zpos{font-size:10px; color:var(--dim); margin-left:5px;}
   .hint{font-size:11px; color:var(--dim); width:100%;}
   .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:12px; background:var(--card);}
   table{width:100%; border-collapse:collapse; font-size:13px; min-width:860px;}
@@ -344,7 +359,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   </header>
 
   <div class="tabbar">
-    <button class="tab on" data-tab="home">首頁回撤</button>
+    <button class="tab on" data-tab="home">指數回撤</button>
     <button class="tab" data-tab="screen">爆量起漲</button>
     <button class="tab" data-tab="trust">投信連買</button>
   </div>
@@ -371,6 +386,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         <div><b>5日量/月量</b>：最近 5 日均量 ÷ 月均量。&gt;1 代表近期量能持續放大，不是只爆一天。</div>
         <div><b>季線乖離%</b>：收盤距 60 日均線（季線）的距離。數字太大代表短線漲多、追高風險高（本表上限約 30%）。</div>
         <div><b>評分</b>：綜合爆量強度、量能持續、突破季高、均線多頭排列等的 0–100 分，僅供「排序」參考，非買賣建議。</div>
+        <div><b>爆量月位階</b>：先找歷史上「成交量最大的那個月份」，取該月 K 的最高、最低價。看現價落在這區間的位置：<b style="color:var(--amber)">近爆量低★</b>＝現價在該月中價~低價之間（最貼近大量低點、相對有買進價值）；<b style="color:var(--blue)">爆量月上半</b>＝中價~高價之間；月量高之上＝已突破該月高點；破爆量低＝已跌破該月低點。百分比＝位置(0%＝月低、100%＝月高)。可點此欄由小到大排序，把最接近大量低點的排在前面。</div>
         <div><b>強度標記</b>：符合的偏多條件標籤，如 突破季高、月線翻揚、站上季線、季線翻揚、多頭排列、站上年線。</div>
         <div style="color:var(--dim)">本表為機械式初篩，進場前仍需看籌碼（三大法人／主力）、消息面與基本面。</div>
       </div>
@@ -408,7 +424,8 @@ TEMPLATE = r"""<!DOCTYPE html>
         <div><b>距高點%</b>：連買最高價 ÷ 現價 −1。越大＝離投信買的高點越遠、潛在補漲空間越大。</div>
         <div><b>連買漲幅%</b>：連買期間股價漲跌幅。越小＝越「還沒發動」。</div>
         <div><b>仍在買</b>：投信連買是否延續到最新一天（是＝籌碼仍有支撐）。</div>
-        <div><b>評分</b>：以「投信主導性(佔比)」為核心，加吃貨強度、補漲空間、貼近投信成本；已大漲者扣分。<b>僅供排序，非投資建議</b>。</div>
+        <div><b>賣回%</b>：連買結束後投信又賣回了多少（佔累計買超）。<b>≥60% 直接從清單剔除</b>（視為投信已落跑）；數字越低越好，0% 最佳。</div>
+        <div><b>評分</b>：以「投信主導性(佔比)」為核心，加吃貨強度、補漲空間、貼近投信成本；已大漲或被部分賣回者扣分。<b>僅供排序，非投資建議</b>。</div>
         <div style="color:var(--dim)">註：投信買賣超為盤後資料，通常較股價晚約一個交易日；目前涵蓋上市，上櫃稍後補上。</div>
       </div>
     </details>
@@ -452,10 +469,11 @@ document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
 
 /* ---------- 首頁：市場回撤卡 ---------- */
 function renderDD(){
-  const order=["TWII","SOX","TSMC"];
+  const order=["TWII","SOX","KOSPI","TSMC"];
+  const nm={TWII:"台股加權指數",SOX:"費城半導體 SOX",KOSPI:"韓國 KOSPI",TSMC:"台積電 2330"};
   document.getElementById("ddcards").innerHTML=order.map(k=>{
     const m=MARKET?MARKET[k]:null;
-    if(!m) return `<div class="ddcard"><div class="ddname">${k==="TWII"?"台股加權指數":k==="SOX"?"費城半導體 SOX":"台積電 2330"}</div><div class="ddna">資料暫時無法取得</div></div>`;
+    if(!m) return `<div class="ddcard"><div class="ddname">${nm[k]||k}</div><div class="ddna">資料暫時無法取得</div></div>`;
     const fmt=(v)=> m.kind==="price" ? v.toFixed(2) : Math.round(v).toLocaleString();
     const ddAbs=Math.abs(m.dd).toFixed(2);
     const flat=Math.abs(m.dd)<0.05;
@@ -473,6 +491,25 @@ function renderDD(){
 
 /* ---------- 投信連買：依門檻即時運算 + 強弱排序 ---------- */
 let trustThr = 50;
+let trustSort = {key:"評分", asc:false};
+const SELL_BACK_FRAC = 0.6;   // 連買後若被賣回 ≥ 此比例的累計買超 → 視為投信已落跑，排除
+const TCOLS = [
+  ["代號","l",        r=>r.sid],
+  ["名稱","l",        r=>r.name],
+  ["市場","",         r=>r.market],
+  ["連買(天)","",     r=>r.days],
+  ["投信買超佔比","", r=>r.dominance],
+  ["連買累計(張)","", r=>r.total],
+  ["現價","",         r=>r.lastClose],
+  ["投信成本","",     r=>r.cost],
+  ["距成本%","",      r=>r.costBias],
+  ["連買最高","",     r=>r.hi],
+  ["距高點%","",      r=>r.gapHigh],
+  ["連買漲幅%","",    r=>r.streakRet],
+  ["賣回%","",        r=>r.soldBack],
+  ["仍在買","",       r=>r.stillBuying?1:0],
+  ["評分","",         r=>r.score],
+];
 function computeTrustRows(thr){
   const data = (TRUST && TRUST.data) ? TRUST.data : {};
   const minStreak = (TRUST && TRUST.min_streak) ? TRUST.min_streak : 3;
@@ -496,6 +533,10 @@ function computeTrustRows(thr){
     const base = a>0 ? s[a-1][2] : s[a][2];
     const streakRet = base>0 ? (s[b][2]/base - 1) : 0;
     if(!(lastClose <= hi || lastClose < cost)) continue;
+    // ③ 連買後被賣回多少（投信是否已落跑）
+    let postNet=0; for(let k=b+1;k<s.length;k++) postNet+=s[k][1];
+    const soldBack = total>0 ? Math.max(0, -postNet)/total : 0;   // 賣回佔累計買超比例
+    if(soldBack >= SELL_BACK_FRAC) continue;                       // 同等/接近量賣回 → 排除
     const dominance = vol>0 ? total/vol : 0;
     const gapHigh = lastClose>0 ? (hi/lastClose - 1) : 0;
     const costBias = cost>0 ? (lastClose/cost - 1) : 0;
@@ -508,31 +549,43 @@ function computeTrustRows(thr){
     let score = 100*(0.35*sc_dom + 0.20*sc_acc + 0.25*sc_lag + 0.20*sc_cost);
     if(stillBuying) score += 5;
     if(streakRet > 0.20) score -= 10;
+    score -= soldBack*15;                                          // 有被部分賣回 → 扣分
     score = Math.max(0, Math.min(100, score));
-    rows.push({sid, name:o.name, market:o.market, days, dominance, total, lastClose, cost, costBias, hi, gapHigh, streakRet, stillBuying, score});
+    rows.push({sid, name:o.name, market:o.market, days, dominance, total, lastClose, cost, costBias, hi, gapHigh, streakRet, soldBack, stillBuying, score});
   }
-  rows.sort((x,y)=>y.score-x.score);
+  // ② 依目前選擇的欄位排序
+  const acc = (TCOLS.find(c=>c[0]===trustSort.key)||TCOLS[TCOLS.length-1])[2];
+  rows.sort((x,y)=>{
+    const xv=acc(x), yv=acc(y);
+    if(typeof xv==="string"||typeof yv==="string"){
+      const r=String(xv).localeCompare(String(yv)); return trustSort.asc?r:-r;
+    }
+    return trustSort.asc ? xv-yv : yv-xv;
+  });
   return rows;
 }
 function renderTrust(){
   document.getElementById("trustdate").textContent = (TRUST && TRUST.date) ? TRUST.date : "—";
-  const cols=["代號","名稱","市場","連買(天)","投信買超佔比","連買累計(張)","現價","投信成本","距成本%","連買最高","距高點%","連買漲幅%","仍在買","評分"];
-  document.getElementById("trusthead").innerHTML = cols.map((c,i)=>`<th class="${i<2?'l':''}">${c}</th>`).join("");
+  const head=document.getElementById("trusthead");
+  head.innerHTML = TCOLS.map(([n,c])=>{const ar=trustSort.key===n?`<span class="ar">${trustSort.asc?"▲":"▼"}</span>`:""; return `<th class="${c}" data-tk="${n}">${n}${ar}</th>`;}).join("");
+  head.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.tk; if(trustSort.key===k)trustSort.asc=!trustSort.asc; else {trustSort.key=k; trustSort.asc=false;} renderTrust();});
   const tb=document.getElementById("trustbody");
+  const nc=TCOLS.length;
   if(!TRUST || !TRUST.data || !Object.keys(TRUST.data).length){
-    tb.innerHTML=`<tr><td colspan="14" style="text-align:center;color:var(--dim);padding:36px">投信資料準備中（下次自動更新後出現）</td></tr>`; return;
+    tb.innerHTML=`<tr><td colspan="${nc}" style="text-align:center;color:var(--dim);padding:36px">投信資料準備中（下次自動更新後出現）</td></tr>`; return;
   }
   const rows = computeTrustRows(trustThr);
   if(!rows.length){
-    tb.innerHTML=`<tr><td colspan="14" style="text-align:center;color:var(--dim);padding:36px">此門檻下沒有符合「投信連買 ≥3 日且尚未漲上去」的個股<br>可試試降低每日張數門檻</td></tr>`; return;
+    tb.innerHTML=`<tr><td colspan="${nc}" style="text-align:center;color:var(--dim);padding:36px">此門檻下沒有符合「投信連買 ≥3 日且尚未漲上去、且未被賣回」的個股<br>可試試降低每日張數門檻</td></tr>`; return;
   }
   const pct=(v)=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
   tb.innerHTML = rows.map(r=>{
     const domc = r.dominance>=0.25?"var(--amber)":r.dominance>=0.12?"#d98818":"var(--text)";
     const costc = r.costBias<=0?"var(--down)":"var(--up)";
+    const sbc = r.soldBack>=0.3?"var(--amber)":"var(--dim)";
     const scC = r.score>=70?"var(--up)":r.score>=45?"var(--amber)":"var(--dim)";
     const mkt = r.market==="上市"?"twse":"tpex";
-    const has = (HISTORY&&HISTORY[r.sid])?`onclick="openChart('${r.sid}')"`:'';
+    const has = (HISTORY&&HISTORY[r.sid])?`onclick="openChart('${r.sid}')"`:'title="無歷史資料"';
     return `<tr>
       <td class="l"><span class="code">${r.sid}</span></td>
       <td class="l"><span class="nm" ${has}>${r.name||""}</span></td>
@@ -546,6 +599,7 @@ function renderTrust(){
       <td class="num" style="color:var(--muted)">${r.hi.toFixed(2)}</td>
       <td class="num" style="color:var(--amber)">${pct(r.gapHigh)}</td>
       <td class="num">${pct(r.streakRet)}</td>
+      <td class="num" style="color:${sbc}">${(r.soldBack*100).toFixed(0)}%</td>
       <td class="num">${r.stillBuying?'<span style="color:var(--up)">是</span>':'<span style="color:var(--dim)">—</span>'}</td>
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(r.score,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r.score.toFixed(0)}</span></span></td>
     </tr>`;
@@ -566,7 +620,7 @@ const TAGS = {
   "站上年線":["rgba(255,99,132,.12)","#ff9aa8","rgba(255,99,132,.3)"],
 };
 const COLS = [["代號","l"],["名稱","l"],["市場",""],["收盤",""],["漲跌%",""],
-  ["成交量(張)",""],["月均量(張)",""],["量比",""],["5日量/月量",""],["季線乖離%",""],["評分",""],["強度標記","l"]];
+  ["成交量(張)",""],["月均量(張)",""],["量比",""],["5日量/月量",""],["季線乖離%",""],["評分",""],["爆量月位階",""],["強度標記","l"]];
 const num = v => { if(v==null||v==="") return null; const n=parseFloat(String(v).replace(/,/g,"")); return isNaN(n)?null:n; };
 const fmtInt = v => { const n=num(v); return n==null?"":n.toLocaleString(); };
 let state = { sort:"評分", asc:false, mkt:"全部", q:"" };
@@ -595,7 +649,7 @@ function renderBars(d){
 }
 function renderHead(){
   document.getElementById("thead").innerHTML=COLS.map(([n,c])=>{const ar=state.sort===n?`<span class="ar">${state.asc?"▲":"▼"}</span>`:""; return `<th class="${c}" data-k="${n}">${n}${ar}</th>`;}).join("");
-  document.querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k; if(state.sort===k)state.asc=!state.asc; else {state.sort=k;state.asc=false;} render();});
+  document.querySelectorAll("#thead th").forEach(th=>th.onclick=()=>{const k=th.dataset.k; if(state.sort===k)state.asc=!state.asc; else {state.sort=k;state.asc=false;} render();});
 }
 function renderTable(d){
   document.getElementById("tbody").innerHTML=d.map(r=>{
@@ -612,8 +666,9 @@ function renderTable(d){
       <td class="num"><span class="vr" style="color:${vc}">${r["量比"]}x</span></td><td class="num">${r["5日量/月量"]}</td>
       <td class="num">${r["季線乖離%"]}%</td>
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(sv,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r["評分"]}</span></span></td>
+      <td class="num">${(()=>{const z=r["_zone"]; return z?`<span class="zone ${z.cls}">${z.label}</span><span class="zpos">${Math.round(z.pos*100)}%</span>`:'<span style="color:var(--dim)">—</span>';})()}</td>
       <td class="tags">${tags}</td></tr>`;
-  }).join("")||`<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
+  }).join("")||`<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
 }
 function render(){const d=view(); renderCards(d); renderBars(d); renderHead(); renderTable(d);
   document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔`;}
@@ -649,10 +704,17 @@ function computeInd(bars){
 function openChart(sid){
   const daily=HISTORY[sid]; if(!daily) return;
   const r=RESULTS.find(x=>x["代號"]===sid)||{};
+  const td=(TRUST&&TRUST.data&&TRUST.data[sid])||null;
+  const name=r["名稱"]||(td?td.name:"")||"";
   CH.sid=sid; CH.offset=0; CH.hover=null;
-  document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=r["名稱"]||"";
+  document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
   const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
-  document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]||""} (${chg>0?"+":""}${r["漲跌%"]||"0"}%)</span>`;
+  if(r["收盤"]!=null && r["漲跌%"]!=null){
+    document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
+  } else {
+    const lc=daily[daily.length-1][4];
+    document.getElementById("cvChg").innerHTML=`<span style="color:var(--muted)">${lc!=null?lc.toFixed(2):""}</span>`;
+  }
   document.querySelectorAll(".pbtn").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
   setPeriod("D"); document.getElementById("cv").classList.add("open");
 }
@@ -737,6 +799,26 @@ canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDef
 canvas.addEventListener("touchend",e=>{ if(e.touches.length===0)pinch=null; },{passive:false});
 window.addEventListener("resize",()=>{ if(document.getElementById("cv").classList.contains("open"))drawChart(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
+
+/* ⑨ 爆量月價值區間：找成交量最大的月份，看現價落在該月 K 高低區間的位置 */
+function volMonthZone(sid){
+  const daily = HISTORY && HISTORY[sid];
+  if(!daily || daily.length < 20) return null;
+  const m = aggregate(daily, "M");
+  if(m.length < 2) return null;
+  let mx = m[0]; for(const b of m) if(b.v > mx.v) mx = b;
+  const H = mx.h, L = mx.l, MID = (H+L)/2;
+  if(!(H > L)) return null;
+  const P = daily[daily.length-1][4];          // 最新收盤
+  const pos = (P - L)/(H - L);                  // 0=月低, 1=月高
+  let label, cls;
+  if(P > H){ label="月量高之上"; cls="z-above"; }
+  else if(P >= L && P <= MID){ label="近爆量低★"; cls="z-value"; }   // 中價~低價＝價值區
+  else if(P >= MID){ label="爆量月上半"; cls="z-upper"; }
+  else { label="破爆量低"; cls="z-below"; }     // P < L
+  return {H, L, MID, P, pos, label, cls, month:mx.d.slice(0,7)};
+}
+(RESULTS||[]).forEach(r=>{ const z=volMonthZone(r["代號"]); r["_zone"]=z; r["爆量月位階"]= z? Math.round(z.pos*100) : null; });
 
 renderDD();
 renderTrust();
