@@ -31,6 +31,7 @@
 
 import os
 import re
+import json
 import time
 import sqlite3
 import argparse
@@ -413,6 +414,125 @@ def output(sel, newest):
     print("\n提醒：機械式初篩，進場前仍需看籌碼(三大法人/主力)、消息面與基本面。")
 
 
+# ============================================================
+#  投信買賣超（籌碼）：上市 = 證交所 T86（全市場，每日一次）
+# ============================================================
+T86_URL = "https://www.twse.com.tw/fund/T86"
+TRUST_LOOKBACK = 30      # 觀察最近幾個交易日
+TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
+TRUST_MIN_STREAK = 3     # 連續買超天數門檻
+
+
+def fetch_twse_t86(sess, ymd):
+    """抓某日(YYYYMMDD)上市三大法人買賣超，回傳 [(stock_id, date_iso, 投信淨買張), ...]。"""
+    url = f"{T86_URL}?response=json&date={ymd}&selectType=ALL"
+    r = sess.get(url, timeout=CONFIG["HTTP_TIMEOUT"])
+    r.raise_for_status()
+    j = r.json()
+    if "tables" in j and j["tables"]:
+        tbl = j["tables"][0]
+        fields, data = tbl.get("fields", []), tbl.get("data", [])
+    else:
+        fields, data = j.get("fields", []), j.get("data", [])
+    if not fields or not data:
+        return []
+    try:
+        ic = fields.index("證券代號")
+        it = fields.index("投信買賣超股數")
+    except ValueError:
+        return []
+    iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    out = []
+    for row in data:
+        code = str(row[ic]).strip()
+        if not is_common_stock(code):
+            continue
+        net = to_float(row[it])
+        out.append((code, iso, round((0.0 if net != net else net) / 1000.0, 1)))
+    return out
+
+
+def update_inst(con, sess):
+    """把最近 TRUST_LOOKBACK 個交易日、尚未抓過的『投信買賣超』補進 inst 表（每日通常只差1天）。"""
+    con.execute("CREATE TABLE IF NOT EXISTS inst("
+                "stock_id TEXT, date TEXT, trust_lots REAL, PRIMARY KEY(stock_id,date))")
+    con.commit()
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (TRUST_LOOKBACK,))]
+    have = set(r[0] for r in con.execute("SELECT DISTINCT date FROM inst"))
+    todo = [d for d in dates if d not in have]
+    if not todo:
+        print("投信買賣超：已是最新。")
+        return
+    print(f"更新投信買賣超：需抓 {len(todo)} 個交易日…")
+    n = 0
+    for d in sorted(todo):
+        try:
+            rows = fetch_twse_t86(sess, d.replace("-", ""))
+        except Exception as e:
+            print(f"  T86 {d} 失敗：{e}")
+            continue
+        if rows:
+            con.executemany("INSERT OR IGNORE INTO inst VALUES (?,?,?)", rows)
+            con.commit()
+            n += 1
+        time.sleep(1.2)
+    print(f"投信買賣超更新完成：新增 {n} 個交易日。")
+
+
+def build_trust_candidates(con):
+    """挑出『最近一個月內、投信曾連續≥3日淨買≥基準門檻』的個股，
+    並附上其近一個月每日 [日期, 投信淨買張, 收盤, 最高, 成交張]，供網頁端依門檻即時運算與排序。"""
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM inst ORDER BY date DESC LIMIT ?", (TRUST_LOOKBACK,))]
+    if not dates:
+        return {}
+    dmin = min(dates)
+    rows = con.execute(
+        "SELECT i.stock_id, i.date, i.trust_lots, p.close, p.high, p.volume "
+        "FROM inst i JOIN price p ON p.stock_id=i.stock_id AND p.date=i.date "
+        "WHERE i.date >= ? ORDER BY i.stock_id, i.date", (dmin,)).fetchall()
+    from collections import defaultdict
+    by = defaultdict(list)
+    for sid, d, t, c, h, v in rows:
+        if c is None or h is None:
+            continue
+        by[sid].append([d, round(t or 0, 1), round(c, 2), round(h, 2), round((v or 0) / 1000.0, 1)])
+    info = {r[0]: (r[1], r[2]) for r in con.execute("SELECT stock_id,name,market FROM stock")}
+    out = {}
+    for sid, series in by.items():
+        if len(series) < TRUST_MIN_STREAK:
+            continue
+        best = run = 0
+        for s in series:
+            if s[1] >= TRUST_BASE_THR:
+                run += 1
+                best = max(best, run)
+            else:
+                run = 0
+        if best >= TRUST_MIN_STREAK:
+            nm, mk = info.get(sid, ("", ""))
+            out[sid] = {"name": nm, "market": mk, "series": series}
+    return out
+
+
+def output_trust(cands):
+    """輸出 output/trust_YYYYMMDD.json（給看板第三分頁讀取）。"""
+    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    last = "00000000"
+    for v in cands.values():
+        if v["series"]:
+            last = max(last, v["series"][-1][0].replace("-", ""))
+    if last == "00000000":
+        last = dt.date.today().strftime("%Y%m%d")
+    iso = f"{last[:4]}-{last[4:6]}-{last[6:8]}"
+    path = os.path.join(CONFIG["OUTPUT_DIR"], f"trust_{last}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"date": iso, "base_thr": TRUST_BASE_THR, "min_streak": TRUST_MIN_STREAK,
+                   "data": cands}, f, ensure_ascii=False)
+    print(f"已輸出投信連買候選：{path}")
+
+
 def write_empty_csv(newest=None):
     """無入選或抓不到當日資料時，仍輸出一份只有表頭的 CSV，
     確保看板程式一定找得到檔案，整條流程不會中斷。"""
@@ -473,6 +593,16 @@ def main():
         write_empty_csv(newest)
     else:
         output(sel, newest)
+
+    # 投信連續買超（額外輸出 trust_*.json；失敗不影響上面的爆量清單）
+    try:
+        update_inst(con, sess)
+        cands = build_trust_candidates(con)
+        output_trust(cands)
+        print(f"投信連買候選：{len(cands)} 檔（張數門檻於網頁端切換）")
+    except Exception as e:
+        print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
+
     con.close()
 
 
