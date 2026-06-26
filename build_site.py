@@ -169,7 +169,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .scoretrack{width:60px; height:6px; background:var(--border); border-radius:3px; overflow:hidden;}
   .scorefill{height:100%; border-radius:3px;}
   .scoreval{font-weight:700; min-width:30px; text-align:right;}
-  .tags{text-align:left; white-space:normal;}
+  .tags{text-align:left; white-space:nowrap;}
   .tag{display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:500; margin:1px 3px 1px 0; border:1px solid;}
   .foot{text-align:center; color:var(--dim); font-size:11px; margin-top:14px;}
 
