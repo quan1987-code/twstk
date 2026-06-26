@@ -44,6 +44,22 @@ def find_latest_csv():
     return max(cands, key=os.path.getmtime) if cands else None
 
 
+def find_latest_trust():
+    cands = glob.glob(os.path.join("output", "trust_*.json")) or glob.glob("trust_*.json")
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def load_trust():
+    tp = find_latest_trust()
+    if not tp:
+        return {}
+    try:
+        with open(tp, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def load_history(stock_ids, db_path):
     hist = {}
     if not os.path.exists(db_path):
@@ -74,18 +90,20 @@ def load_history(stock_ids, db_path):
 
 
 # ---------------- 首頁：市場回撤 ----------------
-def _drawdown(dates, closes):
-    """dates/closes：由舊到新。回傳 歷史最高收盤、其日期、最近收盤、其日期、回撤%。"""
-    pairs = [(d, c) for d, c in zip(dates, closes) if c is not None and c == c and c > 0]
-    if not pairs:
+def _drawdown(dates, highs, closes):
+    """dates/highs/closes：由舊到新。歷史最高取『盤中最高價』，最近值取收盤價。"""
+    rows = [(d, h, c) for d, h, c in zip(dates, highs, closes)
+            if h is not None and h == h and h > 0 and c is not None and c == c and c > 0]
+    if not rows:
         return None
-    dates = [p[0] for p in pairs]
-    closes = [p[1] for p in pairs]
-    ath = max(closes)
-    ai = closes.index(ath)
-    last = closes[-1]
-    return {"ath": round(ath, 2), "ath_date": dates[ai],
-            "last": round(last, 2), "last_date": dates[-1],
+    ds = [r[0] for r in rows]
+    hs = [r[1] for r in rows]
+    cs = [r[2] for r in rows]
+    ath = max(hs)
+    ai = hs.index(ath)
+    last = cs[-1]
+    return {"ath": round(ath, 2), "ath_date": ds[ai],
+            "last": round(last, 2), "last_date": ds[-1],
             "dd": round((last / ath - 1) * 100, 2)}
 
 
@@ -94,14 +112,15 @@ def fetch_yf(symbol):
         return None
     try:
         df = yf.Ticker(symbol).history(period="max", interval="1d", auto_adjust=False)
-        if df is None or df.empty or "Close" not in df:
+        if df is None or df.empty or "Close" not in df.columns or "High" not in df.columns:
             return None
-        s = df["Close"].dropna()
-        if s.empty:
+        sub = df[["High", "Close"]].dropna()
+        if sub.empty:
             return None
-        dates = [d.strftime("%Y-%m-%d") for d in s.index]
-        vals = [float(x) for x in s.values]
-        return _drawdown(dates, vals)
+        dates = [d.strftime("%Y-%m-%d") for d in sub.index]
+        highs = [float(x) for x in sub["High"].values]
+        closes = [float(x) for x in sub["Close"].values]
+        return _drawdown(dates, highs, closes)
     except Exception as e:
         print(f"  yfinance 抓 {symbol} 失敗：{e}")
         return None
@@ -113,11 +132,12 @@ def tsmc_from_db():
         return None
     try:
         con = sqlite3.connect(DB_PATH)
-        rows = con.execute("SELECT date,close FROM price WHERE stock_id='2330' ORDER BY date").fetchall()
+        rows = con.execute("SELECT date,high,close FROM price WHERE stock_id='2330' ORDER BY date").fetchall()
         con.close()
         dates = [r[0] for r in rows]
-        closes = [r[1] for r in rows]
-        r = _drawdown(dates, closes)
+        highs = [r[1] for r in rows]
+        closes = [r[2] for r in rows]
+        r = _drawdown(dates, highs, closes)
         if r:
             r["db_only"] = True
         return r
@@ -141,21 +161,22 @@ def get_market():
     return out
 
 
-def build_html(results, history, market, date, count, db_ok, gentime):
+def build_html(results, history, market, trust, date, count, db_ok, gentime):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
             .replace("/*__MARKET__*/null", json.dumps(market, ensure_ascii=False))
+            .replace("/*__TRUST__*/null", json.dumps(trust, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
-def write_page(results, history, market, date, db_ok, gentime):
+def write_page(results, history, market, trust, date, db_ok, gentime):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, market, date, len(results), db_ok, gentime))
+        f.write(build_html(results, history, market, trust, date, len(results), db_ok, gentime))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
                    "orientation": "portrait", "background_color": "#0a0f1a",
@@ -166,19 +187,21 @@ def main():
     gentime = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
     print("抓首頁市場資料（加權指數 / 費半 / 台積電）…")
     market = get_market()
+    trust = load_trust()
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
-        print("找不到選股 CSV，第二分頁顯示空清單（首頁仍正常）。")
-        write_page([], {}, market, "", False, gentime)
+        print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
+        write_page([], {}, market, trust, "", False, gentime)
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
     results = df.to_dict(orient="records")
     date = results[0].get("資料日", "") if results else ""
     ids = [r.get("代號", "") for r in results if r.get("代號")]
     history, db_ok = load_history(ids, DB_PATH)
-    write_page(results, history, market, date, db_ok, gentime)
-    print(f"已產生 {OUT_DIR}/index.html（{len(results)} 檔，資料日 {date}，更新 {gentime}）")
+    write_page(results, history, market, trust, date, db_ok, gentime)
+    tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
+    print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)} 檔・投信候選 {tcount} 檔・資料日 {date}・更新 {gentime}）")
 
 
 # ============================================================
@@ -265,6 +288,10 @@ TEMPLATE = r"""<!DOCTYPE html>
   .controls input{background:var(--card); border:1px solid var(--border); border-radius:8px; padding:8px 12px; color:var(--text); font-size:14px; flex:1 1 140px; min-width:120px; outline:none;}
   .chip{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:7px 13px; font-size:13px; cursor:pointer; font-weight:500;}
   .chip.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  .thr{display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:11px;}
+  .thrlbl{font-size:12px; color:var(--dim); margin-right:2px;}
+  .thrbtn{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:7px 13px; font-size:13px; cursor:pointer; font-weight:700;}
+  .thrbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
   .hint{font-size:11px; color:var(--dim); width:100%;}
   .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:12px; background:var(--card);}
   table{width:100%; border-collapse:collapse; font-size:13px; min-width:860px;}
@@ -317,15 +344,16 @@ TEMPLATE = r"""<!DOCTYPE html>
   </header>
 
   <div class="tabbar">
-    <button class="tab on" data-tab="home">首頁・市場回撤</button>
-    <button class="tab" data-tab="screen">月均量爆量起漲</button>
+    <button class="tab on" data-tab="home">首頁回撤</button>
+    <button class="tab" data-tab="screen">爆量起漲</button>
+    <button class="tab" data-tab="trust">投信連買</button>
   </div>
 
   <!-- 分頁一：首頁 -->
   <div class="tabpane" id="tab-home">
     <div class="ddcards" id="ddcards"></div>
     <div class="ddnote">
-      <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高收盤」的跌幅（以收盤價計）。<br>
+      <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高價（盤中最高點）」的跌幅。<br>
       數字越大代表離前高越遠。台股加權指數與費城半導體為指數點數，台積電為股價。<br>
       美股費半依美國收盤，台北下午更新時通常為「前一個美股交易日」。
     </div>
@@ -358,6 +386,35 @@ TEMPLATE = r"""<!DOCTYPE html>
     <div class="tablewrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
   </div>
 
+  <!-- 分頁三：投信連買 -->
+  <div class="tabpane hidden" id="tab-trust">
+    <div class="sub" style="margin:0 0 10px">投信連續買超 ・ 籌碼面 ・ 資料日 <span id="trustdate">—</span></div>
+    <div class="thr">
+      <span class="thrlbl">每日門檻</span>
+      <button class="thrbtn on" data-thr="50">50張</button>
+      <button class="thrbtn" data-thr="100">100張</button>
+      <button class="thrbtn" data-thr="200">200張</button>
+      <button class="thrbtn" data-thr="500">500張</button>
+      <button class="thrbtn" data-thr="1000">1000張</button>
+    </div>
+    <details class="explain">
+      <summary>篩選邏輯與指標說明（點開）</summary>
+      <div class="exbody">
+        <div><b>怎麼篩</b>：最近一個月內，投信「<b>連續 ≥3 個交易日</b>」每日淨買都 <b>≥ 你選的張數</b>；且<b>現價 ≤ 連買期間最高價</b>，或<b>現價 &lt; 投信成本均價</b>（＝投信買了、但股價還沒漲上去 / 甚至跌破投信成本）。</div>
+        <div><b>投信買超佔比</b>：連買期間 投信淨買張數 ÷ 同期總成交張數。<b>越高＝投信主導、籌碼集中</b>（本頁最關鍵指標）。</div>
+        <div><b>連買天數 / 累計張數</b>：投信吃貨的「久」與「重」。</div>
+        <div><b>投信成本均價</b>：連買期間以每日投信淨買量加權的收盤均價（近似投信平均成本）。</div>
+        <div><b>距成本%</b>：現價 ÷ 投信成本 −1。負值（綠）＝現價已跌破投信成本，投信暫時套牢（雙面刃：可能加碼護盤，也可能停損）。</div>
+        <div><b>距高點%</b>：連買最高價 ÷ 現價 −1。越大＝離投信買的高點越遠、潛在補漲空間越大。</div>
+        <div><b>連買漲幅%</b>：連買期間股價漲跌幅。越小＝越「還沒發動」。</div>
+        <div><b>仍在買</b>：投信連買是否延續到最新一天（是＝籌碼仍有支撐）。</div>
+        <div><b>評分</b>：以「投信主導性(佔比)」為核心，加吃貨強度、補漲空間、貼近投信成本；已大漲者扣分。<b>僅供排序，非投資建議</b>。</div>
+        <div style="color:var(--dim)">註：投信買賣超為盤後資料，通常較股價晚約一個交易日；目前涵蓋上市，上櫃稍後補上。</div>
+      </div>
+    </details>
+    <div class="tablewrap"><table><thead><tr id="trusthead"></tr></thead><tbody id="trustbody"></tbody></table></div>
+  </div>
+
   <div class="foot">資料：證交所/櫃買 + FinMind + Yahoo ・ 僅供研究，非投資建議</div>
 </div>
 
@@ -382,14 +439,15 @@ TEMPLATE = r"""<!DOCTYPE html>
 const RESULTS = /*__RESULTS__*/null;
 const HISTORY = /*__HISTORY__*/null;
 const MARKET  = /*__MARKET__*/null;
+const TRUST   = /*__TRUST__*/null;
 const DB_OK   = /*__DBOK__*/false;
 
 /* ---------- 分頁切換 ---------- */
+const PANES = ["home", "screen", "trust"];
 document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on")); t.classList.add("on");
   const id=t.dataset.tab;
-  document.getElementById("tab-home").classList.toggle("hidden", id!=="home");
-  document.getElementById("tab-screen").classList.toggle("hidden", id!=="screen");
+  PANES.forEach(p=>document.getElementById("tab-"+p).classList.toggle("hidden", p!==id));
 }));
 
 /* ---------- 首頁：市場回撤卡 ---------- */
@@ -407,11 +465,96 @@ function renderDD(){
       <div class="ddname">${m.name}</div>
       <div class="ddbig">距歷史高點 <b class="${flat?'flat':''}">${flat?'≈ 0':'−'+ddAbs}%</b></div>
       <div class="ddbar"><div class="ddbarfill" style="width:${barW}%"></div></div>
-      <div class="ddrow"><span class="k">歷史最高收盤${dbnote}</span><span class="v">${fmt(m.ath)}</span><span class="d">${m.ath_date}</span></div>
+      <div class="ddrow"><span class="k">歷史最高價${dbnote}</span><span class="v">${fmt(m.ath)}</span><span class="d">${m.ath_date}</span></div>
       <div class="ddrow"><span class="k">最近收盤</span><span class="v">${fmt(m.last)}</span><span class="d">${m.last_date}</span></div>
     </div>`;
   }).join("");
 }
+
+/* ---------- 投信連買：依門檻即時運算 + 強弱排序 ---------- */
+let trustThr = 50;
+function computeTrustRows(thr){
+  const data = (TRUST && TRUST.data) ? TRUST.data : {};
+  const minStreak = (TRUST && TRUST.min_streak) ? TRUST.min_streak : 3;
+  const rows = [];
+  for(const sid in data){
+    const o = data[sid]; const s = o.series;
+    if(!s || s.length < minStreak) continue;
+    let a=-1, b=-1, end=s.length-1;
+    while(end>=0){
+      if(s[end][1] >= thr){
+        let start=end; while(start-1>=0 && s[start-1][1]>=thr) start--;
+        if(end-start+1 >= minStreak){ a=start; b=end; break; }
+        end=start-1;
+      } else end--;
+    }
+    if(a<0) continue;
+    let total=0, vol=0, hi=-Infinity, cN=0, cD=0;
+    for(let k=a;k<=b;k++){ const e=s[k]; total+=e[1]; vol+=e[4]; hi=Math.max(hi,e[3]); if(e[1]>0){cN+=e[2]*e[1]; cD+=e[1];} }
+    const cost = cD>0 ? cN/cD : s[b][2];
+    const last = s[s.length-1]; const lastClose = last[2];
+    const base = a>0 ? s[a-1][2] : s[a][2];
+    const streakRet = base>0 ? (s[b][2]/base - 1) : 0;
+    if(!(lastClose <= hi || lastClose < cost)) continue;
+    const dominance = vol>0 ? total/vol : 0;
+    const gapHigh = lastClose>0 ? (hi/lastClose - 1) : 0;
+    const costBias = cost>0 ? (lastClose/cost - 1) : 0;
+    const days = b-a+1;
+    const stillBuying = (b === s.length-1);
+    const sc_dom  = Math.min(Math.max(dominance/0.25, 0), 1);
+    const sc_acc  = Math.min(days/7, 1)*0.4 + Math.min(total/3000, 1)*0.6;
+    const sc_lag  = Math.min(Math.max(gapHigh/0.20, 0), 1);
+    const sc_cost = costBias<=0 ? 1 : Math.max(1 - costBias/0.10, 0);
+    let score = 100*(0.35*sc_dom + 0.20*sc_acc + 0.25*sc_lag + 0.20*sc_cost);
+    if(stillBuying) score += 5;
+    if(streakRet > 0.20) score -= 10;
+    score = Math.max(0, Math.min(100, score));
+    rows.push({sid, name:o.name, market:o.market, days, dominance, total, lastClose, cost, costBias, hi, gapHigh, streakRet, stillBuying, score});
+  }
+  rows.sort((x,y)=>y.score-x.score);
+  return rows;
+}
+function renderTrust(){
+  document.getElementById("trustdate").textContent = (TRUST && TRUST.date) ? TRUST.date : "—";
+  const cols=["代號","名稱","市場","連買(天)","投信買超佔比","連買累計(張)","現價","投信成本","距成本%","連買最高","距高點%","連買漲幅%","仍在買","評分"];
+  document.getElementById("trusthead").innerHTML = cols.map((c,i)=>`<th class="${i<2?'l':''}">${c}</th>`).join("");
+  const tb=document.getElementById("trustbody");
+  if(!TRUST || !TRUST.data || !Object.keys(TRUST.data).length){
+    tb.innerHTML=`<tr><td colspan="14" style="text-align:center;color:var(--dim);padding:36px">投信資料準備中（下次自動更新後出現）</td></tr>`; return;
+  }
+  const rows = computeTrustRows(trustThr);
+  if(!rows.length){
+    tb.innerHTML=`<tr><td colspan="14" style="text-align:center;color:var(--dim);padding:36px">此門檻下沒有符合「投信連買 ≥3 日且尚未漲上去」的個股<br>可試試降低每日張數門檻</td></tr>`; return;
+  }
+  const pct=(v)=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
+  tb.innerHTML = rows.map(r=>{
+    const domc = r.dominance>=0.25?"var(--amber)":r.dominance>=0.12?"#d98818":"var(--text)";
+    const costc = r.costBias<=0?"var(--down)":"var(--up)";
+    const scC = r.score>=70?"var(--up)":r.score>=45?"var(--amber)":"var(--dim)";
+    const mkt = r.market==="上市"?"twse":"tpex";
+    const has = (HISTORY&&HISTORY[r.sid])?`onclick="openChart('${r.sid}')"`:'';
+    return `<tr>
+      <td class="l"><span class="code">${r.sid}</span></td>
+      <td class="l"><span class="nm" ${has}>${r.name||""}</span></td>
+      <td><span class="mkt ${mkt}">${r.market}</span></td>
+      <td class="num" style="font-weight:700">${r.days}</td>
+      <td class="num"><b style="color:${domc}">${(r.dominance*100).toFixed(1)}%</b></td>
+      <td class="num">${Math.round(r.total).toLocaleString()}</td>
+      <td class="num" style="font-weight:700">${r.lastClose.toFixed(2)}</td>
+      <td class="num" style="color:var(--muted)">${r.cost.toFixed(2)}</td>
+      <td class="num" style="color:${costc};font-weight:700">${pct(r.costBias)}</td>
+      <td class="num" style="color:var(--muted)">${r.hi.toFixed(2)}</td>
+      <td class="num" style="color:var(--amber)">${pct(r.gapHigh)}</td>
+      <td class="num">${pct(r.streakRet)}</td>
+      <td class="num">${r.stillBuying?'<span style="color:var(--up)">是</span>':'<span style="color:var(--dim)">—</span>'}</td>
+      <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(r.score,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r.score.toFixed(0)}</span></span></td>
+    </tr>`;
+  }).join("");
+}
+document.querySelectorAll(".thrbtn").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".thrbtn").forEach(x=>x.classList.remove("on")); b.classList.add("on");
+  trustThr=parseInt(b.dataset.thr,10); renderTrust();
+}));
 
 /* ---------- 選股表格 ---------- */
 const TAGS = {
@@ -596,6 +739,7 @@ window.addEventListener("resize",()=>{ if(document.getElementById("cv").classLis
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
 
 renderDD();
+renderTrust();
 render();
 </script>
 </body>
