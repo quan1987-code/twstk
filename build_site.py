@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 r"""
-雲端網頁版看板產生器（手機觸控 + 可加到主畫面當 App）
+雲端網頁版看板（雙分頁・手機觸控・PWA）
 ================================================================
-給 GitHub Actions 在雲端執行：讀 output\breakout_*.csv + twstock.db，
-產生 site\index.html（給 GitHub Pages 發布）與 site\manifest.json（PWA）。
+分頁一（首頁）：市場回撤
+  顯示「台股加權指數 / 美股費城半導體 SOX / 台積電 2330」三張卡片，
+  每張含：歷史最高收盤(附日期)、最近收盤(附日期)、距高點回撤%。
+  資料來源：yfinance（Yahoo，完整歷史；台積電抓不到時改用本地 twstock.db）。
 
-與本機版差異：
-  ‧ 輸出固定為 site/index.html（不是 dashboard_日期.html），方便 Pages 當首頁
-  ‧ 不會自動開瀏覽器（雲端沒有瀏覽器）
-  ‧ K線圖加上「手機觸控」：單指拖移看十字線讀數、雙指縮放/平移
-  ‧ 加入 PWA 設定，手機可「加入主畫面」全螢幕當 App 用
-  ‧ 顯示資料日與更新時間（台北時間）
+分頁二（月均量爆量起漲）：選股看板
+  統計卡 + 量比排行 + 可排序/搜尋表格 + 點名稱看K線技術圖。
+  另含「指標說明」面板，解釋 月均量 / 量比 / 5日量÷月量 / 季線乖離 / 評分 等。
 
-需要套件：pandas
+輸出 site/index.html + site/manifest.json（給 GitHub Pages）。
+需要套件：pandas、yfinance（首頁市場資料用；沒裝也能跑，首頁顯示「資料暫時無法取得」）。
 """
 import os
 import sys
@@ -22,9 +22,21 @@ import sqlite3
 import datetime
 import pandas as pd
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
 OUT_DIR = "site"
+
+# 首頁三標的：(代碼, yfinance符號, 顯示名, 數值型態 'index'整數 / 'price'兩位小數)
+MARKET_TARGETS = [
+    ("TWII", "^TWII", "台股加權指數", "index"),
+    ("SOX",  "^SOX",  "費城半導體 SOX", "index"),
+    ("TSMC", "2330.TW", "台積電 2330", "price"),
+]
 
 
 def find_latest_csv():
@@ -61,52 +73,116 @@ def load_history(stock_ids, db_path):
     return hist, True
 
 
-def build_html(results, history, date, count, db_ok, gentime):
+# ---------------- 首頁：市場回撤 ----------------
+def _drawdown(dates, closes):
+    """dates/closes：由舊到新。回傳 歷史最高收盤、其日期、最近收盤、其日期、回撤%。"""
+    pairs = [(d, c) for d, c in zip(dates, closes) if c is not None and c == c and c > 0]
+    if not pairs:
+        return None
+    dates = [p[0] for p in pairs]
+    closes = [p[1] for p in pairs]
+    ath = max(closes)
+    ai = closes.index(ath)
+    last = closes[-1]
+    return {"ath": round(ath, 2), "ath_date": dates[ai],
+            "last": round(last, 2), "last_date": dates[-1],
+            "dd": round((last / ath - 1) * 100, 2)}
+
+
+def fetch_yf(symbol):
+    if yf is None:
+        return None
+    try:
+        df = yf.Ticker(symbol).history(period="max", interval="1d", auto_adjust=False)
+        if df is None or df.empty or "Close" not in df:
+            return None
+        s = df["Close"].dropna()
+        if s.empty:
+            return None
+        dates = [d.strftime("%Y-%m-%d") for d in s.index]
+        vals = [float(x) for x in s.values]
+        return _drawdown(dates, vals)
+    except Exception as e:
+        print(f"  yfinance 抓 {symbol} 失敗：{e}")
+        return None
+
+
+def tsmc_from_db():
+    """台積電保險：Yahoo 抓不到時改用本地 DB 的 2330（註：僅資料庫涵蓋區間，非全歷史）。"""
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute("SELECT date,close FROM price WHERE stock_id='2330' ORDER BY date").fetchall()
+        con.close()
+        dates = [r[0] for r in rows]
+        closes = [r[1] for r in rows]
+        r = _drawdown(dates, closes)
+        if r:
+            r["db_only"] = True
+        return r
+    except Exception:
+        return None
+
+
+def get_market():
+    out = {}
+    for code, sym, name, kind in MARKET_TARGETS:
+        r = fetch_yf(sym)
+        if r is None and code == "TSMC":
+            r = tsmc_from_db()
+        if r is not None:
+            r["name"] = name
+            r["kind"] = kind
+            print(f"  市場資料 {name}：最高 {r['ath']}（{r['ath_date']}）/ 最近 {r['last']}（{r['last_date']}）/ 回撤 {r['dd']}%")
+        else:
+            print(f"  市場資料 {name}：取得失敗")
+        out[code] = r
+    return out
+
+
+def build_html(results, history, market, date, count, db_ok, gentime):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
+            .replace("/*__MARKET__*/null", json.dumps(market, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
+def write_page(results, history, market, date, db_ok, gentime):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(build_html(results, history, market, date, len(results), db_ok, gentime))
+    with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
+                   "orientation": "portrait", "background_color": "#0a0f1a",
+                   "theme_color": "#0a0f1a", "start_url": "."}, f, ensure_ascii=False)
+
+
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     gentime = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    print("抓首頁市場資料（加權指數 / 費半 / 台積電）…")
+    market = get_market()
+
+    path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
-        print("找不到 CSV（output\\breakout_*.csv），產生佔位頁面（不中斷流程）。")
-        os.makedirs(OUT_DIR, exist_ok=True)
-        with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-            f.write(build_html([], {}, "", 0, False, gentime))
-        with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump({"name": "爆量起漲選股", "short_name": "爆量起漲", "display": "standalone",
-                       "orientation": "portrait", "background_color": "#0a0f1a",
-                       "theme_color": "#0a0f1a", "start_url": "."}, f, ensure_ascii=False)
+        print("找不到選股 CSV，第二分頁顯示空清單（首頁仍正常）。")
+        write_page([], {}, market, "", False, gentime)
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
     results = df.to_dict(orient="records")
-    if not results:
-        results = []
     date = results[0].get("資料日", "") if results else ""
     ids = [r.get("代號", "") for r in results if r.get("代號")]
     history, db_ok = load_history(ids, DB_PATH)
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-    with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, date, len(results), db_ok, gentime))
-    with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "name": "爆量起漲選股", "short_name": "爆量起漲",
-            "display": "standalone", "orientation": "portrait",
-            "background_color": "#0a0f1a", "theme_color": "#0a0f1a", "start_url": "."
-        }, f, ensure_ascii=False)
+    write_page(results, history, market, date, db_ok, gentime)
     print(f"已產生 {OUT_DIR}/index.html（{len(results)} 檔，資料日 {date}，更新 {gentime}）")
 
 
 # ============================================================
-#  HTML（含手機觸控 + PWA）
-#  台股慣例：紅漲綠跌。
+#  HTML（雙分頁 + 手機觸控 + PWA）。台股慣例：紅漲綠跌。
 # ============================================================
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -115,11 +191,11 @@ TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="爆量起漲">
+<meta name="apple-mobile-web-app-title" content="台股看板">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0a0f1a">
 <link rel="manifest" href="manifest.json">
-<title>月均量爆量起漲 ・ __DATE__</title>
+<title>台股看板 ・ __DATE__</title>
 <style>
   :root{
     --bg:#0a0f1a; --card:#111827; --card2:#161f33; --border:#1f2a3d;
@@ -133,18 +209,50 @@ TEMPLATE = r"""<!DOCTYPE html>
   *{box-sizing:border-box;}
   body{margin:0; background:var(--bg); color:var(--text);
     font-family:'Inter','Noto Sans TC','PingFang TC','Microsoft JhengHei',system-ui,sans-serif;
-    -webkit-font-smoothing:antialiased; padding:16px 12px 36px;
-    padding-top:calc(16px + env(safe-area-inset-top)); }
+    -webkit-font-smoothing:antialiased; padding:16px 12px 36px; padding-top:calc(16px + env(safe-area-inset-top));}
   .num{font-variant-numeric:tabular-nums;}
   .wrap{max-width:1180px; margin:0 auto;}
   header h1{font-size:19px; font-weight:800; margin:0;}
   header h1 .bolt{color:var(--amber);}
   .sub{font-size:12px; color:var(--muted); margin-top:4px;}
-  .cards{display:grid; grid-template-columns:repeat(2,1fr); gap:9px; margin:14px 0;}
+  .hidden{display:none !important;}
+
+  .tabbar{display:flex; gap:6px; margin:14px 0; background:var(--card); padding:5px; border-radius:11px; border:1px solid var(--border);}
+  .tab{flex:1; background:transparent; color:var(--muted); border:none; border-radius:8px; padding:10px 8px; font-size:14px; font-weight:700; cursor:pointer;}
+  .tab.on{background:var(--amber-s); color:var(--amber);}
+
+  /* 首頁回撤卡 */
+  .ddcards{display:grid; grid-template-columns:1fr; gap:12px;}
+  .ddcard{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:16px 17px;}
+  .ddname{font-size:15px; font-weight:800; margin-bottom:10px;}
+  .ddbig{font-size:13px; color:var(--muted); margin-bottom:10px;}
+  .ddbig b{font-size:30px; font-weight:800; color:var(--amber); margin-left:4px; letter-spacing:.3px;}
+  .ddbig b.flat{color:var(--up);}
+  .ddbar{height:8px; background:#0e1626; border-radius:5px; overflow:hidden; margin-bottom:13px;}
+  .ddbarfill{height:100%; background:linear-gradient(90deg,#f5a524,#e0701f); border-radius:5px;}
+  .ddrow{display:flex; align-items:baseline; gap:8px; padding:4px 0; border-top:1px solid var(--border);}
+  .ddrow .k{font-size:12px; color:var(--dim); width:96px; flex:none;}
+  .ddrow .v{font-size:17px; font-weight:800; font-variant-numeric:tabular-nums;}
+  .ddrow .d{font-size:11px; color:var(--muted); margin-left:auto;}
+  .ddna{color:var(--dim); font-size:13px; padding:8px 0;}
+  .ddnote{font-size:12px; color:var(--dim); line-height:1.6; margin-top:14px; padding:13px 15px; background:var(--card); border:1px solid var(--border); border-radius:11px;}
+
+  .cards{display:grid; grid-template-columns:repeat(2,1fr); gap:9px; margin-bottom:12px;}
   .stat{background:var(--card); border:1px solid var(--border); border-radius:11px; padding:13px 15px;}
   .stat .l{font-size:11px; color:var(--dim); margin-bottom:5px;}
   .stat .v{font-size:24px; font-weight:800; line-height:1;}
   .stat .s{font-size:11px; color:var(--muted); margin-top:4px;}
+
+  .explain{background:var(--card); border:1px solid var(--border); border-radius:11px; margin-bottom:13px; overflow:hidden;}
+  .explain summary{cursor:pointer; padding:13px 15px; font-size:13px; font-weight:700; color:var(--blue); list-style:none;}
+  .explain summary::-webkit-details-marker{display:none;}
+  .explain summary::before{content:"ⓘ "; }
+  .explain[open] summary{border-bottom:1px solid var(--border);}
+  .exbody{padding:6px 15px 14px; font-size:12.5px; line-height:1.65; color:var(--muted);}
+  .exbody b{color:var(--text);}
+  .exbody div{padding:5px 0; border-bottom:1px dashed var(--border);}
+  .exbody div:last-child{border-bottom:none;}
+
   .panel{background:var(--card); border:1px solid var(--border); border-radius:12px; margin-bottom:14px;}
   .panel .ph{font-size:12px; font-weight:700; color:var(--muted); padding:13px 14px 2px;}
   .bars{padding:6px 14px 12px;}
@@ -177,10 +285,9 @@ TEMPLATE = r"""<!DOCTYPE html>
   .scoreval{font-weight:700; min-width:30px; text-align:right;}
   .tags{text-align:left; white-space:nowrap;}
   .tag{display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:500; margin:1px 3px 1px 0; border:1px solid;}
-  .foot{text-align:center; color:var(--dim); font-size:11px; margin-top:14px;}
+  .foot{text-align:center; color:var(--dim); font-size:11px; margin-top:16px;}
 
-  #cv{position:fixed; inset:0; background:#070b14; z-index:50; display:none; flex-direction:column;
-      padding-top:env(safe-area-inset-top);}
+  #cv{position:fixed; inset:0; background:#070b14; z-index:50; display:none; flex-direction:column; padding-top:env(safe-area-inset-top);}
   #cv.open{display:flex;}
   .cvhead{display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--border); flex-wrap:wrap;}
   .back{background:var(--card); border:1px solid var(--border); color:var(--muted); border-radius:8px; padding:7px 12px; font-size:14px; cursor:pointer;}
@@ -199,26 +306,59 @@ TEMPLATE = r"""<!DOCTYPE html>
   .malegend i{width:13px; height:3px; border-radius:2px; display:inline-block;}
   .chartbox{flex:1; position:relative; min-height:0;}
   #chartCanvas{position:absolute; inset:0; width:100%; height:100%; touch-action:none;}
-  @media(min-width:640px){ .cards{grid-template-columns:repeat(4,1fr);} body{padding:22px 18px 40px;} }
+  @media(min-width:640px){ .cards{grid-template-columns:repeat(4,1fr);} .ddcards{grid-template-columns:repeat(3,1fr);} body{padding:22px 18px 40px;} }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1><span class="bolt">⚡</span> 月均量爆量起漲</h1>
-    <div class="sub" id="subtitle">資料日 __DATE__ ・ 共 __COUNT__ 檔 ・ 更新 __GENTIME__</div>
+    <h1><span class="bolt">⚡</span> 台股看板</h1>
+    <div class="sub">更新 __GENTIME__（台北）</div>
   </header>
-  <div class="cards" id="cards"></div>
-  <div class="panel"><div class="ph">量比排行（前 20）</div><div class="bars" id="bars"></div></div>
-  <div class="controls">
-    <input id="q" placeholder="搜尋代號或名稱…" autocomplete="off">
-    <button class="chip on" data-mkt="全部">全部</button>
-    <button class="chip" data-mkt="上市">上市</button>
-    <button class="chip" data-mkt="上櫃">上櫃</button>
-    <span class="hint">點欄位排序 ・ 點名稱看K線</span>
+
+  <div class="tabbar">
+    <button class="tab on" data-tab="home">首頁・市場回撤</button>
+    <button class="tab" data-tab="screen">月均量爆量起漲</button>
   </div>
-  <div class="tablewrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
-  <div class="foot">機械式初篩 ・ 進場前仍需看籌碼、消息面與基本面</div>
+
+  <!-- 分頁一：首頁 -->
+  <div class="tabpane" id="tab-home">
+    <div class="ddcards" id="ddcards"></div>
+    <div class="ddnote">
+      <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高收盤」的跌幅（以收盤價計）。<br>
+      數字越大代表離前高越遠。台股加權指數與費城半導體為指數點數，台積電為股價。<br>
+      美股費半依美國收盤，台北下午更新時通常為「前一個美股交易日」。
+    </div>
+  </div>
+
+  <!-- 分頁二：選股 -->
+  <div class="tabpane hidden" id="tab-screen">
+    <div class="sub" id="subtitle" style="margin:0 0 12px">資料日 __DATE__ ・ 共 __COUNT__ 檔</div>
+    <div class="cards" id="cards"></div>
+    <details class="explain">
+      <summary>指標說明（點開）</summary>
+      <div class="exbody">
+        <div><b>月均量</b>：最近 20 個交易日的平均成交量（張）。代表這檔平常的量能水準。</div>
+        <div><b>量比</b>：今日量 ÷ 月均量。例如 <b>3x</b> 表示今天的量是平常的 3 倍 →「爆量」。本表門檻為 ≥ 2x。</div>
+        <div><b>5日量/月量</b>：最近 5 日均量 ÷ 月均量。&gt;1 代表近期量能持續放大，不是只爆一天。</div>
+        <div><b>季線乖離%</b>：收盤距 60 日均線（季線）的距離。數字太大代表短線漲多、追高風險高（本表上限約 30%）。</div>
+        <div><b>評分</b>：綜合爆量強度、量能持續、突破季高、均線多頭排列等的 0–100 分，僅供「排序」參考，非買賣建議。</div>
+        <div><b>強度標記</b>：符合的偏多條件標籤，如 突破季高、月線翻揚、站上季線、季線翻揚、多頭排列、站上年線。</div>
+        <div style="color:var(--dim)">本表為機械式初篩，進場前仍需看籌碼（三大法人／主力）、消息面與基本面。</div>
+      </div>
+    </details>
+    <div class="panel"><div class="ph">量比排行（前 20）</div><div class="bars" id="bars"></div></div>
+    <div class="controls">
+      <input id="q" placeholder="搜尋代號或名稱…" autocomplete="off">
+      <button class="chip on" data-mkt="全部">全部</button>
+      <button class="chip" data-mkt="上市">上市</button>
+      <button class="chip" data-mkt="上櫃">上櫃</button>
+      <span class="hint">點欄位排序 ・ 點名稱看K線</span>
+    </div>
+    <div class="tablewrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
+  </div>
+
+  <div class="foot">資料：證交所/櫃買 + FinMind + Yahoo ・ 僅供研究，非投資建議</div>
 </div>
 
 <div id="cv">
@@ -241,8 +381,39 @@ TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const RESULTS = /*__RESULTS__*/null;
 const HISTORY = /*__HISTORY__*/null;
+const MARKET  = /*__MARKET__*/null;
 const DB_OK   = /*__DBOK__*/false;
 
+/* ---------- 分頁切換 ---------- */
+document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on")); t.classList.add("on");
+  const id=t.dataset.tab;
+  document.getElementById("tab-home").classList.toggle("hidden", id!=="home");
+  document.getElementById("tab-screen").classList.toggle("hidden", id!=="screen");
+}));
+
+/* ---------- 首頁：市場回撤卡 ---------- */
+function renderDD(){
+  const order=["TWII","SOX","TSMC"];
+  document.getElementById("ddcards").innerHTML=order.map(k=>{
+    const m=MARKET?MARKET[k]:null;
+    if(!m) return `<div class="ddcard"><div class="ddname">${k==="TWII"?"台股加權指數":k==="SOX"?"費城半導體 SOX":"台積電 2330"}</div><div class="ddna">資料暫時無法取得</div></div>`;
+    const fmt=(v)=> m.kind==="price" ? v.toFixed(2) : Math.round(v).toLocaleString();
+    const ddAbs=Math.abs(m.dd).toFixed(2);
+    const flat=Math.abs(m.dd)<0.05;
+    const barW=Math.min(Math.abs(m.dd),50)/50*100;
+    const dbnote=m.db_only?' <span style="color:var(--dim);font-size:10px">(資料庫區間)</span>':'';
+    return `<div class="ddcard">
+      <div class="ddname">${m.name}</div>
+      <div class="ddbig">距歷史高點 <b class="${flat?'flat':''}">${flat?'≈ 0':'−'+ddAbs}%</b></div>
+      <div class="ddbar"><div class="ddbarfill" style="width:${barW}%"></div></div>
+      <div class="ddrow"><span class="k">歷史最高收盤${dbnote}</span><span class="v">${fmt(m.ath)}</span><span class="d">${m.ath_date}</span></div>
+      <div class="ddrow"><span class="k">最近收盤</span><span class="v">${fmt(m.last)}</span><span class="d">${m.last_date}</span></div>
+    </div>`;
+  }).join("");
+}
+
+/* ---------- 選股表格 ---------- */
 const TAGS = {
   "突破季高":["rgba(245,165,36,.13)","#f7c14b","rgba(245,165,36,.35)"],
   "月線翻揚":["rgba(34,197,94,.12)","#56d97e","rgba(34,197,94,.3)"],
@@ -258,7 +429,7 @@ const fmtInt = v => { const n=num(v); return n==null?"":n.toLocaleString(); };
 let state = { sort:"評分", asc:false, mkt:"全部", q:"" };
 
 function view(){
-  let d = RESULTS.filter(r=>r["代號"]);
+  let d = (RESULTS||[]).filter(r=>r["代號"]);
   if(state.mkt!=="全部") d=d.filter(r=>r["市場"]===state.mkt);
   if(state.q){const q=state.q.toLowerCase(); d=d.filter(r=>(r["代號"]||"").toLowerCase().includes(q)||(r["名稱"]||"").toLowerCase().includes(q));}
   d.sort((a,b)=>{const x=num(a[state.sort]),y=num(b[state.sort]); if(x==null&&y==null)return 0; if(x==null)return 1; if(y==null)return -1; return state.asc?x-y:y-x;});
@@ -277,7 +448,7 @@ function renderCards(d){
 function renderBars(d){
   const top=[...d].sort((a,b)=>(num(b["量比"])||0)-(num(a["量比"])||0)).slice(0,20), max=top.length?Math.max(...top.map(r=>num(r["量比"])||0)):1;
   document.getElementById("bars").innerHTML=top.map(r=>{const v=num(r["量比"])||0,w=Math.max(v/max*100,2),c=v>=3?"var(--amber)":v>=2?"#d98818":"var(--dim)";
-    return `<div class="barrow"><div class="lbl">${r["代號"]} ${r["名稱"]||""}</div><div class="bartrack"><div class="barfill" style="width:${w}%;background:${c}"></div></div><div class="barval" style="color:${c}">${v.toFixed(2)}x</div></div>`;}).join("");
+    return `<div class="barrow"><div class="lbl">${r["代號"]} ${r["名稱"]||""}</div><div class="bartrack"><div class="barfill" style="width:${w}%;background:${c}"></div></div><div class="barval" style="color:${c}">${v.toFixed(2)}x</div></div>`;}).join("")||'<div style="color:var(--dim);font-size:12px;padding:8px 0">今日無資料</div>';
 }
 function renderHead(){
   document.getElementById("thead").innerHTML=COLS.map(([n,c])=>{const ar=state.sort===n?`<span class="ar">${state.asc?"▲":"▼"}</span>`:""; return `<th class="${c}" data-k="${n}">${n}${ar}</th>`;}).join("");
@@ -289,7 +460,7 @@ function renderTable(d){
     const lim=chg>=9.5?`<span class="lim" style="background:var(--up)">漲停</span>`:(chg<=-9.5?`<span class="lim" style="background:var(--down)">跌停</span>`:"");
     const vr=num(r["量比"])||0, vc=vr>=3?"var(--amber)":vr>=2?"#d98818":"var(--text)";
     const sv=num(r["評分"])||0, scC=sv>=70?"var(--up)":sv>=45?"var(--amber)":"var(--dim)", mkt=r["市場"]==="上市"?"twse":"tpex";
-    const has=HISTORY[r["代號"]]?`onclick="openChart('${r["代號"]}')"`:'title="無歷史資料"';
+    const has=(HISTORY&&HISTORY[r["代號"]])?`onclick="openChart('${r["代號"]}')"`:'title="無歷史資料"';
     const tags=(r["強度標記"]||"").split("·").filter(Boolean).map(t=>{const c=TAGS[t]||["rgba(94,111,134,.15)","#93a3b8","rgba(94,111,134,.3)"]; return `<span class="tag" style="background:${c[0]};color:${c[1]};border-color:${c[2]}">${t}</span>`;}).join("");
     return `<tr><td class="l"><span class="code">${r["代號"]}</span></td><td class="l"><span class="nm" ${has}>${r["名稱"]||""}</span></td>
       <td><span class="mkt ${mkt}">${r["市場"]}</span></td><td class="num">${r["收盤"]}</td>
@@ -299,10 +470,10 @@ function renderTable(d){
       <td class="num">${r["季線乖離%"]}%</td>
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(sv,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r["評分"]}</span></span></td>
       <td class="tags">${tags}</td></tr>`;
-  }).join("")||`<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:36px">沒有符合條件的標的</td></tr>`;
+  }).join("")||`<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
 }
 function render(){const d=view(); renderCards(d); renderBars(d); renderHead(); renderTable(d);
-  document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔 ・ 更新 __GENTIME__`;}
+  document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔`;}
 document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value; render();});
 document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{document.querySelectorAll(".chip").forEach(x=>x.classList.remove("on")); c.classList.add("on"); state.mkt=c.dataset.mkt; render();}));
 
@@ -348,7 +519,7 @@ function setPeriod(p){ CH.period=p; CH.offset=0; CH.hover=null; CH.bars=aggregat
 document.querySelectorAll(".pbtn").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".pbtn").forEach(x=>x.classList.remove("on")); b.classList.add("on"); setPeriod(b.dataset.p);}));
 function visRange(){ const N=CH.bars.length, cnt=Math.min(CH.count,N); let end=N-CH.offset; if(end>N)end=N; let start=end-cnt; if(start<0)start=0; return {start,end}; }
 const PADL=50, PADR=12, GAP=8, DATEH=20;
-function layout(W,H){ const usable=H-DATEH, ph=Math.round(usable*0.56), vh=Math.round(usable*0.20), mh=usable-ph-vh-2*GAP;
+function layout(W,H){ const usable=H-DATEH, ph=Math.round(usable*0.56), vh=Math.round(usable*0.20);
   return { price:{y0:0,y1:ph}, vol:{y0:ph+GAP,y1:ph+GAP+vh}, macd:{y0:ph+GAP+vh+GAP,y1:usable}, dateY:usable }; }
 function drawChart(){
   const cv=document.getElementById("chartCanvas"), box=cv.parentElement, W=box.clientWidth, H=box.clientHeight, dpr=window.devicePixelRatio||1;
@@ -401,7 +572,6 @@ function updateReadout(i){
 const canvas=document.getElementById("chartCanvas");
 function cx(clientX){ const r=canvas.getBoundingClientRect(); return clientX-r.left; }
 function scrubAt(x){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; drawChart(); }
-// 滑鼠
 canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX); });
 canvas.addEventListener("mouseleave",()=>{ CH.hover=null; drawChart(); });
 canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; drawChart(); },{passive:false});
@@ -409,7 +579,6 @@ let drag=null;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
 window.addEventListener("mouseup",()=>{ drag=null; });
 window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
-// 觸控
 let pinch=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
@@ -425,6 +594,8 @@ canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDef
 canvas.addEventListener("touchend",e=>{ if(e.touches.length===0)pinch=null; },{passive:false});
 window.addEventListener("resize",()=>{ if(document.getElementById("cv").classList.contains("open"))drawChart(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
+
+renderDD();
 render();
 </script>
 </body>
