@@ -54,7 +54,8 @@ CONFIG = {
     "FINMIND_TOKEN": os.environ.get("FINMIND_TOKEN", ""),  # 僅供首次歷史回補
     "DB_PATH": "twstock.db",
     "OUTPUT_DIR": "output",
-    "BACKFILL_DAYS": 400,        # 首次回補日曆天數（~270 交易日，足夠季線、接近年線）
+    "BACKFILL_DAYS": 400,        # （備用）回補日曆天數
+    "BACKFILL_START": "2005-01-01",  # 個股歷史深度回補起始日（補到 2005 年初）
     "BACKFILL_MIN_ROWS": 60,     # 個股 DB 內少於此天數就觸發回補（普通是首次）
     "FINMIND_SLEEP": 6.0,        # 回補時每檔間隔(秒)，配合 600 次/hr 上限（6 秒=600/hr）
     "FRESH_DAYS": 7,             # 選股時：個股最新一筆超過幾天前就視為停牌/已下市，排除
@@ -266,22 +267,24 @@ def row_counts(con):
 
 
 def run_backfill(con, token, universe, args):
-    """對 DB 內歷史不足的個股做一次性回補。"""
-    end = dt.date.today()
-    start = (end - dt.timedelta(days=CONFIG["BACKFILL_DAYS"])).isoformat()
-    end = end.isoformat()
-    counts = row_counts(con)
-    todo = sorted(s for s in universe if counts.get(s, 0) < CONFIG["BACKFILL_MIN_ROWS"])
+    """對尚未『深度回補到起始日』的個股做一次性回補（補到 2005）。
+    用 deep_done 表記錄已回補的個股，避免每天重抓；新上市股之後也只會補一次。"""
+    con.execute("CREATE TABLE IF NOT EXISTS deep_done(stock_id TEXT PRIMARY KEY)")
+    con.commit()
+    end = dt.date.today().isoformat()
+    start = CONFIG.get("BACKFILL_START") or (dt.date.today() - dt.timedelta(days=CONFIG["BACKFILL_DAYS"])).isoformat()
+    done = set(r[0] for r in con.execute("SELECT stock_id FROM deep_done"))
+    todo = sorted(s for s in universe if s not in done)
     if not todo:
-        print("歷史資料已齊備，略過回補。"); return
+        print(f"個股歷史已深度回補（至 {start}），略過回補。"); return
     if not token:
         print("【警告】未設定 FINMIND_TOKEN，無法回補歷史。請先設定 token 後重跑。"); return
 
     cap = args.max_backfill if args.max_backfill else len(todo)
     todo = todo[:cap]
     eta_min = len(todo) * CONFIG["FINMIND_SLEEP"] / 60
-    print(f"需回補 {len(todo)} 檔歷史（{start} ~ {end}），預估約 {eta_min:.0f} 分鐘。"
-          f"\n可掛著跑，中斷後重跑會自動接續…")
+    print(f"需深度回補 {len(todo)} 檔歷史（{start} ~ {end}），預估約 {eta_min:.0f} 分鐘"
+          f"（約 {eta_min/60:.1f} 小時）。\n首次很久、但只做一次；中斷後重跑會自動接續…")
     for i, sid in enumerate(todo, 1):
         try:
             rows = backfill_one(token, sid, start, end)
@@ -289,11 +292,13 @@ def run_backfill(con, token, universe, args):
             print(f"  [{i}/{len(todo)}] {sid} 失敗：{e}（稍後重跑接續）"); break
         if rows:
             con.executemany("INSERT OR REPLACE INTO price VALUES (?,?,?,?,?,?,?,?)", rows)
-            con.commit()
+        con.execute("INSERT OR IGNORE INTO deep_done VALUES (?)", (sid,))   # 標記此檔已回補
+        con.commit()
         if i % 25 == 0 or i == len(todo):
             print(f"  回補進度 [{i}/{len(todo)}]  最新：{sid} 寫入 {len(rows)} 筆")
         time.sleep(CONFIG["FINMIND_SLEEP"])
-    print("本輪回補結束。")
+    left = len(set(s for s in universe if s not in set(r[0] for r in con.execute('SELECT stock_id FROM deep_done'))))
+    print(f"本輪回補結束。尚餘 {left} 檔待回補（下次執行續抓）。" if left else "本輪回補結束。全部個股已深度回補完成。")
 
 
 def load_history(con, universe):
@@ -418,7 +423,8 @@ def output(sel, newest):
 #  投信買賣超（籌碼）：上市 = 證交所 T86（全市場，每日一次）
 # ============================================================
 T86_URL = "https://www.twse.com.tw/fund/T86"
-TRUST_LOOKBACK = 30      # 觀察最近幾個交易日
+TRUST_LOOKBACK = 30      # 連買候選觀察窗（最近約一個月）
+INST_LOOKBACK = 250      # 投信買賣超在 inst 表保留的交易日數（供個股K線投信副圖，約一年）
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
 
@@ -458,7 +464,7 @@ def update_inst(con, sess):
                 "stock_id TEXT, date TEXT, trust_lots REAL, PRIMARY KEY(stock_id,date))")
     con.commit()
     dates = [r[0] for r in con.execute(
-        "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (TRUST_LOOKBACK,))]
+        "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (INST_LOOKBACK,))]
     have = set(r[0] for r in con.execute("SELECT DISTINCT date FROM inst"))
     todo = [d for d in dates if d not in have]
     if not todo:

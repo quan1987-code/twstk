@@ -91,6 +91,107 @@ def load_history(stock_ids, db_path, limit=LOOKBACK_BARS):
     return hist, True
 
 
+def _r2(x):
+    return round(x, 2) if x is not None else None
+
+
+def write_stock_data(db_path, out_dir):
+    """為『每一檔』股票輸出精簡版逐檔資料檔 site/data/{代號}.json（含 2005 以來日線 + 近一年投信買賣超），
+    並輸出 site/data/_index.json（全清單，給首頁搜尋用）。圖表改成『點哪檔才抓哪檔』，HTML 不再內嵌歷史。"""
+    if not os.path.exists(db_path):
+        return 0
+    ddir = os.path.join(out_dir, "data")
+    os.makedirs(ddir, exist_ok=True)
+    con = sqlite3.connect(db_path)
+    info = {r[0]: (r[1], r[2]) for r in con.execute("SELECT stock_id,name,market FROM stock")}
+    # 近一年投信買賣超，預載成 {sid: {date: 張}}
+    inst = {}
+    try:
+        for sid, d, t in con.execute("SELECT stock_id,date,trust_lots FROM inst"):
+            inst.setdefault(sid, {})[d] = t
+    except sqlite3.Error:
+        inst = {}
+    sids = [r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price")]
+    index = []
+    n = 0
+    for sid in sids:
+        rows = con.execute("SELECT date,open,high,low,close,volume FROM price "
+                           "WHERE stock_id=? ORDER BY date", (sid,)).fetchall()
+        d = []; o = []; h = []; l = []; c = []; v = []
+        for dd, oo, hh, ll, cc, vv in rows:
+            if cc is None:
+                continue
+            d.append(dd); o.append(_r2(oo)); h.append(_r2(hh)); l.append(_r2(ll))
+            c.append(_r2(cc)); v.append(round((vv or 0) / 1000.0, 1))
+        if not d:
+            continue
+        im = inst.get(sid, {})
+        ts = len(d); t = []
+        if im:
+            imin = min(im.keys())
+            lo = 0
+            while lo < len(d) and d[lo] < imin:
+                lo += 1
+            ts = lo
+            t = [round(im.get(dd, 0.0), 1) for dd in d[ts:]]
+        name, mk = info.get(sid, ("", ""))
+        obj = {"n": name, "m": mk, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v, "ts": ts, "t": t}
+        with open(os.path.join(ddir, f"{sid}.json"), "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+        index.append([sid, name, mk]); n += 1
+    with open(os.path.join(ddir, "_index.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, separators=(",", ":"))
+    con.close()
+    return n
+
+
+def month_value_zone(con, sid, months=36):
+    """⑨ 伺服器端計算『爆量月價值區間』：最近 months 個月內，成交量最大的那個月份的月K高低，
+    看現價落在其中的位置。回傳 {label, cls, pos(%)} 或 None。"""
+    rows = con.execute("SELECT date,high,low,close,volume FROM price "
+                       "WHERE stock_id=? ORDER BY date", (sid,)).fetchall()
+    if len(rows) < 20:
+        return None
+    magg = {}; order = []
+    for dd, hh, ll, cc, vv in rows:
+        if cc is None:
+            continue
+        k = dd[:7]
+        if k not in magg:
+            magg[k] = [hh, ll, cc, vv or 0]; order.append(k)
+        else:
+            g = magg[k]
+            if hh is not None:
+                g[0] = max(g[0], hh) if g[0] is not None else hh
+            if ll is not None:
+                g[1] = min(g[1], ll) if g[1] is not None else ll
+            g[2] = cc; g[3] += (vv or 0)
+    if not order:
+        return None
+    recent = order[-months:] if len(order) > months else order
+    mx = None
+    for k in recent:
+        if mx is None or magg[k][3] > magg[mx][3]:
+            mx = k
+    if mx is None:
+        return None
+    H, L = magg[mx][0], magg[mx][1]
+    if not (H and L and H > L):
+        return None
+    P = rows[-1][3]
+    if P is None:
+        return None
+    mid = (H + L) / 2
+    pos = round((P - L) / (H - L) * 100)
+    if P > H:
+        return {"label": "月量高之上", "cls": "z-above", "pos": pos}
+    if L <= P <= mid:
+        return {"label": "近爆量低★", "cls": "z-value", "pos": pos}
+    if P >= mid:
+        return {"label": "爆量月上半", "cls": "z-upper", "pos": pos}
+    return {"label": "破爆量低", "cls": "z-below", "pos": pos}
+
+
 # ---------------- 首頁：市場回撤 ----------------
 def _drawdown(dates, highs, closes):
     """dates/highs/closes：由舊到新。歷史最高取『盤中最高價』，最近值取收盤價。"""
@@ -187,30 +288,37 @@ def write_page(results, history, market, trust, date, db_ok, gentime):
 
 def main():
     gentime = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
-    print("抓首頁市場資料（加權指數 / 費半 / 台積電）…")
+    print("抓首頁市場資料（加權指數 / 費半 / KOSPI / 台積電）…")
     market = get_market()
     trust = load_trust()
+    have_db = os.path.exists(DB_PATH)
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
         print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
-        write_page([], {}, market, trust, "", False, gentime)
+        nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
+        write_page([], {}, market, trust, "", have_db, gentime)
+        print(f"已產生 {OUT_DIR}/index.html（無爆量清單・逐檔資料 {nstk} 檔・更新 {gentime}）")
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
     results = df.to_dict(orient="records")
     date = results[0].get("資料日", "") if results else ""
-    ids = [r.get("代號", "") for r in results if r.get("代號")]
-    history, db_ok = load_history(ids, DB_PATH)
-    # 投信候選也嵌入歷史（較短），讓投信頁名稱可點開 K 線
-    tdata = trust.get("data", {}) if isinstance(trust, dict) else {}
-    tsids = [s for s in tdata.keys() if s and s not in history]
-    if tsids:
-        th, tok = load_history(tsids, DB_PATH, limit=TRUST_CHART_BARS)
-        history.update(th)
-        db_ok = db_ok or tok
-    write_page(results, history, market, trust, date, db_ok, gentime)
+    # ⑨ 伺服器端計算「爆量月價值區間」，灌進每列（圖表不再內嵌歷史）
+    if have_db:
+        con = sqlite3.connect(DB_PATH)
+        for r in results:
+            try:
+                z = month_value_zone(con, r.get("代號", ""))
+            except sqlite3.Error:
+                z = None
+            if z:
+                r["_zoneLabel"] = z["label"]; r["_zoneCls"] = z["cls"]; r["爆量月位階"] = z["pos"]
+        con.close()
+    # ④⑥ 產生逐檔資料檔（2005 起日線 + 近一年投信）＋首頁搜尋索引
+    nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
+    write_page(results, {}, market, trust, date, have_db, gentime)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
-    print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)} 檔・投信候選 {tcount} 檔・資料日 {date}・更新 {gentime}）")
+    print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)}・投信候選 {tcount}・逐檔資料 {nstk} 檔・更新 {gentime}）")
 
 
 # ============================================================
@@ -268,6 +376,18 @@ TEMPLATE = r"""<!DOCTYPE html>
   .ddrow .d{font-size:11px; color:var(--muted); margin-left:auto;}
   .ddna{color:var(--dim); font-size:13px; padding:8px 0;}
   .ddnote{font-size:12px; color:var(--dim); line-height:1.6; margin-top:14px; padding:13px 15px; background:var(--card); border:1px solid var(--border); border-radius:11px;}
+  .searchwrap{position:relative; margin-bottom:14px;}
+  .searchwrap input{width:100%; box-sizing:border-box; background:var(--card); border:1px solid var(--border); border-radius:11px; padding:12px 14px; color:var(--text); font-size:15px; outline:none;}
+  .searchwrap input:focus{border-color:rgba(245,165,36,.5);}
+  .sugbox{position:absolute; left:0; right:0; top:calc(100% + 6px); z-index:30; background:var(--card); border:1px solid var(--border); border-radius:11px; overflow:hidden; display:none; box-shadow:0 8px 28px rgba(0,0,0,.45);}
+  .sugbox.on{display:block;}
+  .sugitem{display:flex; align-items:center; gap:10px; padding:11px 14px; cursor:pointer; border-bottom:1px solid rgba(255,255,255,.04);}
+  .sugitem:last-child{border-bottom:none;}
+  .sugitem:active,.sugitem:hover{background:rgba(245,165,36,.1);}
+  .sugitem .sc{font-weight:700; color:var(--amber); font-variant-numeric:tabular-nums; min-width:52px;}
+  .sugitem .sn{flex:1; color:var(--text);}
+  .sugitem .sm{font-size:12px; color:var(--dim);}
+  .sugitem.dim{color:var(--dim); cursor:default; justify-content:center;}
 
   .cards{display:grid; grid-template-columns:repeat(2,1fr); gap:9px; margin-bottom:12px;}
   .stat{background:var(--card); border:1px solid var(--border); border-radius:11px; padding:13px 15px;}
@@ -366,6 +486,10 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- 分頁一：首頁 -->
   <div class="tabpane" id="tab-home">
+    <div class="searchwrap">
+      <input id="stkq" placeholder="🔍 搜尋任意股票（代號或名稱）看完整 K 線…" autocomplete="off">
+      <div class="sugbox" id="sugbox"></div>
+    </div>
     <div class="ddcards" id="ddcards"></div>
     <div class="ddnote">
       <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高價（盤中最高點）」的跌幅。<br>
@@ -440,14 +564,14 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="back" onclick="closeChart()">◀ 返回</button>
     <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span></div>
     <div class="cvchg" id="cvChg"></div>
-    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button></div>
+    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button></div>
   </div>
   <div class="readout" id="readout"></div>
   <div class="malegend">
     <span><i style="background:var(--ma5)"></i>MA5</span><span><i style="background:var(--ma10)"></i>MA10</span>
     <span><i style="background:var(--ma20)"></i>MA20</span><span><i style="background:var(--ma60)"></i>MA60</span>
     <span><i style="background:var(--ma240)"></i>MA240</span><span><i style="background:#8aa0b6"></i>布林20</span>
-    <span style="color:var(--dim)">單指拖移看讀數 ・ 雙指縮放</span>
+    <span style="color:var(--dim)">單指拖移看讀數 ・ 雙指縮放 ・ 點副圖切換 量↔投信</span>
   </div>
   <div class="chartbox"><canvas id="chartCanvas"></canvas></div>
 </div>
@@ -585,7 +709,7 @@ function renderTrust(){
     const sbc = r.soldBack>=0.3?"var(--amber)":"var(--dim)";
     const scC = r.score>=70?"var(--up)":r.score>=45?"var(--amber)":"var(--dim)";
     const mkt = r.market==="上市"?"twse":"tpex";
-    const has = (HISTORY&&HISTORY[r.sid])?`onclick="openChart('${r.sid}')"`:'title="無歷史資料"';
+    const has = `onclick="openChart('${r.sid}')"`;
     return `<tr>
       <td class="l"><span class="code">${r.sid}</span></td>
       <td class="l"><span class="nm" ${has}>${r.name||""}</span></td>
@@ -657,7 +781,7 @@ function renderTable(d){
     const lim=chg>=9.5?`<span class="lim" style="background:var(--up)">漲停</span>`:(chg<=-9.5?`<span class="lim" style="background:var(--down)">跌停</span>`:"");
     const vr=num(r["量比"])||0, vc=vr>=3?"var(--amber)":vr>=2?"#d98818":"var(--text)";
     const sv=num(r["評分"])||0, scC=sv>=70?"var(--up)":sv>=45?"var(--amber)":"var(--dim)", mkt=r["市場"]==="上市"?"twse":"tpex";
-    const has=(HISTORY&&HISTORY[r["代號"]])?`onclick="openChart('${r["代號"]}')"`:'title="無歷史資料"';
+    const has=`onclick="openChart('${r["代號"]}')"`;
     const tags=(r["強度標記"]||"").split("·").filter(Boolean).map(t=>{const c=TAGS[t]||["rgba(94,111,134,.15)","#93a3b8","rgba(94,111,134,.3)"]; return `<span class="tag" style="background:${c[0]};color:${c[1]};border-color:${c[2]}">${t}</span>`;}).join("");
     return `<tr><td class="l"><span class="code">${r["代號"]}</span></td><td class="l"><span class="nm" ${has}>${r["名稱"]||""}</span></td>
       <td><span class="mkt ${mkt}">${r["市場"]}</span></td><td class="num">${r["收盤"]}</td>
@@ -666,7 +790,7 @@ function renderTable(d){
       <td class="num"><span class="vr" style="color:${vc}">${r["量比"]}x</span></td><td class="num">${r["5日量/月量"]}</td>
       <td class="num">${r["季線乖離%"]}%</td>
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(sv,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r["評分"]}</span></span></td>
-      <td class="num">${(()=>{const z=r["_zone"]; return z?`<span class="zone ${z.cls}">${z.label}</span><span class="zpos">${Math.round(z.pos*100)}%</span>`:'<span style="color:var(--dim)">—</span>';})()}</td>
+      <td class="num">${r["_zoneLabel"]?`<span class="zone ${r["_zoneCls"]}">${r["_zoneLabel"]}</span><span class="zpos">${r["爆量月位階"]}%</span>`:'<span style="color:var(--dim)">—</span>'}</td>
       <td class="tags">${tags}</td></tr>`;
   }).join("")||`<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
 }
@@ -692,7 +816,7 @@ function aggregate(daily, period){
   for(const b of daily){ const k=key(b[0]); if(!map[k]){ map[k]={d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}; order.push(k);} else { const g=map[k]; g.h=Math.max(g.h,b[2]); g.l=Math.min(g.l,b[3]); g.c=b[4]; g.v+=b[5]; g.d=b[0]; } }
   return order.map(k=>map[k]);
 }
-let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null };
+let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[] };
 function computeInd(bars){
   const close=bars.map(b=>b.c), vol=bars.map(b=>b.v);
   const ma={}; PRICE_MAS.forEach(n=>ma[n]=SMA(close,n));
@@ -701,27 +825,50 @@ function computeInd(bars){
   const vma={}; VOL_MAS.forEach(n=>vma[n]=SMA(vol,n));
   return { ma, boll:{u:bu,m:mid,l:bl}, vma, macd:MACD(close) };
 }
-function openChart(sid){
-  const daily=HISTORY[sid]; if(!daily) return;
+async function fetchStock(sid){
+  if(HISTORY[sid]) return HISTORY[sid];
+  try{
+    const res=await fetch(`data/${sid}.json`,{cache:"default"});
+    if(!res.ok) return null;
+    const j=await res.json();
+    const n=j.d.length, bars=new Array(n);
+    for(let i=0;i<n;i++) bars[i]=[j.d[i],j.o[i],j.h[i],j.l[i],j.c[i],j.v[i]];
+    const o={name:j.n||"", market:j.m||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[])};
+    HISTORY[sid]=o; return o;
+  }catch(e){ return null; }
+}
+async function openChart(sid){
+  const o=await fetchStock(sid);
+  if(!o||!o.bars||!o.bars.length){ alert("讀取「"+sid+"」資料失敗，請稍後再試。"); return; }
   const r=RESULTS.find(x=>x["代號"]===sid)||{};
   const td=(TRUST&&TRUST.data&&TRUST.data[sid])||null;
-  const name=r["名稱"]||(td?td.name:"")||"";
-  CH.sid=sid; CH.offset=0; CH.hover=null;
+  const name=r["名稱"]||o.name||(td?td.name:"")||"";
+  CH.sid=sid; CH.offset=0; CH.hover=null; CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t;
   document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
-  const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
-  if(r["收盤"]!=null && r["漲跌%"]!=null){
+  if(r["收盤"]!=null && r["漲跌%"]!=null){ const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
     document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
-  } else {
-    const lc=daily[daily.length-1][4];
-    document.getElementById("cvChg").innerHTML=`<span style="color:var(--muted)">${lc!=null?lc.toFixed(2):""}</span>`;
-  }
-  document.querySelectorAll(".pbtn").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
+  } else { const lc=o.bars[o.bars.length-1][4];
+    document.getElementById("cvChg").innerHTML=`<span style="color:var(--muted)">${lc!=null?lc.toFixed(2):""}</span>`; }
+  const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent="副圖:量";
+  document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
   setPeriod("D"); document.getElementById("cv").classList.add("open");
 }
 function closeChart(){ document.getElementById("cv").classList.remove("open"); }
-function setPeriod(p){ CH.period=p; CH.offset=0; CH.hover=null; CH.bars=aggregate(HISTORY[CH.sid], p); CH.ind=computeInd(CH.bars);
-  CH.count=Math.min(CH.bars.length, p==="D"?90:(p==="W"?80:60)); drawChart(); }
-document.querySelectorAll(".pbtn").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".pbtn").forEach(x=>x.classList.remove("on")); b.classList.add("on"); setPeriod(b.dataset.p);}));
+function periodKey(ds,p){ if(p==="M") return ds.slice(0,7); if(p==="W"){ const a=ds.split("-").map(Number); const dt=new Date(Date.UTC(a[0],a[1]-1,a[2])); const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day); return dt.toISOString().slice(0,10);} return ds; }
+function setPeriod(p){
+  CH.period=p; CH.offset=0; CH.hover=null;
+  const o=HISTORY[CH.sid]; const daily=o.bars;
+  CH.bars=aggregate(daily,p); CH.ind=computeInd(CH.bars);
+  const ts=CH.ts, tt=CH.t, net={}, has={};
+  for(let i=0;i<daily.length;i++){ const k=periodKey(daily[i][0],p); const val=(i>=ts)?tt[i-ts]:null;
+    if(val!=null){ net[k]=(net[k]||0)+val; has[k]=true; } }
+  CH.tnet=[]; CH.tcum=[]; let cum=0, started=false;
+  for(const b of CH.bars){ const k=periodKey(b.d,p); const hv=has[k]===true; const nv=hv?net[k]:null;
+    CH.tnet.push(nv); if(hv){ started=true; cum+=nv; } CH.tcum.push(started?cum:null); }
+  CH.count=Math.min(CH.bars.length, p==="D"?90:(p==="W"?80:60)); drawChart();
+}
+function toggleVol(){ if(!CH.bars.length)return; CH.volMode=CH.volMode==="vol"?"inst":"vol"; const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent=CH.volMode==="vol"?"副圖:量":"副圖:投信"; drawChart(); }
+document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".pbtn[data-p]").forEach(x=>x.classList.remove("on")); b.classList.add("on"); setPeriod(b.dataset.p);}));
 function visRange(){ const N=CH.bars.length, cnt=Math.min(CH.count,N); let end=N-CH.offset; if(end>N)end=N; let start=end-cnt; if(start<0)start=0; return {start,end}; }
 const PADL=50, PADR=12, GAP=8, DATEH=20;
 function layout(W,H){ const usable=H-DATEH, ph=Math.round(usable*0.56), vh=Math.round(usable*0.20);
@@ -751,11 +898,28 @@ function drawChart(){
   PRICE_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.ma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=pY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
   const N=CH.bars.length;
   PRICE_MAS.forEach(m=>{ const ki=(N-1)-(m-1); if(ki<start||ki>=end)return; const x=xOf(ki), y=L.price.y1-3; ctx.fillStyle=MACOLOR[m]; ctx.beginPath(); ctx.moveTo(x,y-7); ctx.lineTo(x-4,y); ctx.lineTo(x+4,y); ctx.closePath(); ctx.fill(); });
-  let vmax=0; for(let i=start;i<end;i++){ vmax=Math.max(vmax,CH.bars[i].v); VOL_MAS.forEach(m=>{const v=CH.ind.vma[m][i]; if(v!=null)vmax=Math.max(vmax,v);}); }
-  vmax=vmax||1; const vY=(v)=> L.vol.y1 - v/vmax*(L.vol.y1-L.vol.y0-4);
-  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.fillText(Math.round(vmax)+"張",PADL-6,L.vol.y0+8);
-  for(let i=start;i<end;i++){ const b=CH.bars[i], x=xOf(i), up=b.c>=b.o; ctx.fillStyle=up?"rgba(255,77,79,.75)":"rgba(34,197,94,.75)"; const bodyW=Math.max(bw*0.6,1), y=vY(b.v); ctx.fillRect(x-bodyW/2,y,bodyW,L.vol.y1-y); }
-  ctx.lineWidth=1.3; VOL_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.vma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
+  if(CH.volMode==="vol"){
+    let vmax=0; for(let i=start;i<end;i++){ vmax=Math.max(vmax,CH.bars[i].v); VOL_MAS.forEach(m=>{const v=CH.ind.vma[m][i]; if(v!=null)vmax=Math.max(vmax,v);}); }
+    vmax=vmax||1; const vY=(v)=> L.vol.y1 - v/vmax*(L.vol.y1-L.vol.y0-4);
+    ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText(Math.round(vmax)+"張",PADL-6,L.vol.y0+8);
+    for(let i=start;i<end;i++){ const b=CH.bars[i], x=xOf(i), up=b.c>=b.o; ctx.fillStyle=up?"rgba(255,77,79,.75)":"rgba(34,197,94,.75)"; const bodyW=Math.max(bw*0.6,1), y=vY(b.v); ctx.fillRect(x-bodyW/2,y,bodyW,L.vol.y1-y); }
+    ctx.lineWidth=1.3; VOL_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.vma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
+    ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("成交量",PADL+2,L.vol.y0+2);
+  } else {
+    // 投信買賣超 bars（紅買綠賣）+ 投信庫存(累計)線
+    const y0=L.vol.y0, y1=L.vol.y1, hh=y1-y0-4, midY=Math.round((y0+y1)/2);
+    let any=false, nmax=1e-9; for(let i=start;i<end;i++){ const v=CH.tnet[i]; if(v!=null){any=true; nmax=Math.max(nmax,Math.abs(v));} }
+    ctx.strokeStyle="rgba(255,255,255,0.1)"; ctx.beginPath(); ctx.moveTo(PADL,midY); ctx.lineTo(W-PADR,midY); ctx.stroke();
+    if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("此區間無投信資料（投信約近一年）",(PADL+W-PADR)/2,midY); }
+    else{
+      const nbY=(v)=> midY - v/nmax*(hh/2);
+      ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("±"+Math.round(nmax)+"張",PADL-6,y0+8);
+      for(let i=start;i<end;i++){ const v=CH.tnet[i]; if(v==null||v===0)continue; const x=xOf(i), y=nbY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.85)":"rgba(34,197,94,.85)"; const bodyW=Math.max(bw*0.6,1); ctx.fillRect(x-bodyW/2,Math.min(y,midY),bodyW,Math.abs(y-midY)||1); }
+      let cmin=Infinity,cmax=-Infinity; for(let i=start;i<end;i++){ const v=CH.tcum[i]; if(v!=null){cmin=Math.min(cmin,v);cmax=Math.max(cmax,v);} }
+      if(cmin<cmax){ const cY=(v)=> y1-2 - (v-cmin)/(cmax-cmin)*(hh); ctx.strokeStyle="#f5c518"; ctx.lineWidth=1.6; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.tcum[i]; if(v==null){st=false;continue;} const x=xOf(i),y=cY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); }
+      ctx.fillStyle="#f5c518"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("投信買賣超 ▏庫存(黃線)",PADL+2,y0+2);
+    }
+  }
   const {dif,dea,osc}=CH.ind.macd; let mmax=1e-9; for(let i=start;i<end;i++){ [dif[i],dea[i],osc[i]].forEach(v=>{if(v!=null)mmax=Math.max(mmax,Math.abs(v));}); }
   const mMid=(L.macd.y0+L.macd.y1)/2, mH=(L.macd.y1-L.macd.y0-4)/2, mY=(v)=> mMid - v/mmax*mH;
   ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mMid); ctx.lineTo(W-PADR,mMid); ctx.stroke();
@@ -780,45 +944,47 @@ function scrubAt(x){ const {start,end}=visRange(), n=end-start, bw=(canvas.paren
 canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX); });
 canvas.addEventListener("mouseleave",()=>{ CH.hover=null; drawChart(); });
 canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; drawChart(); },{passive:false});
-let drag=null;
+let drag=null, suppressClick=false;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
 window.addEventListener("mouseup",()=>{ drag=null; });
-window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
-let pinch=null;
+window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; suppressClick=true; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
+canvas.addEventListener("click",e=>{ if(suppressClick){suppressClick=false;return;} if(!CH.bars.length)return; const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(e.offsetY>=L.vol.y0&&e.offsetY<=L.vol.y1) toggleVol(); });
+let pinch=null, tap=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
 canvas.addEventListener("touchstart",e=>{ if(!CH.bars.length)return;
-  if(e.touches.length===1){ scrubAt(cx(e.touches[0].clientX)); pinch=null; }
-  else if(e.touches.length>=2){ pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; } },{passive:false});
+  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX)); pinch=null; }
+  else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; } },{passive:false});
 canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDefault();
-  if(e.touches.length===1&&!pinch){ scrubAt(cx(e.touches[0].clientX)); }
+  if(e.touches.length===1&&!pinch){ if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX)); }
   else if(e.touches.length>=2&&pinch){ const nd=tdist(e.touches), ratio=pinch.d/(nd||1), N=CH.bars.length;
     CH.count=Math.max(20,Math.min(N,Math.round(pinch.cnt*ratio)));
     const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,N), dB=Math.round((tmid(e.touches)-pinch.mid)/bw);
     CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), pinch.off+dB)); drawChart(); } },{passive:false});
-canvas.addEventListener("touchend",e=>{ if(e.touches.length===0)pinch=null; },{passive:false});
+canvas.addEventListener("touchend",e=>{ if(e.touches.length===0){ pinch=null;
+  if(tap&&!tap.moved&&(Date.now()-tap.t)<300){ const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(tap.y>=L.vol.y0&&tap.y<=L.vol.y1) toggleVol(); }
+  tap=null; } },{passive:false});
 window.addEventListener("resize",()=>{ if(document.getElementById("cv").classList.contains("open"))drawChart(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
 
-/* ⑨ 爆量月價值區間：找成交量最大的月份，看現價落在該月 K 高低區間的位置 */
-function volMonthZone(sid){
-  const daily = HISTORY && HISTORY[sid];
-  if(!daily || daily.length < 20) return null;
-  const m = aggregate(daily, "M");
-  if(m.length < 2) return null;
-  let mx = m[0]; for(const b of m) if(b.v > mx.v) mx = b;
-  const H = mx.h, L = mx.l, MID = (H+L)/2;
-  if(!(H > L)) return null;
-  const P = daily[daily.length-1][4];          // 最新收盤
-  const pos = (P - L)/(H - L);                  // 0=月低, 1=月高
-  let label, cls;
-  if(P > H){ label="月量高之上"; cls="z-above"; }
-  else if(P >= L && P <= MID){ label="近爆量低★"; cls="z-value"; }   // 中價~低價＝價值區
-  else if(P >= MID){ label="爆量月上半"; cls="z-upper"; }
-  else { label="破爆量低"; cls="z-below"; }     // P < L
-  return {H, L, MID, P, pos, label, cls, month:mx.d.slice(0,7)};
+/* ⑥ 首頁搜尋任意股 → 抓逐檔資料 → 開 K 線 */
+let STKIDX=null;
+async function loadIndex(){ if(STKIDX)return STKIDX; try{ const r=await fetch("data/_index.json",{cache:"default"}); if(r.ok) STKIDX=await r.json(); }catch(e){} return STKIDX||[]; }
+function renderSug(q){
+  const box=document.getElementById("sugbox"); if(!q){ box.innerHTML=""; box.classList.remove("on"); return; }
+  const idx=STKIDX||[], ql=q.toLowerCase(), hit=[];
+  for(const e of idx){ if(e[0].toLowerCase().includes(ql)||(e[1]||"").toLowerCase().includes(ql)){ hit.push(e); if(hit.length>=14)break; } }
+  if(!hit.length){ box.innerHTML='<div class="sugitem dim">查無此股（資料更新後才會出現新上市股）</div>'; box.classList.add("on"); return; }
+  box.innerHTML=hit.map(e=>`<div class="sugitem" onclick="pickStock('${e[0]}')"><span class="sc">${e[0]}</span><span class="sn">${e[1]||""}</span><span class="sm">${e[2]||""}</span></div>`).join("");
+  box.classList.add("on");
 }
-(RESULTS||[]).forEach(r=>{ const z=volMonthZone(r["代號"]); r["_zone"]=z; r["爆量月位階"]= z? Math.round(z.pos*100) : null; });
+function pickStock(sid){ const box=document.getElementById("sugbox"); box.innerHTML=""; box.classList.remove("on"); const q=document.getElementById("stkq"); if(q)q.value=""; openChart(sid); }
+(function(){ const q=document.getElementById("stkq"); if(!q)return;
+  q.addEventListener("input",e=>renderSug(e.target.value.trim()));
+  q.addEventListener("focus",loadIndex);
+  document.addEventListener("click",e=>{ if(!e.target.closest(".searchwrap")){ const b=document.getElementById("sugbox"); if(b){b.innerHTML="";b.classList.remove("on");} } });
+})();
+loadIndex();
 
 renderDD();
 renderTrust();
