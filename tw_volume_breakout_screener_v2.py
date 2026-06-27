@@ -423,6 +423,12 @@ def output(sel, newest):
 #  投信買賣超（籌碼）：上市 = 證交所 T86（全市場，每日一次）
 # ============================================================
 T86_URL = "https://www.twse.com.tw/fund/T86"
+# ⑦ 法人動向：三大法人金額(BFI82U) / 融資融券(MI_MARGN) / 外資台指期(TAIFEX OpenAPI)
+BFI82U_URL = "https://www.twse.com.tw/fund/BFI82U"
+MI_MARGN_URL = "https://www.twse.com.tw/exchangeReport/MI_MARGN"
+TAIFEX_FUT_URL = ("https://openapi.taifex.com.tw/v1/"
+                  "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate")
+TAIFEX_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 TRUST_LOOKBACK = 30      # 連買候選觀察窗（最近約一個月）
 INST_LOOKBACK = 250      # 投信買賣超在 inst 表保留的交易日數（供個股K線投信副圖，約一年）
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
@@ -539,6 +545,158 @@ def output_trust(cands):
     print(f"已輸出投信連買候選：{path}")
 
 
+# ============================================================
+#  ⑦ 法人動向：三大法人金額 / 融資融券餘額 / 外資台指期淨未平倉
+#     （三個全新資料源；抓取失敗都不影響主流程，並印出診斷供雲端 log 驗證）
+# ============================================================
+def _fmt_date(s):
+    s = str(s).strip().replace("/", "").replace("-", "")
+    return f"{s[:4]}-{s[4:6]}-{s[6:8]}" if (len(s) == 8 and s.isdigit()) else str(s)
+
+
+def _num2(s):
+    try:
+        return float(str(s).replace(",", "").replace("%", "").replace("+", "").strip())
+    except Exception:
+        return None
+
+
+def fetch_inst3(sess, ymd):
+    """三大法人買賣金額 BFI82U（單位：元 → 回傳億元淨額）。"""
+    r = sess.get(BFI82U_URL, params={"response": "json", "dayDate": ymd, "type": "day"},
+                 timeout=CONFIG["HTTP_TIMEOUT"])
+    j = r.json()
+    if j.get("stat") != "OK":
+        print(f"  [BFI82U] stat={j.get('stat')}（{ymd}）"); return None
+    rows = j.get("data") or (j.get("tables", [{}])[0].get("data") if j.get("tables") else [])
+    if not rows:
+        return None
+    foreign = trust = dealer = None
+    for row in rows:
+        name = str(row[0]); net = _num2(row[-1])  # 買賣差額為最後一欄
+        if net is None:
+            continue
+        if "外資" in name:
+            foreign = (foreign or 0) + net          # 外資及陸資 + 外資自營商
+        elif "投信" in name:
+            trust = (trust or 0) + net
+        elif "自營" in name:
+            dealer = (dealer or 0) + net            # 自營商(自行買賣)+(避險)
+    if foreign is None and trust is None and dealer is None:
+        return None
+    e = lambda x: round(x / 1e8, 1) if x is not None else None
+    total = (foreign or 0) + (trust or 0) + (dealer or 0)
+    out = {"date": _fmt_date(j.get("date") or ymd), "foreign": e(foreign),
+           "trust": e(trust), "dealer": e(dealer), "total": e(total)}
+    print(f"  [BFI82U] {out}")
+    return out
+
+
+def fetch_margin(sess, ymd):
+    """全市場融資融券餘額 MI_MARGN（tables[0]=彙總）。融資取金額(億)、融券取張數，各附前日變化。"""
+    r = sess.get(MI_MARGN_URL, params={"response": "json", "date": ymd, "selectType": "ALL"},
+                 timeout=CONFIG["HTTP_TIMEOUT"])
+    j = r.json()
+    if j.get("stat") != "OK":
+        print(f"  [MI_MARGN] stat={j.get('stat')}（{ymd}）"); return None
+    tables = j.get("tables") or []
+    summ = tables[0] if tables else None
+    if not summ:
+        return None
+    fields = summ.get("fields", []); data = summ.get("data", [])
+    print(f"  [MI_MARGN] fields={fields}")
+    for row in data:
+        print(f"  [MI_MARGN] row={row}")
+
+    def col(sub):
+        for i, f in enumerate(fields):
+            if sub in str(f):
+                return i
+        return None
+    ci_today, ci_prev = col("今日餘額"), col("前日餘額")
+    if ci_today is None:
+        return None
+
+    def find(keys, exclude=()):
+        for row in data:
+            nm = str(row[0]).replace(" ", "")
+            if all(k in nm for k in keys) and not any(x in nm for x in exclude):
+                return row
+        return None
+
+    def bal_chg(row, scale=1.0):
+        if not row:
+            return None, None
+        t = _num2(row[ci_today]); p = _num2(row[ci_prev]) if ci_prev is not None else None
+        if t is None:
+            return None, None
+        return (round(t / scale, 1), round((t - p) / scale, 1) if p is not None else None)
+
+    # 融資餘額：優先金額(仟元→億)，否則交易單位(張)
+    fin_row = find(["融資", "仟元"]) or find(["融資", "金額"])
+    fin_unit = "億"
+    if fin_row:
+        fin_bal, fin_chg = bal_chg(fin_row, 1e5)        # 仟元 → 億
+    else:
+        fin_row = find(["融資", "單位"]) or find(["融資"], exclude=["券", "仟元", "金額"])
+        fin_unit = "張"; fin_bal, fin_chg = bal_chg(fin_row, 1.0)
+    # 融券餘額：交易單位(張)
+    sh_row = find(["融券", "單位"]) or find(["融券"], exclude=["資", "仟元", "金額"])
+    short_bal, short_chg = bal_chg(sh_row, 1.0)
+    out = {"date": ymd if "-" in ymd else _fmt_date(ymd),
+           "fin_bal": fin_bal, "fin_chg": fin_chg, "fin_unit": fin_unit,
+           "short_bal": short_bal, "short_chg": short_chg}
+    print(f"  [MI_MARGN] parsed={out}")
+    return out
+
+
+def fetch_txf_foreign(sess):
+    """外資台指期淨未平倉口數（TAIFEX OpenAPI；只回最新交易日）。負數=淨空。"""
+    r = sess.get(TAIFEX_FUT_URL, headers=TAIFEX_HEADERS, timeout=CONFIG["HTTP_TIMEOUT"])
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        print("  [TAIFEX] 無資料或格式非預期"); return None
+    date = data[0].get("Date", "")
+    for it in data:
+        cc = str(it.get("ContractCode", "")); item = str(it.get("Item", ""))
+        if ("臺股期貨" in cc or "台股期貨" in cc) and "外資" in item:
+            out = {"date": _fmt_date(date),
+                   "net_oi": _num2(it.get("OpenInterest(Net)")),
+                   "long_oi": _num2(it.get("OpenInterest(Long)")),
+                   "short_oi": _num2(it.get("OpenInterest(Short)"))}
+            print(f"  [TAIFEX] {out}")
+            return out
+    cset = sorted(set(str(x.get("ContractCode", "")) for x in data))[:8]
+    print(f"  [TAIFEX] 找不到臺股期貨/外資。可見契約樣本={cset}")
+    return None
+
+
+def build_market_extras(sess, con):
+    """彙整三大法人 / 融資融券 / 外資台指期，回傳 dict（各區塊失敗則為 None）。"""
+    row = con.execute("SELECT MAX(date) FROM price").fetchone()
+    latest = row[0] if row else None
+    ymd = latest.replace("-", "") if latest else dt.date.today().strftime("%Y%m%d")
+    out = {"date": latest or _fmt_date(ymd)}
+    for key, fn in (("inst3", lambda: fetch_inst3(sess, ymd)),
+                    ("margin", lambda: fetch_margin(sess, ymd)),
+                    ("txf_foreign", lambda: fetch_txf_foreign(sess))):
+        try:
+            out[key] = fn()
+        except Exception as e:
+            print(f"  法人動向[{key}] 抓取/解析失敗：{e}")
+            out[key] = None
+    return out
+
+
+def output_market_extras(extras):
+    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    d = (extras.get("date") or dt.date.today().isoformat()).replace("-", "")
+    path = os.path.join(CONFIG["OUTPUT_DIR"], f"extras_{d}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(extras, f, ensure_ascii=False)
+    print(f"已輸出法人動向：{path}")
+
+
 def write_empty_csv(newest=None):
     """無入選或抓不到當日資料時，仍輸出一份只有表頭的 CSV，
     確保看板程式一定找得到檔案，整條流程不會中斷。"""
@@ -608,6 +766,13 @@ def main():
         print(f"投信連買候選：{len(cands)} 檔（張數門檻於網頁端切換）")
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
+
+    # ⑦ 法人動向：三大法人 / 融資融券 / 外資台指期（全新資料源，失敗不影響主流程）
+    try:
+        extras = build_market_extras(sess, con)
+        output_market_extras(extras)
+    except Exception as e:
+        print(f"法人動向資料失敗（不影響主流程）：{e}")
 
     con.close()
 

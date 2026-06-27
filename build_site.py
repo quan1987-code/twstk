@@ -51,6 +51,22 @@ def find_latest_trust():
     return max(cands, key=os.path.getmtime) if cands else None
 
 
+def find_latest_extras():
+    cands = glob.glob(os.path.join("output", "extras_*.json")) or glob.glob("extras_*.json")
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def load_extras():
+    p = find_latest_extras()
+    if not p:
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def load_trust():
     tp = find_latest_trust()
     if not tp:
@@ -264,22 +280,23 @@ def get_market():
     return out
 
 
-def build_html(results, history, market, trust, date, count, db_ok, gentime):
+def build_html(results, history, market, trust, extras, date, count, db_ok, gentime):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
             .replace("/*__MARKET__*/null", json.dumps(market, ensure_ascii=False))
             .replace("/*__TRUST__*/null", json.dumps(trust, ensure_ascii=False))
+            .replace("/*__EXTRAS__*/null", json.dumps(extras, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
-def write_page(results, history, market, trust, date, db_ok, gentime):
+def write_page(results, history, market, trust, extras, date, db_ok, gentime):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, market, trust, date, len(results), db_ok, gentime))
+        f.write(build_html(results, history, market, trust, extras, date, len(results), db_ok, gentime))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
                    "orientation": "portrait", "background_color": "#0a0f1a",
@@ -291,13 +308,14 @@ def main():
     print("抓首頁市場資料（加權指數 / 費半 / KOSPI / 台積電）…")
     market = get_market()
     trust = load_trust()
+    extras = load_extras()
     have_db = os.path.exists(DB_PATH)
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
         print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
         nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-        write_page([], {}, market, trust, "", have_db, gentime)
+        write_page([], {}, market, trust, extras, "", have_db, gentime)
         print(f"已產生 {OUT_DIR}/index.html（無爆量清單・逐檔資料 {nstk} 檔・更新 {gentime}）")
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
@@ -316,7 +334,7 @@ def main():
         con.close()
     # ④⑥ 產生逐檔資料檔（2005 起日線 + 近一年投信）＋首頁搜尋索引
     nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-    write_page(results, {}, market, trust, date, have_db, gentime)
+    write_page(results, {}, market, trust, extras, date, have_db, gentime)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
     print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)}・投信候選 {tcount}・逐檔資料 {nstk} 檔・更新 {gentime}）")
 
@@ -364,6 +382,15 @@ TEMPLATE = r"""<!DOCTYPE html>
   /* 首頁回撤卡 */
   .ddcards{display:grid; grid-template-columns:1fr; gap:12px;}
   .ddcard{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:16px 17px;}
+  .flowwrap{margin-top:16px;}
+  .flowtitle{font-size:13px; font-weight:700; color:var(--muted); margin:0 2px 10px;}
+  .flowgrid{display:grid; grid-template-columns:1fr; gap:12px;}
+  .fcard{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:14px 16px;}
+  .fcard .ft{font-size:12px; color:var(--muted); font-weight:600; margin-bottom:7px; display:flex; align-items:center; gap:8px;}
+  .fcard .fd{font-size:11px; color:var(--dim); font-weight:500;}
+  .fcard .fv{font-size:23px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-.5px;}
+  .fcard .fu{font-size:12px; font-weight:600; color:var(--dim);}
+  .fcard .fsub{font-size:12.5px; color:var(--muted); margin-top:6px; font-variant-numeric:tabular-nums;}
   .ddname{font-size:15px; font-weight:800; margin-bottom:10px;}
   .ddbig{font-size:13px; color:var(--muted); margin-bottom:10px;}
   .ddbig b{font-size:30px; font-weight:800; color:var(--amber); margin-left:4px; letter-spacing:.3px;}
@@ -468,7 +495,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .malegend i{width:13px; height:3px; border-radius:2px; display:inline-block;}
   .chartbox{flex:1; position:relative; min-height:0;}
   #chartCanvas{position:absolute; inset:0; width:100%; height:100%; touch-action:none;}
-  @media(min-width:640px){ .cards{grid-template-columns:repeat(4,1fr);} .ddcards{grid-template-columns:repeat(3,1fr);} body{padding:22px 18px 40px;} }
+  @media(min-width:640px){ .cards{grid-template-columns:repeat(4,1fr);} .ddcards{grid-template-columns:repeat(3,1fr);} .flowgrid{grid-template-columns:repeat(3,1fr);} body{padding:22px 18px 40px;} }
 </style>
 </head>
 <body>
@@ -491,6 +518,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="sugbox" id="sugbox"></div>
     </div>
     <div class="ddcards" id="ddcards"></div>
+    <div class="flowwrap" id="flowwrap"></div>
     <div class="ddnote">
       <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高價（盤中最高點）」的跌幅。<br>
       數字越大代表離前高越遠。台股加權指數與費城半導體為指數點數，台積電為股價。<br>
@@ -581,6 +609,7 @@ const RESULTS = /*__RESULTS__*/null;
 const HISTORY = /*__HISTORY__*/null;
 const MARKET  = /*__MARKET__*/null;
 const TRUST   = /*__TRUST__*/null;
+const EXTRAS  = /*__EXTRAS__*/null;
 const DB_OK   = /*__DBOK__*/false;
 
 /* ---------- 分頁切換 ---------- */
@@ -613,7 +642,36 @@ function renderDD(){
   }).join("");
 }
 
-/* ---------- 投信連買：依門檻即時運算 + 強弱排序 ---------- */
+/* ⑦ 法人動向：三大法人 / 外資台指期 / 融資融券 */
+function renderExtras(){
+  const box=document.getElementById("flowwrap"); if(!box) return;
+  const E=EXTRAS||{}, i3=E.inst3, mg=E.margin, tx=E.txf_foreign;
+  if(!i3 && !mg && !tx){ box.innerHTML=""; return; }
+  const r1=(v)=> Math.round(v*10)/10;
+  const sign=(v)=> v==null?"—":(v>0?"+":"")+r1(v).toLocaleString();
+  const sgI=(v)=> v==null?"—":(v>0?"+":"")+Math.round(v).toLocaleString();
+  const col=(v)=> v==null?"var(--dim)":(v>0?"var(--up)":(v<0?"var(--down)":"var(--text)"));
+  const cards=[];
+  if(i3){
+    cards.push(`<div class="fcard"><div class="ft">三大法人買賣超 <span class="fd">${i3.date||""}</span></div>
+      <div class="fv" style="color:${col(i3.total)}">${sign(i3.total)}<span class="fu"> 億</span></div>
+      <div class="fsub">外資 <b style="color:${col(i3.foreign)}">${sign(i3.foreign)}</b> ・ 投信 <b style="color:${col(i3.trust)}">${sign(i3.trust)}</b> ・ 自營 <b style="color:${col(i3.dealer)}">${sign(i3.dealer)}</b></div></div>`);
+  }
+  if(tx){
+    const tag=tx.net_oi==null?"":(tx.net_oi>0?" 淨多":" 淨空");
+    const det=(tx.long_oi!=null&&tx.short_oi!=null)?`多單 ${Math.round(tx.long_oi).toLocaleString()} ・ 空單 ${Math.round(tx.short_oi).toLocaleString()} 口`:"未平倉口數（負=淨空）";
+    cards.push(`<div class="fcard"><div class="ft">外資台指期未平倉 <span class="fd">${tx.date||""}</span></div>
+      <div class="fv" style="color:${col(tx.net_oi)}">${sgI(tx.net_oi)}<span class="fu"> 口${tag}</span></div>
+      <div class="fsub">${det}</div></div>`);
+  }
+  if(mg){
+    const fu=mg.fin_unit||"億";
+    cards.push(`<div class="fcard"><div class="ft">融資融券餘額 <span class="fd">${mg.date||""}</span></div>
+      <div class="fv">融資 ${mg.fin_bal!=null?Math.round(mg.fin_bal).toLocaleString():"—"}<span class="fu"> ${fu}</span> <b style="color:${col(mg.fin_chg)};font-size:14px">${mg.fin_chg!=null?"("+sgI(mg.fin_chg)+")":""}</b></div>
+      <div class="fsub">融券 ${mg.short_bal!=null?Math.round(mg.short_bal).toLocaleString():"—"} 張 <b style="color:${col(mg.short_chg)}">${mg.short_chg!=null?"("+sgI(mg.short_chg)+")":""}</b></div></div>`);
+  }
+  box.innerHTML=`<div class="flowtitle">法人動向（最近交易日）</div><div class="flowgrid">${cards.join("")}</div>`;
+}
 let trustThr = 50;
 let trustSort = {key:"評分", asc:false};
 const SELL_BACK_FRAC = 0.6;   // 連買後若被賣回 ≥ 此比例的累計買超 → 視為投信已落跑，排除
@@ -987,6 +1045,7 @@ function pickStock(sid){ const box=document.getElementById("sugbox"); box.innerH
 loadIndex();
 
 renderDD();
+renderExtras();
 renderTrust();
 render();
 </script>
