@@ -67,6 +67,22 @@ def load_extras():
         return {}
 
 
+def find_latest_flows():
+    cands = glob.glob(os.path.join("output", "flows_*.json")) or glob.glob("flows_*.json")
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def load_flows():
+    p = find_latest_flows()
+    if not p:
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def load_trust():
     tp = find_latest_trust()
     if not tp:
@@ -280,23 +296,24 @@ def get_market():
     return out
 
 
-def build_html(results, history, market, trust, extras, date, count, db_ok, gentime):
+def build_html(results, history, market, trust, extras, flows, date, count, db_ok, gentime):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
             .replace("/*__MARKET__*/null", json.dumps(market, ensure_ascii=False))
             .replace("/*__TRUST__*/null", json.dumps(trust, ensure_ascii=False))
             .replace("/*__EXTRAS__*/null", json.dumps(extras, ensure_ascii=False))
+            .replace("/*__FLOWS__*/null", json.dumps(flows, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
-def write_page(results, history, market, trust, extras, date, db_ok, gentime):
+def write_page(results, history, market, trust, extras, flows, date, db_ok, gentime):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, market, trust, extras, date, len(results), db_ok, gentime))
+        f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
                    "orientation": "portrait", "background_color": "#0a0f1a",
@@ -309,13 +326,14 @@ def main():
     market = get_market()
     trust = load_trust()
     extras = load_extras()
+    flows = load_flows()
     have_db = os.path.exists(DB_PATH)
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
         print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
         nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-        write_page([], {}, market, trust, extras, "", have_db, gentime)
+        write_page([], {}, market, trust, extras, flows, "", have_db, gentime)
         print(f"已產生 {OUT_DIR}/index.html（無爆量清單・逐檔資料 {nstk} 檔・更新 {gentime}）")
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
@@ -334,7 +352,7 @@ def main():
         con.close()
     # ④⑥ 產生逐檔資料檔（2005 起日線 + 近一年投信）＋首頁搜尋索引
     nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-    write_page(results, {}, market, trust, extras, date, have_db, gentime)
+    write_page(results, {}, market, trust, extras, flows, date, have_db, gentime)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
     print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)}・投信候選 {tcount}・逐檔資料 {nstk} 檔・更新 {gentime}）")
 
@@ -454,6 +472,27 @@ TEMPLATE = r"""<!DOCTYPE html>
   .z-above{background:rgba(94,111,134,.14); color:var(--muted); border-color:rgba(94,111,134,.3);}
   .z-below{background:rgba(94,111,134,.1); color:var(--dim); border-color:rgba(94,111,134,.25);}
   .zpos{font-size:10px; color:var(--dim); margin-left:5px;}
+  .fchips{display:flex; gap:7px; flex-wrap:wrap; margin-bottom:13px;}
+  .fchip{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:8px 13px; font-size:13px; font-weight:600; cursor:pointer;}
+  .fchip.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  .toptop{display:grid; grid-template-columns:1fr; gap:14px;}
+  @media(min-width:640px){ .toptop{grid-template-columns:1fr 1fr;} }
+  .tpanel{background:var(--card); border:1px solid var(--border); border-radius:13px; overflow:hidden;}
+  .tphd{font-size:13px; font-weight:800; padding:11px 14px; border-bottom:1px solid var(--border);}
+  .tphd.buy{color:var(--up);} .tphd.sell{color:var(--down);}
+  .frow{position:relative; display:flex; align-items:center; gap:9px; padding:9px 13px; border-bottom:1px solid rgba(255,255,255,.04); font-size:13px;}
+  .frow:last-child{border-bottom:none;}
+  .frow .fbar{position:absolute; left:0; top:0; bottom:0; z-index:0;}
+  .frow.buy .fbar{background:rgba(255,77,79,.10);}
+  .frow.sell .fbar{background:rgba(34,197,94,.10);}
+  .frow>*{position:relative; z-index:1;}
+  .frk{width:18px; text-align:center; font-weight:700; color:var(--dim); font-size:12px;}
+  .fnm2{flex:1; font-weight:600; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .fnm2 i{color:var(--dim); font-style:normal; font-size:11px; margin-left:4px;}
+  .fval{font-weight:800; font-variant-numeric:tabular-nums; white-space:nowrap;}
+  .fval small{font-weight:600; color:var(--dim); font-size:10px; margin-left:1px;}
+  .fcg{width:60px; text-align:right; font-size:12px; font-variant-numeric:tabular-nums;}
+  .tpempty{padding:26px; text-align:center; color:var(--dim); font-size:13px;}
   .hint{font-size:11px; color:var(--dim); width:100%;}
   .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:12px; background:var(--card);}
   table{width:100%; border-collapse:collapse; font-size:13px; min-width:860px;}
@@ -509,6 +548,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="tab on" data-tab="home">指數回撤</button>
     <button class="tab" data-tab="screen">爆量起漲</button>
     <button class="tab" data-tab="trust">投信連買</button>
+    <button class="tab" data-tab="flow">資金流向</button>
   </div>
 
   <!-- 分頁一：首頁 -->
@@ -584,6 +624,25 @@ TEMPLATE = r"""<!DOCTYPE html>
     <div class="tablewrap"><table><thead><tr id="trusthead"></tr></thead><tbody id="trustbody"></tbody></table></div>
   </div>
 
+  <!-- 分頁四：資金流向 -->
+  <div class="tabpane hidden" id="tab-flow">
+    <div class="sub" style="margin:0 0 10px">大戶 / 投信資金流向 ・ 買賣超金額 TOP10 ・ 資料日 <span id="flowdate">—</span></div>
+    <div class="fchips" id="fchips">
+      <button class="fchip on" data-fk="big_d">大戶·當日</button>
+      <button class="fchip" data-fk="big_30">大戶·近30日</button>
+      <button class="fchip" data-fk="trust_d">投信·當日</button>
+      <button class="fchip" data-fk="trust_30">投信·近30日</button>
+    </div>
+    <div class="toptop" id="toptop"></div>
+    <details class="exp"><summary>說明</summary>
+      <div class="expbody">
+        <div><b>大戶</b>＝<b>三大法人合計</b>（外資＋投信＋自營）買賣超，作為「大戶／主力資金」的免費替代指標（無單獨大戶分點免費來源）。<b>投信</b>＝投信單獨買賣超。</div>
+        <div><b>金額(億)</b>＝買賣超張數 × 當日收盤估算；<b>當日</b>＝最近一個交易日，<b>近30日</b>＝最近 30 個交易日累計。紅＝買超、綠＝賣超。點名稱可看 K 線。</div>
+        <div style="color:var(--dim)">資料為證交所 T86 盤後（目前涵蓋上市；上櫃稍後補上），通常較股價晚約一個交易日。</div>
+      </div>
+    </details>
+  </div>
+
   <div class="foot">資料：證交所/櫃買 + FinMind + Yahoo ・ 僅供研究，非投資建議</div>
 </div>
 
@@ -610,10 +669,11 @@ const HISTORY = /*__HISTORY__*/null;
 const MARKET  = /*__MARKET__*/null;
 const TRUST   = /*__TRUST__*/null;
 const EXTRAS  = /*__EXTRAS__*/null;
+const FLOWS   = /*__FLOWS__*/null;
 const DB_OK   = /*__DBOK__*/false;
 
 /* ---------- 分頁切換 ---------- */
-const PANES = ["home", "screen", "trust"];
+const PANES = ["home", "screen", "trust", "flow"];
 document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on")); t.classList.add("on");
   const id=t.dataset.tab;
@@ -672,6 +732,42 @@ function renderExtras(){
   }
   box.innerHTML=`<div class="flowtitle">法人動向（最近交易日）</div><div class="flowgrid">${cards.join("")}</div>`;
 }
+
+/* 資金流向 TOP10：大戶(三大法人)/投信 × 當日/近30日 */
+let flowKey="big_d";
+function renderFlows(){
+  const root=document.getElementById("toptop"); if(!root) return;
+  const F=FLOWS||{};
+  const dd=document.getElementById("flowdate"); if(dd) dd.textContent=F.date||"—";
+  const grp=F[flowKey];
+  if(!grp || ((!grp.buy||!grp.buy.length)&&(!grp.sell||!grp.sell.length))){
+    root.innerHTML=`<div class="tpanel"><div class="tpempty">資料準備中：三大法人(T86)資料抓到後即顯示</div></div>`; return;
+  }
+  const maxAbs=(arr)=> Math.max(1,...arr.map(x=>Math.abs(x.amt)));
+  const panel=(title,cls,arr)=>{
+    const mx=maxAbs(arr);
+    const rows=(arr||[]).map((x,i)=>{
+      const w=Math.max(2,Math.abs(x.amt)/mx*100);
+      const cg=x.chg==null?"":(x.chg>0?"+":"")+x.chg.toFixed(2)+"%";
+      const cgc=x.chg==null?"var(--dim)":(x.chg>0?"var(--up)":(x.chg<0?"var(--down)":"var(--muted)"));
+      const av=(x.amt>0?"+":"")+x.amt.toLocaleString();
+      const avc=cls==="buy"?"var(--up)":"var(--down)";
+      return `<div class="frow ${cls}"><span class="fbar" style="width:${w}%"></span>
+        <span class="frk">${i+1}</span>
+        <span class="fnm2" onclick="openChart('${x.sid}')">${x.name||x.sid}<i>${x.sid}</i></span>
+        <span class="fval" style="color:${avc}">${av}<small>億</small></span>
+        <span class="fcg" style="color:${cgc}">${cg}</span></div>`;
+    }).join("")||`<div class="tpempty">無</div>`;
+    return `<div class="tpanel"><div class="tphd ${cls}">${title}</div>${rows}</div>`;
+  };
+  root.innerHTML=panel("買超 TOP10","buy",grp.buy)+panel("賣超 TOP10","sell",grp.sell);
+}
+(function(){ const c=document.getElementById("fchips"); if(!c) return;
+  c.querySelectorAll(".fchip").forEach(b=>b.addEventListener("click",()=>{
+    c.querySelectorAll(".fchip").forEach(x=>x.classList.remove("on")); b.classList.add("on");
+    flowKey=b.dataset.fk; renderFlows();
+  }));
+})();
 let trustThr = 50;
 let trustSort = {key:"評分", asc:false};
 const SELL_BACK_FRAC = 0.6;   // 連買後若被賣回 ≥ 此比例的累計買超 → 視為投信已落跑，排除
@@ -1046,6 +1142,7 @@ loadIndex();
 
 renderDD();
 renderExtras();
+renderFlows();
 renderTrust();
 render();
 </script>

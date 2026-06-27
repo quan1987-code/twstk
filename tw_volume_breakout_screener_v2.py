@@ -435,8 +435,28 @@ TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
 
 
+def _t86_indices(fields):
+    def find(*cands):
+        for c in cands:
+            if c in fields:
+                return fields.index(c)
+        for i, f in enumerate(fields):
+            if any(c in f for c in cands):
+                return i
+        return None
+    return {
+        "code": find("證券代號"),
+        "fmain": find("外陸資買賣超股數(不含外資自營商)", "外資及陸資買賣超股數(不含外資自營商)"),
+        "fdeal": find("外資自營商買賣超股數"),
+        "trust": find("投信買賣超股數"),
+        "dealer": find("自營商買賣超股數"),
+        "total": find("三大法人買賣超股數"),
+    }
+
+
 def fetch_twse_t86(sess, ymd):
-    """抓某日(YYYYMMDD)上市三大法人買賣超，回傳 [(stock_id, date_iso, 投信淨買張), ...]。"""
+    """抓某日(YYYYMMDD)上市三大法人買賣超，回傳
+    [(stock_id, date_iso, 外資張, 投信張, 自營張, 三大法人合計張), ...]。缺欄位以 None 表示。"""
     url = f"{T86_URL}?response=json&date={ymd}&selectType=ALL"
     r = sess.get(url, timeout=CONFIG["HTTP_TIMEOUT"])
     r.raise_for_status()
@@ -448,35 +468,51 @@ def fetch_twse_t86(sess, ymd):
         fields, data = j.get("fields", []), j.get("data", [])
     if not fields or not data:
         return []
-    try:
-        ic = fields.index("證券代號")
-        it = fields.index("投信買賣超股數")
-    except ValueError:
+    idx = _t86_indices(fields)
+    if idx["code"] is None or idx["trust"] is None:
         return []
     iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+    def lots(row, i):
+        if i is None or i >= len(row):
+            return None
+        v = to_float(row[i])
+        return None if v != v else round(v / 1000.0, 1)   # 股數 → 張
+
     out = []
     for row in data:
-        code = str(row[ic]).strip()
+        code = str(row[idx["code"]]).strip()
         if not is_common_stock(code):
             continue
-        net = to_float(row[it])
-        out.append((code, iso, round((0.0 if net != net else net) / 1000.0, 1)))
+        fm, fd = lots(row, idx["fmain"]), lots(row, idx["fdeal"])
+        foreign = None if (fm is None and fd is None) else round((fm or 0) + (fd or 0), 1)
+        trust = lots(row, idx["trust"])
+        dealer = lots(row, idx["dealer"])
+        total = lots(row, idx["total"])
+        out.append((code, iso, foreign, trust, dealer, total))
     return out
 
 
 def update_inst(con, sess):
-    """把最近 TRUST_LOOKBACK 個交易日、尚未抓過的『投信買賣超』補進 inst 表（每日通常只差1天）。"""
+    """把最近 INST_LOOKBACK 個交易日的『三大法人(外資/投信/自營/合計)買賣超』補進 inst 表。
+    舊版只有 trust_lots，本版新增 foreign/dealer/total 三欄；缺這些欄位(total IS NULL)的日期會重抓一次。"""
     con.execute("CREATE TABLE IF NOT EXISTS inst("
                 "stock_id TEXT, date TEXT, trust_lots REAL, PRIMARY KEY(stock_id,date))")
+    for col in ("foreign_lots", "dealer_lots", "total_lots"):
+        try:
+            con.execute(f"ALTER TABLE inst ADD COLUMN {col} REAL")
+        except sqlite3.OperationalError:
+            pass   # 欄位已存在
     con.commit()
     dates = [r[0] for r in con.execute(
         "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (INST_LOOKBACK,))]
-    have = set(r[0] for r in con.execute("SELECT DISTINCT date FROM inst"))
+    have = set(r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM inst WHERE total_lots IS NOT NULL"))
     todo = [d for d in dates if d not in have]
     if not todo:
-        print("投信買賣超：已是最新。")
+        print("三大法人買賣超：已是最新。")
         return
-    print(f"更新投信買賣超：需抓 {len(todo)} 個交易日…")
+    print(f"更新三大法人買賣超：需抓 {len(todo)} 個交易日（首次含補三大法人欄位）…")
     n = 0
     for d in sorted(todo):
         try:
@@ -485,11 +521,14 @@ def update_inst(con, sess):
             print(f"  T86 {d} 失敗：{e}")
             continue
         if rows:
-            con.executemany("INSERT OR IGNORE INTO inst VALUES (?,?,?)", rows)
+            con.executemany(
+                "INSERT OR REPLACE INTO inst"
+                "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
+                " VALUES (?,?,?,?,?,?)", rows)
             con.commit()
             n += 1
         time.sleep(1.2)
-    print(f"投信買賣超更新完成：新增 {n} 個交易日。")
+    print(f"三大法人買賣超更新完成：新增/補齊 {n} 個交易日。")
 
 
 def build_trust_candidates(con):
@@ -697,6 +736,77 @@ def output_market_extras(extras):
     print(f"已輸出法人動向：{path}")
 
 
+# ============================================================
+#  資金流向：大戶(三大法人合計) / 投信，最近一日 + 近30日 買賣超 TOP10（依金額億）
+# ============================================================
+FLOW_WINDOW = 30        # 近 N 個交易日累計
+FLOW_TOPN = 10
+
+
+def build_flows(con):
+    """以 inst 表(三大法人/投信張數) × 當日收盤估算買賣超金額(億)，
+    產出 大戶/投信 各『最近一日』與『近30日累計』的買超/賣超 TOP10。"""
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM inst WHERE total_lots IS NOT NULL "
+        "ORDER BY date DESC LIMIT ?", (FLOW_WINDOW,))]
+    if not dates:
+        print("資金流向：inst 尚無三大法人資料，略過（下次抓到後即產生）。")
+        return None
+    latest = dates[0]
+    win_min = dates[-1]
+    names = {r[0]: r[1] for r in con.execute("SELECT stock_id,name FROM stock")}
+
+    # 最近一日漲跌%
+    prev = con.execute("SELECT DISTINCT date FROM price WHERE date < ? ORDER BY date DESC LIMIT 1",
+                       (latest,)).fetchone()
+    chg = {}
+    if prev:
+        cur = dict(con.execute("SELECT stock_id,close FROM price WHERE date=?", (latest,)))
+        prv = dict(con.execute("SELECT stock_id,close FROM price WHERE date=?", (prev[0],)))
+        for sid, c in cur.items():
+            p = prv.get(sid)
+            if c is not None and p:
+                chg[sid] = round((c - p) / p * 100, 2)
+
+    def amounts(col, since):
+        # 金額(億) = Σ 張 × 1000 × 收盤 / 1e8 = Σ 張 × 收盤 / 1e5
+        rows = con.execute(
+            f"SELECT i.stock_id, i.{col}, p.close FROM inst i "
+            f"JOIN price p ON p.stock_id=i.stock_id AND p.date=i.date "
+            f"WHERE i.date>=? AND i.{col} IS NOT NULL", (since,)).fetchall()
+        out = {}
+        for sid, lots, close in rows:
+            if lots is None or close is None:
+                continue
+            out[sid] = out.get(sid, 0.0) + lots * close / 1e5
+        return out
+
+    def top(amts):
+        items = list(amts.items())
+        buy = sorted((x for x in items if x[1] > 0), key=lambda t: -t[1])[:FLOW_TOPN]
+        sell = sorted((x for x in items if x[1] < 0), key=lambda t: t[1])[:FLOW_TOPN]
+        mk = lambda lst: [{"sid": s, "name": names.get(s, ""), "amt": round(a, 1),
+                           "chg": chg.get(s)} for s, a in lst]
+        return {"buy": mk(buy), "sell": mk(sell)}
+
+    return {"date": latest, "win_from": win_min, "win_days": len(dates),
+            "big_d": top(amounts("total_lots", latest)),
+            "big_30": top(amounts("total_lots", win_min)),
+            "trust_d": top(amounts("trust_lots", latest)),
+            "trust_30": top(amounts("trust_lots", win_min))}
+
+
+def output_flows(flows):
+    if not flows:
+        return
+    os.makedirs(CONFIG["OUTPUT_DIR"], exist_ok=True)
+    d = (flows.get("date") or dt.date.today().isoformat()).replace("-", "")
+    path = os.path.join(CONFIG["OUTPUT_DIR"], f"flows_{d}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(flows, f, ensure_ascii=False)
+    print(f"已輸出資金流向 TOP10：{path}")
+
+
 def write_empty_csv(newest=None):
     """無入選或抓不到當日資料時，仍輸出一份只有表頭的 CSV，
     確保看板程式一定找得到檔案，整條流程不會中斷。"""
@@ -766,6 +876,12 @@ def main():
         print(f"投信連買候選：{len(cands)} 檔（張數門檻於網頁端切換）")
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
+
+    # 資金流向 TOP10（大戶=三大法人合計 / 投信；最近一日 + 近30日）
+    try:
+        output_flows(build_flows(con))
+    except Exception as e:
+        print(f"資金流向產出失敗（不影響主流程）：{e}")
 
     # ⑦ 法人動向：三大法人 / 融資融券 / 外資台指期（全新資料源，失敗不影響主流程）
     try:
