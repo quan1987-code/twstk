@@ -396,6 +396,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .tabbar{display:flex; gap:6px; margin:14px 0; background:var(--card); padding:5px; border-radius:11px; border:1px solid var(--border);}
   .tab{flex:1; background:transparent; color:var(--muted); border:none; border-radius:8px; padding:10px 8px; font-size:14px; font-weight:700; cursor:pointer;}
   .tab.on{background:var(--amber-s); color:var(--amber);}
+  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:linear-gradient(90deg,rgba(245,165,36,.16),rgba(77,159,255,.10)); border:1px solid rgba(245,165,36,.3); border-radius:11px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
+  .czentry .arr{color:var(--amber); font-weight:800; font-size:17px;}
+  .czentry .czt2{display:block; font-size:11px; color:var(--muted); font-weight:600; margin-top:3px;}
+  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:linear-gradient(90deg,rgba(245,165,36,.16),rgba(77,159,255,.10)); border:1px solid rgba(245,165,36,.32); border-radius:11px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
+  .czentry .czt2{font-size:11px; color:var(--muted); font-weight:600; margin-left:2px;}
+  .czentry .arr{color:var(--amber); font-weight:800; font-size:16px;}
 
   /* 首頁回撤卡 */
   .ddcards{display:grid; grid-template-columns:1fr; gap:12px;}
@@ -550,6 +556,11 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="tab" data-tab="trust">投信連買</button>
     <button class="tab" data-tab="flow">資金流向</button>
   </div>
+
+  <a class="czentry" href="chuzhi.html">
+    <span>🚦 處置股專區<span class="czt2">即將／確定／處置中／出關 監控 ＋ 實戰SOP</span></span>
+    <span class="arr">→</span>
+  </a>
 
   <!-- 分頁一：首頁 -->
   <div class="tabpane" id="tab-home">
