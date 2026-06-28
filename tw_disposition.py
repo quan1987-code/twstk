@@ -33,10 +33,11 @@ OUT_DIR = "site"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 HTTP_TIMEOUT = 30
-CHIP_MAX_STOCKS = 80          # 分點最多處理幾檔
-CHIP_SLEEP = 0.3
-CHIP_TDAYS = 30               # 分點/主力序列涵蓋的交易日數
-CHIP_TIMEOUT = 90             # 分點請求逾時(秒)，比一般長
+CHIP_MAX_STOCKS = 60          # 分點最多處理幾檔（控制首次回補時間）
+CHIP_SLEEP = 0.25
+CHIP_TIMEOUT = 45             # 分點(單日)請求逾時秒
+MF_HISTORY_DAYS = 40          # 主力序列最多看回幾個交易日
+MF_BACKFILL_CAP = 10          # 每檔每次最多補抓幾日（首次回補上限；之後每日約+1）
 RELEASED_WINDOW_TD = 5
 WATCH_CUM6_MIN = 25.0
 K1_THRESHOLD = 32.0
@@ -274,33 +275,26 @@ def trading_dates(con, n):
     ds = [r[0] for r in con.execute("SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (n,))]
     return sorted(ds)
 
-def chip_collect(token, sid, tdates):
-    """先試區間抓(1次)；若回空或<2天則逐日抓(單日已證實可用)。回傳 (df, date_col, source)。"""
-    if requests is None or not token: return pd.DataFrame(), None, "no-token"
-    start, end = tdates[0], tdates[-1]
-    df = pd.DataFrame()
-    try:
-        df = finmind_get("TaiwanStockTradingDailyReport", token, timeout=CHIP_TIMEOUT,
-                         data_id=sid, start_date=start, end_date=end)
-    except Exception as e:
-        print(f"    分點區間 {sid} 失敗：{e}")
-    cd = _date_col(df)
-    nd = len(set(df[cd].astype(str).str[:10])) if (cd and not df.empty) else 0
-    if nd >= 2:
-        return df, cd, "range"
-    frames = []
-    for d in tdates:
-        try:
-            dd = finmind_get("TaiwanStockTradingDailyReport", token, timeout=CHIP_TIMEOUT,
-                             data_id=sid, start_date=d, end_date=d)
-        except Exception:
-            dd = pd.DataFrame()
-        if dd is not None and not dd.empty: frames.append(dd)
-        time.sleep(CHIP_SLEEP)
-    if not frames:
-        return (df if not df.empty else pd.DataFrame()), _date_col(df), "none"
-    df2 = pd.concat(frames, ignore_index=True)
-    return df2, _date_col(df2), "daily"
+# 主力買賣超快取表（存進 twstock.db，跨次累積，避免每次重抓）
+def ensure_mf_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS mainforce(stock_id TEXT, date TEXT, mf REAL, PRIMARY KEY(stock_id,date))")
+    con.commit()
+
+def cached_mf_dates(con, sid):
+    return set(r[0] for r in con.execute("SELECT date FROM mainforce WHERE stock_id=?", (sid,)))
+
+def load_mf_series(con, sid, dates):
+    if not dates: return {}
+    qm = ",".join("?" * len(dates))
+    rows = con.execute(f"SELECT date,mf FROM mainforce WHERE stock_id=? AND date IN ({qm}) AND mf IS NOT NULL",
+                       [sid] + list(dates)).fetchall()
+    return {d: m for d, m in rows}
+
+def window_cc(ser, voln, dates):
+    """主N = Σ(主力買賣超張) ÷ Σ(成交量張) ×100（等於各日集中度的量加權）。"""
+    num = sum(ser[d] for d in dates if d in ser)
+    den = sum(voln[d] for d in dates if d in ser and d in voln)
+    return round(num / den * 100, 1) if den > 0 else None
 
 def patch_stock_mf(out_dir, sid, mf_series):
     """把主力買賣超日序列寫進 site/data/{sid}.json 的 mfs/mf。"""
@@ -457,35 +451,41 @@ def main():
     for r in confirmed: r["st"] = None
     for r in released: r["st"] = 0
 
-    # 分點：對 ongoing+confirmed+released+watch 子集 → CC5/CC10 + 每日主力序列 + 回寫逐檔
-    if not args.no_chips:
+    # 分點：用快取表累積每日主力買賣超，只補抓「還沒存過」的近幾天（單日抓，FinMind 分點不支援區間）
+    if not args.no_chips and FINMIND_TOKEN:
+        ensure_mf_table(con)
         targets = list(dict.fromkeys([r["sid"] for r in ongoing] + [r["sid"] for r in confirmed]
                                      + [r["sid"] for r in released] + [r["sid"] for r in watch]))[:CHIP_MAX_STOCKS]
-        tdates = trading_dates(con, CHIP_TDAYS)
+        mf_dates = trading_dates(con, MF_HISTORY_DAYS)
         idx_for = {r["sid"]: r for lst in (ongoing,confirmed,released,watch) for r in lst}
-        ok = 0; patched = 0; src_count = {"range":0,"daily":0,"none":0,"no-token":0}; dbg_done = False
+        fetched = 0; patched = 0; dbg_done = False
         for sid in targets:
-            df, cd, src = chip_collect(FINMIND_TOKEN, sid, tdates)
-            src_count[src] = src_count.get(src, 0) + 1
-            if src == "range": time.sleep(CHIP_SLEEP)
-            if df is None or df.empty or not cd:
+            have = cached_mf_dates(con, sid)
+            to_fetch = [d for d in mf_dates if d not in have][-MF_BACKFILL_CAP:]
+            for d in to_fetch:
+                try:
+                    df = finmind_get("TaiwanStockTradingDailyReport", FINMIND_TOKEN, timeout=CHIP_TIMEOUT,
+                                     data_id=sid, start_date=d, end_date=d)
+                except Exception:
+                    df = pd.DataFrame()
                 if not dbg_done:
                     cols = list(df.columns) if (df is not None and not df.empty) else []
-                    diag["notes"].append(f"分點首檔診斷 {sid}: src={src} rows={0 if df is None else len(df)} cols={cols}")
+                    diag["notes"].append(f"分點首檔 {sid} {d}: rows={0 if df is None else len(df)} cols={cols}")
                     dbg_done = True
-                continue
-            if not dbg_done:
-                diag["notes"].append(f"分點首檔 {sid}: src={src} rows={len(df)} datecol={cd}")
-                dbg_done = True
-            dts = sorted(set(df[cd].astype(str).str[:10]))
+                mf, _ = cc_from_df(df)
+                con.execute("INSERT OR REPLACE INTO mainforce VALUES (?,?,?)", (sid, d, mf))
+                fetched += 1
+                time.sleep(CHIP_SLEEP)
+            con.commit()
+            ser = load_mf_series(con, sid, mf_dates)
+            if patch_stock_mf(args.out, sid, ser): patched += 1
+            seq = win.get(sid, [])
+            voln = {dd: (v/1000.0) for dd,_,_,_,v in seq if v}
             r = idx_for.get(sid)
-            if r is not None:
-                r["z5"] = cc_over_dates(df, set(dts[-5:]), cd)[1] if dts else None
-                r["z10"] = cc_over_dates(df, set(dts[-10:]), cd)[1] if dts else None
-            series = daily_main_force(df, cd)
-            if patch_stock_mf(args.out, sid, series): patched += 1
-            ok += 1
-        diag["notes"].append(f"分點成功 {ok}/{len(targets)} 檔（區間{src_count['range']}/逐日{src_count['daily']}/無{src_count['none']}），主力序列回寫 {patched} 檔")
+            if r is not None and ser:
+                r["z5"] = window_cc(ser, voln, mf_dates[-5:])
+                r["z10"] = window_cc(ser, voln, mf_dates[-10:])
+        diag["notes"].append(f"分點：本次抓 {fetched} 日，主力序列回寫 {patched}/{len(targets)} 檔（快取累積中）")
     con.close()
     write_outputs(args.out, build_payload(today, next_td, watch, confirmed, ongoing, released, diag))
 
