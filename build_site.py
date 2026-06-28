@@ -662,7 +662,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="back" onclick="closeChart()">◀ 返回</button>
     <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span></div>
     <div class="cvchg" id="cvChg"></div>
-    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button></div>
+    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" style="margin-left:5px">下圖:MACD</button></div>
   </div>
   <div class="readout" id="readout"></div>
   <div class="malegend">
@@ -981,7 +981,7 @@ function aggregate(daily, period){
   for(const b of daily){ const k=key(b[0]); if(!map[k]){ map[k]={d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}; order.push(k);} else { const g=map[k]; g.h=Math.max(g.h,b[2]); g.l=Math.min(g.l,b[3]); g.c=b[4]; g.v+=b[5]; g.d=b[0]; } }
   return order.map(k=>map[k]);
 }
-let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[] };
+let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
 function computeInd(bars){
   const close=bars.map(b=>b.c), vol=bars.map(b=>b.v);
   const ma={}; PRICE_MAS.forEach(n=>ma[n]=SMA(close,n));
@@ -998,7 +998,7 @@ async function fetchStock(sid){
     const j=await res.json();
     const n=j.d.length, bars=new Array(n);
     for(let i=0;i<n;i++) bars[i]=[j.d[i],j.o[i],j.h[i],j.l[i],j.c[i],j.v[i]];
-    const o={name:j.n||"", market:j.m||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[])};
+    const o={name:j.n||"", market:j.m||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]), mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[])};
     HISTORY[sid]=o; return o;
   }catch(e){ return null; }
 }
@@ -1008,13 +1008,14 @@ async function openChart(sid){
   const r=RESULTS.find(x=>x["代號"]===sid)||{};
   const td=(TRUST&&TRUST.data&&TRUST.data[sid])||null;
   const name=r["名稱"]||o.name||(td?td.name:"")||"";
-  CH.sid=sid; CH.offset=0; CH.hover=null; CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t;
+  CH.sid=sid; CH.offset=0; CH.hover=null; CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t; CH.macdMode="macd"; CH.mfs=o.mfs; CH.mf=o.mf;
   document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
   if(r["收盤"]!=null && r["漲跌%"]!=null){ const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
     document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
   } else { const lc=o.bars[o.bars.length-1][4];
     document.getElementById("cvChg").innerHTML=`<span style="color:var(--muted)">${lc!=null?lc.toFixed(2):""}</span>`; }
   const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent="副圖:量";
+  const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent="下圖:MACD";
   document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
   setPeriod("D"); document.getElementById("cv").classList.add("open");
 }
@@ -1030,14 +1031,41 @@ function setPeriod(p){
   CH.tnet=[]; CH.tcum=[]; let cum=0, started=false;
   for(const b of CH.bars){ const k=periodKey(b.d,p); const hv=has[k]===true; const nv=hv?net[k]:null;
     CH.tnet.push(nv); if(hv){ started=true; cum+=nv; } CH.tcum.push(started?cum:null); }
+  const mfs=CH.mfs, mm=CH.mf, mnet={}, mhas={};
+  for(let i=0;i<daily.length;i++){ const k=periodKey(daily[i][0],p); const val=(i>=mfs)?mm[i-mfs]:null;
+    if(val!=null){ mnet[k]=(mnet[k]||0)+val; mhas[k]=true; } }
+  CH.mnet=[]; CH.mcum=[]; let mcum=0, mstarted=false;
+  for(const b of CH.bars){ const k=periodKey(b.d,p); const hv=mhas[k]===true; const nv=hv?mnet[k]:null;
+    CH.mnet.push(nv); if(hv){ mstarted=true; mcum+=nv; } CH.mcum.push(mstarted?mcum:null); }
   CH.count=Math.min(CH.bars.length, p==="D"?90:(p==="W"?80:60)); drawChart();
 }
 function toggleVol(){ if(!CH.bars.length)return; CH.volMode=CH.volMode==="vol"?"inst":"vol"; const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent=CH.volMode==="vol"?"副圖:量":"副圖:投信"; drawChart(); }
+function toggleMacd(){ if(!CH.bars.length)return; CH.macdMode=CH.macdMode==="macd"?"mforce":"macd"; const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent=CH.macdMode==="macd"?"下圖:MACD":"下圖:主力"; drawChart(); }
 document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".pbtn[data-p]").forEach(x=>x.classList.remove("on")); b.classList.add("on"); setPeriod(b.dataset.p);}));
 function visRange(){ const N=CH.bars.length, cnt=Math.min(CH.count,N); let end=N-CH.offset; if(end>N)end=N; let start=end-cnt; if(start<0)start=0; return {start,end}; }
 const PADL=50, PADR=12, GAP=8, DATEH=20;
 function layout(W,H){ const usable=H-DATEH, ph=Math.round(usable*0.56), vh=Math.round(usable*0.20);
   return { price:{y0:0,y1:ph}, vol:{y0:ph+GAP,y1:ph+GAP+vh}, macd:{y0:ph+GAP+vh+GAP,y1:usable}, dateY:usable }; }
+function drawMForce(ctx,L,start,end,xOf,bw,W){
+  const y0=L.macd.y0, y1=L.macd.y1, mid=Math.round((y0+y1)/2), hh=(y1-y0-4)/2;
+  ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mid); ctx.lineTo(W-PADR,mid); ctx.stroke();
+  let vmax=1e-9, any=false, lastCum=null;
+  for(let i=start;i<end;i++){ const nv=CH.mnet[i], cv=CH.mcum[i];
+    if(nv!=null){ any=true; vmax=Math.max(vmax,Math.abs(nv)); }
+    if(cv!=null){ vmax=Math.max(vmax,Math.abs(cv)); lastCum=cv; } }
+  if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText("此區間無主力買賣超資料（僅處置相關個股提供）",(PADL+W-PADR)/2,mid);
+    ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("主力買賣超",PADL+2,y0+2); return; }
+  const vY=(v)=> mid - v/vmax*hh;
+  for(let i=start;i<end;i++){ const v=CH.mnet[i]; if(v==null)continue; const x=xOf(i), y=vY(v);
+    ctx.fillStyle=v>=0?"rgba(255,77,79,.8)":"rgba(34,197,94,.8)"; const bodyW=Math.max(bw*0.55,1);
+    ctx.fillRect(x-bodyW/2,Math.min(y,mid),bodyW,Math.abs(y-mid)||1); }
+  ctx.lineWidth=1.5; ctx.strokeStyle="#f5a524"; let st=false; ctx.beginPath();
+  for(let i=start;i<end;i++){ const v=CH.mcum[i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v);
+    if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke();
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("\u00b1"+Math.round(vmax)+"\u5f35",PADL-6,y0+8);
+  ctx.fillStyle="#f5a524"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("\u4e3b\u529b\u8cb7\u8ce3\u8d85(\u67f1) \u258f\u7d2f\u8a08(\u6a58\u7dda)"+(lastCum!=null?" "+Math.round(lastCum):""),PADL+2,y0+2);
+}
 function drawChart(){
   const cv=document.getElementById("chartCanvas"), box=cv.parentElement, W=box.clientWidth, H=box.clientHeight, dpr=window.devicePixelRatio||1;
   cv.width=W*dpr; cv.height=H*dpr; const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
@@ -1085,6 +1113,8 @@ function drawChart(){
       ctx.fillStyle="#f5c518"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("投信買賣超 ▏庫存(黃線)",PADL+2,y0+2);
     }
   }
+  if(CH.macdMode==="mforce"){ drawMForce(ctx,L,start,end,xOf,bw,W); }
+  else {
   const {dif,dea,osc}=CH.ind.macd; let mmax=1e-9; for(let i=start;i<end;i++){ [dif[i],dea[i],osc[i]].forEach(v=>{if(v!=null)mmax=Math.max(mmax,Math.abs(v));}); }
   const mMid=(L.macd.y0+L.macd.y1)/2, mH=(L.macd.y1-L.macd.y0-4)/2, mY=(v)=> mMid - v/mmax*mH;
   ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mMid); ctx.lineTo(W-PADR,mMid); ctx.stroke();
@@ -1092,6 +1122,7 @@ function drawChart(){
   for(let i=start;i<end;i++){ const v=osc[i]; if(v==null)continue; const x=xOf(i), y=mY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.8)":"rgba(34,197,94,.8)"; const bodyW=Math.max(bw*0.5,1); ctx.fillRect(x-bodyW/2,Math.min(y,mMid),bodyW,Math.abs(y-mMid)||1); }
   const dl=(arr,col)=>{ ctx.strokeStyle=col; ctx.lineWidth=1.3; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=arr[i]; if(v==null){st=false;continue;} const x=xOf(i),y=mY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); };
   dl(dif,"#e8c34a"); dl(dea,"#4d9fff");
+  }
   ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="top";
   const ticks=Math.min(6,n); for(let t=0;t<ticks;t++){ const i=start+Math.floor((n-1)*t/(ticks-1||1)); ctx.fillText(CH.bars[i].d.slice(2),xOf(i),L.dateY+4); }
   if(idx>=start&&idx<end){ const x=xOf(idx); ctx.strokeStyle="rgba(255,255,255,0.28)"; ctx.setLineDash([4,3]); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke(); ctx.setLineDash([]); }
@@ -1113,7 +1144,7 @@ let drag=null, suppressClick=false;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
 window.addEventListener("mouseup",()=>{ drag=null; });
 window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; suppressClick=true; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
-canvas.addEventListener("click",e=>{ if(suppressClick){suppressClick=false;return;} if(!CH.bars.length)return; const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(e.offsetY>=L.vol.y0&&e.offsetY<=L.vol.y1) toggleVol(); });
+canvas.addEventListener("click",e=>{ if(suppressClick){suppressClick=false;return;} if(!CH.bars.length)return; const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(e.offsetY>=L.vol.y0&&e.offsetY<=L.vol.y1) toggleVol(); else if(e.offsetY>=L.macd.y0&&e.offsetY<=L.macd.y1) toggleMacd(); });
 let pinch=null, tap=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
@@ -1127,7 +1158,7 @@ canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDef
     const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,N), dB=Math.round((tmid(e.touches)-pinch.mid)/bw);
     CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), pinch.off+dB)); drawChart(); } },{passive:false});
 canvas.addEventListener("touchend",e=>{ if(e.touches.length===0){ pinch=null;
-  if(tap&&!tap.moved&&(Date.now()-tap.t)<300){ const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(tap.y>=L.vol.y0&&tap.y<=L.vol.y1) toggleVol(); }
+  if(tap&&!tap.moved&&(Date.now()-tap.t)<300){ const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(tap.y>=L.vol.y0&&tap.y<=L.vol.y1) toggleVol(); else if(tap.y>=L.macd.y0&&tap.y<=L.macd.y1) toggleMacd(); }
   tap=null; } },{passive:false});
 window.addEventListener("resize",()=>{ if(document.getElementById("cv").classList.contains("open"))drawChart(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
@@ -1156,6 +1187,7 @@ renderExtras();
 renderFlows();
 renderTrust();
 render();
+(function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ openChart(sid.trim()); } }catch(e){} })();
 </script>
 </body>
 </html>"""
