@@ -39,6 +39,10 @@ jobs:
         run: python tw_volume_breakout_screener_v2.py
       - name: Build site
         run: python build_site.py
+      - name: Build 處置股專區
+        run: python tw_disposition.py
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       - name: Save price DB
         if: always()
         uses: actions/cache/save@v4
