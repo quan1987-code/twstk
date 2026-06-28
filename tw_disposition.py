@@ -16,6 +16,7 @@ r"""
   python tw_disposition.py --no-chips  # 跳過分點(省流量)
 """
 import os, sys, json, time, sqlite3, datetime, argparse
+from statistics import pstdev
 import pandas as pd
 try:
     import requests
@@ -32,9 +33,10 @@ OUT_DIR = "site"
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 HTTP_TIMEOUT = 30
-CHIP_MAX_STOCKS = 90          # 分點最多處理幾檔
-CHIP_SLEEP = 0.35
-CHIP_WINDOW_DAYS = 90         # 分點/主力序列抓近幾個日曆天
+CHIP_MAX_STOCKS = 80          # 分點最多處理幾檔
+CHIP_SLEEP = 0.3
+CHIP_TDAYS = 30               # 分點/主力序列涵蓋的交易日數
+CHIP_TIMEOUT = 90             # 分點請求逾時(秒)，比一般長
 RELEASED_WINDOW_TD = 5
 WATCH_CUM6_MIN = 25.0
 K1_THRESHOLD = 32.0
@@ -205,14 +207,14 @@ def compute_price_metrics(seq, idx6=0.0, disp_start=None):
     if len(vols) >= 21:
         avg = sum(vols[-21:-1])/20.0
         out["ll"] = round(vols[-1]/avg*100, 0) if avg else None
-    # 月斜：MA20 斜率%
-    ma20 = _ma(closes, 20); ma20p = _ma(closes[:-5], 20) if len(closes) >= 25 else None
-    if ma20 and ma20p: out["yx"] = round((ma20/ma20p-1)*100, 2)
-    # 位階：近60日高低區間位置(0~100)
-    if len(closes) >= 10:
-        hh = max(highs[-60:]) if highs else None; ll = min(lows[-60:]) if lows else None
-        if hh is not None and ll is not None and hh > ll:
-            out["wj"] = round((last-ll)/(hh-ll)*100, 0)
+    # 月斜：月線(MA20) 1日斜率%（小哥定義：>1%強勢、>3%妖股）
+    ma20 = _ma(closes, 20); ma20_1 = _ma(closes[:-1], 20) if len(closes) >= 21 else None
+    if ma20 and ma20_1: out["yx"] = round((ma20/ma20_1-1)*100, 2)
+    # 位階：小哥用「布林通道」定義，+10基期高/-10基期低 → (收盤-MA20)/(2*STD20)*10
+    if len(closes) >= 20 and ma20:
+        sd = pstdev(closes[-20:])
+        if sd > 0:
+            out["wj"] = round(max(-15.0, min(15.0, (last-ma20)/(2*sd)*10)), 1)
     # 累幅
     if disp_start:
         sc = None
@@ -248,10 +250,13 @@ def cc_from_df(df):
     cc = (pos - abs(neg))/tb*100.0
     return round(mf, 0), round(cc, 1)
 
-def daily_main_force(df):
+def _date_col(df):
+    return pick_col(df, CHIP_COLS["date"]) or (detect_date_cols(df)[0] if (df is not None and not df.empty) else None)
+
+def daily_main_force(df, cd=None):
     """回傳 {date: 主力買賣超張}。"""
     if df is None or df.empty: return {}
-    cd = pick_col(df, CHIP_COLS["date"])
+    cd = cd or _date_col(df)
     if not cd: return {}
     out = {}
     for dt, sub in df.groupby(cd):
@@ -259,19 +264,43 @@ def daily_main_force(df):
         if mf is not None: out[str(dt)[:10]] = mf
     return out
 
-def cc_over_dates(df, date_set):
-    cd = pick_col(df, CHIP_COLS["date"])
+def cc_over_dates(df, date_set, cd=None):
+    cd = cd or _date_col(df)
     if not cd: return None, None
     sub = df[df[cd].astype(str).str[:10].isin(date_set)]
     return cc_from_df(sub)
 
-def fetch_chip_window(token, sid, start_date, end_date):
-    if requests is None or not token: return pd.DataFrame()
+def trading_dates(con, n):
+    ds = [r[0] for r in con.execute("SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (n,))]
+    return sorted(ds)
+
+def chip_collect(token, sid, tdates):
+    """先試區間抓(1次)；若回空或<2天則逐日抓(單日已證實可用)。回傳 (df, date_col, source)。"""
+    if requests is None or not token: return pd.DataFrame(), None, "no-token"
+    start, end = tdates[0], tdates[-1]
+    df = pd.DataFrame()
     try:
-        return finmind_get("TaiwanStockTradingDailyReport", token, data_id=sid,
-                           start_date=start_date, end_date=end_date)
+        df = finmind_get("TaiwanStockTradingDailyReport", token, timeout=CHIP_TIMEOUT,
+                         data_id=sid, start_date=start, end_date=end)
     except Exception as e:
-        print(f"    分點 {sid} 失敗：{e}"); return pd.DataFrame()
+        print(f"    分點區間 {sid} 失敗：{e}")
+    cd = _date_col(df)
+    nd = len(set(df[cd].astype(str).str[:10])) if (cd and not df.empty) else 0
+    if nd >= 2:
+        return df, cd, "range"
+    frames = []
+    for d in tdates:
+        try:
+            dd = finmind_get("TaiwanStockTradingDailyReport", token, timeout=CHIP_TIMEOUT,
+                             data_id=sid, start_date=d, end_date=d)
+        except Exception:
+            dd = pd.DataFrame()
+        if dd is not None and not dd.empty: frames.append(dd)
+        time.sleep(CHIP_SLEEP)
+    if not frames:
+        return (df if not df.empty else pd.DataFrame()), _date_col(df), "none"
+    df2 = pd.concat(frames, ignore_index=True)
+    return df2, _date_col(df2), "daily"
 
 def patch_stock_mf(out_dir, sid, mf_series):
     """把主力買賣超日序列寫進 site/data/{sid}.json 的 mfs/mf。"""
@@ -293,13 +322,13 @@ def patch_stock_mf(out_dir, sid, mf_series):
     return True
 
 # ===== FinMind =====
-def finmind_get(dataset, token, max_retry=4, **params):
+def finmind_get(dataset, token, max_retry=4, timeout=None, **params):
     if requests is None: raise RuntimeError("requests 未安裝")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     q = {"dataset": dataset, **params}; wait = 8
     for _ in range(max_retry):
         try:
-            resp = requests.get(FINMIND_URL, headers=headers, params=q, timeout=HTTP_TIMEOUT)
+            resp = requests.get(FINMIND_URL, headers=headers, params=q, timeout=timeout or HTTP_TIMEOUT)
         except Exception as e:
             print(f"    [連線錯誤] {e}"); time.sleep(wait); wait = min(wait*2, 120); continue
         if resp.status_code in (402, 429):
@@ -334,23 +363,23 @@ def make_demo():
     def row(sid,name,mkt,close,chg,**kw):
         d = {"sid":sid,"name":name,"mkt":mkt,"close":close,"chg":chg}; d.update(kw); return d
     watch = [
-        row("4129","聯合","上市",58.9,9.92,light="red",lc=2,ll=243,wj=88,yx=2.1,lf=33.8,st=1,z5=11.2,z10=8.4),
-        row("3083","網龍","上櫃",102.0,3.55,light="amber",lc=0,ll=168,wj=71,yx=1.4,lf=26.1,st=2,z5=-3.4,z10=-1.1),
+        row("4129","聯合","上市",58.9,9.92,light="red",lc=2,ll=243,wj=8.5,yx=2.1,lf=33.8,st=1,z5=11.2,z10=8.4),
+        row("3083","網龍","上櫃",102.0,3.55,light="amber",lc=0,ll=168,wj=6.2,yx=1.4,lf=26.1,st=2,z5=-3.4,z10=-1.1),
     ]
     confirmed = [
         row("2618","長榮航","上市",48.6,9.95,round=1,method="5分盤",start="2026-06-30",end="2026-07-11",
-            lc=3,ll=251,wj=62,yx=1.6,lf=-14.0,st=10,z5=-6.4,z10=-5.2),
+            lc=3,ll=251,wj=5.1,yx=1.6,lf=-14.0,st=10,z5=-6.4,z10=-5.2),
     ]
     ongoing = [
         row("2484","希華","上市",42.55,2.53,round=1,method="5分盤",start="2026-06-23",end="2026-07-04",
-            day_n=3,day_total=10,release="2026-07-04",d2r=1,lc=3,ll=251,wj=3,yx=1.6,lf=-14.0,st=1,z5=-6.4,z10=-5.2),
+            day_n=3,day_total=10,release="2026-07-04",d2r=1,lc=3,ll=251,wj=0.3,yx=1.6,lf=-14.0,st=1,z5=-6.4,z10=-5.2),
         row("3339","泰谷","上市",59.8,-0.33,round=1,method="5分盤",start="2026-06-23",end="2026-07-07",
-            day_n=3,day_total=11,release="2026-07-07",d2r=2,lc=3,ll=176,wj=19,yx=1.9,lf=-13.0,st=2,z5=7.1,z10=1.3),
+            day_n=3,day_total=11,release="2026-07-07",d2r=2,lc=3,ll=176,wj=1.9,yx=1.9,lf=-13.0,st=2,z5=7.1,z10=1.3),
         row("8289","泰藝","上市",49.35,5.45,round=2,method="20分盤",start="2026-06-23",end="2026-07-09",
-            day_n=11,day_total=12,release="2026-07-09",d2r=1,lc=11,ll=168,wj=4,yx=1.5,lf=-13.0,st=1,z5=-6.2,z10=-7.2),
+            day_n=11,day_total=12,release="2026-07-09",d2r=1,lc=11,ll=168,wj=0.4,yx=1.5,lf=-13.0,st=1,z5=-6.2,z10=-7.2),
     ]
     released = [
-        row("6442","光聖","上市",2060,-1.20,end="2026-06-26",since=1,lc=1,ll=42,wj=-2,yx=0.1,lf=-12.0,st=0,z5=2.4,z10=-7.7),
+        row("6442","光聖","上市",2060,-1.20,end="2026-06-26",since=1,lc=1,ll=42,wj=-2.0,yx=0.1,lf=-12.0,st=0,z5=2.4,z10=-7.7),
     ]
     return build_payload(today, next_trading_day(today), watch, confirmed, ongoing, released, diag)
 
@@ -428,28 +457,35 @@ def main():
     for r in confirmed: r["st"] = None
     for r in released: r["st"] = 0
 
-    # 分點：對 ongoing+confirmed+released+watch 子集，一次抓區間 → CC5/CC10 + 每日主力序列 + 回寫逐檔
+    # 分點：對 ongoing+confirmed+released+watch 子集 → CC5/CC10 + 每日主力序列 + 回寫逐檔
     if not args.no_chips:
         targets = list(dict.fromkeys([r["sid"] for r in ongoing] + [r["sid"] for r in confirmed]
                                      + [r["sid"] for r in released] + [r["sid"] for r in watch]))[:CHIP_MAX_STOCKS]
-        cs = (datetime.date.fromisoformat(today) - datetime.timedelta(days=CHIP_WINDOW_DAYS)).isoformat()
+        tdates = trading_dates(con, CHIP_TDAYS)
         idx_for = {r["sid"]: r for lst in (ongoing,confirmed,released,watch) for r in lst}
-        ok = 0; patched = 0
+        ok = 0; patched = 0; src_count = {"range":0,"daily":0,"none":0,"no-token":0}; dbg_done = False
         for sid in targets:
-            df = fetch_chip_window(FINMIND_TOKEN, sid, cs, today)
-            time.sleep(CHIP_SLEEP)
-            if df is None or df.empty: continue
-            cd = pick_col(df, CHIP_COLS["date"])
-            dts = sorted(set(df[cd].astype(str).str[:10])) if cd else []
-            z5 = cc_over_dates(df, set(dts[-5:]))[1] if dts else None
-            z10 = cc_over_dates(df, set(dts[-10:]))[1] if dts else None
+            df, cd, src = chip_collect(FINMIND_TOKEN, sid, tdates)
+            src_count[src] = src_count.get(src, 0) + 1
+            if src == "range": time.sleep(CHIP_SLEEP)
+            if df is None or df.empty or not cd:
+                if not dbg_done:
+                    cols = list(df.columns) if (df is not None and not df.empty) else []
+                    diag["notes"].append(f"分點首檔診斷 {sid}: src={src} rows={0 if df is None else len(df)} cols={cols}")
+                    dbg_done = True
+                continue
+            if not dbg_done:
+                diag["notes"].append(f"分點首檔 {sid}: src={src} rows={len(df)} datecol={cd}")
+                dbg_done = True
+            dts = sorted(set(df[cd].astype(str).str[:10]))
             r = idx_for.get(sid)
             if r is not None:
-                r["z5"] = z5; r["z10"] = z10
-            series = daily_main_force(df)
+                r["z5"] = cc_over_dates(df, set(dts[-5:]), cd)[1] if dts else None
+                r["z10"] = cc_over_dates(df, set(dts[-10:]), cd)[1] if dts else None
+            series = daily_main_force(df, cd)
             if patch_stock_mf(args.out, sid, series): patched += 1
             ok += 1
-        diag["notes"].append(f"分點成功 {ok}/{len(targets)} 檔，主力序列回寫 {patched} 檔")
+        diag["notes"].append(f"分點成功 {ok}/{len(targets)} 檔（區間{src_count['range']}/逐日{src_count['daily']}/無{src_count['none']}），主力序列回寫 {patched} 檔")
     con.close()
     write_outputs(args.out, build_payload(today, next_td, watch, confirmed, ongoing, released, diag))
 
@@ -741,8 +777,8 @@ const EXPL = `
 <span class="k">股價／漲幅</span><span>當日收盤價與當日漲跌幅。</span>
 <span class="k">連次</span><span>近期連續達「漲幅型注意（第1款）」的天數；越大代表越強勢、越接近升級處置。</span>
 <span class="k">連量</span><span>量比＝今日量 ÷ 近20日均量 ×100。&gt;200 為明顯爆量。</span>
-<span class="k">位階</span><span>現價在近60個交易日高低區間的位置（0＝區間最低、100＝最高）。</span>
-<span class="k">月斜</span><span>月線（20日線）斜率%＝(MA20今 − MA20五日前)÷MA20五日前×100。正值＝月線上揚。</span>
+<span class="k">位階</span><span>小哥用「布林通道」定義：<b>+10</b>＝股價基期偏高(近上軌、較適放空)、<b>-10</b>＝基期偏低(近下軌、較適做多)、0＝在月線。公式＝(收盤−MA20)÷(2×20日標準差)×10。</span>
+<span class="k">月斜</span><span>月線(20日線)1日斜率%。小哥定義：<b>&gt;1%＝強勢股、&gt;3%＝妖股</b>。公式＝(MA20今−MA20昨)÷MA20昨×100。</span>
 <span class="k">累幅</span><span>處置中／出關股＝自處置起算的累積漲跌%；即將進處置股＝近6日累積漲幅%。</span>
 <span class="k">剩天</span><span>距出關還剩幾個交易日（即將進處置股顯示距處置估計天數）。</span>
 <span class="k">主5／主10</span><span>近5日／近10日「籌碼集中度%」＝(前15買超分點 − 前15賣超分點)÷區間總量×100。正(紅)＝籌碼集中在主力；負(綠)＝主力派發。</span>
