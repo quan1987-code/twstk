@@ -27,6 +27,11 @@ try:
 except Exception:
     yf = None
 
+try:
+    import tw_industry
+except Exception:
+    tw_industry = None
+
 DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
 TRUST_CHART_BARS = 320   # 投信候選嵌入較短歷史以控制檔案大小
@@ -127,11 +132,25 @@ def _r2(x):
     return round(x, 2) if x is not None else None
 
 
-def write_stock_data(db_path, out_dir):
+def load_industry(db_path):
+    """回傳 {sid: 產業標籤}；無 DB 或模組時回空 dict。"""
+    if tw_industry is None or not os.path.exists(db_path):
+        return {}
+    try:
+        con = sqlite3.connect(db_path)
+        m = tw_industry.label_map(con)
+        con.close()
+        return m
+    except Exception:
+        return {}
+
+
+def write_stock_data(db_path, out_dir, industry=None):
     """為『每一檔』股票輸出精簡版逐檔資料檔 site/data/{代號}.json（含 2005 以來日線 + 近一年投信買賣超），
     並輸出 site/data/_index.json（全清單，給首頁搜尋用）。圖表改成『點哪檔才抓哪檔』，HTML 不再內嵌歷史。"""
     if not os.path.exists(db_path):
         return 0
+    industry = industry or {}
     ddir = os.path.join(out_dir, "data")
     os.makedirs(ddir, exist_ok=True)
     con = sqlite3.connect(db_path)
@@ -189,11 +208,12 @@ def write_stock_data(db_path, out_dir):
             mfs = lo
             mf = [round(mm.get(dd, 0.0), 1) for dd in d[mfs:]]
         name, mk = info.get(sid, ("", ""))
-        obj = {"n": name, "m": mk, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v,
+        ind = industry.get(sid, "")
+        obj = {"n": name, "m": mk, "ind": ind, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v,
                "ts": ts, "t": t, "mfs": mfs, "mf": mf}
         with open(os.path.join(ddir, f"{sid}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
-        index.append([sid, name, mk]); n += 1
+        index.append([sid, name, mk, ind]); n += 1
     with open(os.path.join(ddir, "_index.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, separators=(",", ":"))
     con.close()
@@ -319,7 +339,7 @@ def get_market():
     return out
 
 
-def build_html(results, history, market, trust, extras, flows, date, count, db_ok, gentime):
+def build_html(results, history, market, trust, extras, flows, date, count, db_ok, gentime, industry=None):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
@@ -327,16 +347,17 @@ def build_html(results, history, market, trust, extras, flows, date, count, db_o
             .replace("/*__TRUST__*/null", json.dumps(trust, ensure_ascii=False))
             .replace("/*__EXTRAS__*/null", json.dumps(extras, ensure_ascii=False))
             .replace("/*__FLOWS__*/null", json.dumps(flows, ensure_ascii=False))
+            .replace("/*__INDUSTRY__*/null", json.dumps(industry or {}, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
-def write_page(results, history, market, trust, extras, flows, date, db_ok, gentime):
+def write_page(results, history, market, trust, extras, flows, date, db_ok, gentime, industry=None):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime))
+        f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime, industry))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
                    "orientation": "portrait", "background_color": "#0a0f1a",
@@ -351,12 +372,13 @@ def main():
     extras = load_extras()
     flows = load_flows()
     have_db = os.path.exists(DB_PATH)
+    industry = load_industry(DB_PATH) if have_db else {}
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
         print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
-        nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-        write_page([], {}, market, trust, extras, flows, "", have_db, gentime)
+        nstk = write_stock_data(DB_PATH, OUT_DIR, industry) if have_db else 0
+        write_page([], {}, market, trust, extras, flows, "", have_db, gentime, industry)
         print(f"已產生 {OUT_DIR}/index.html（無爆量清單・逐檔資料 {nstk} 檔・更新 {gentime}）")
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
@@ -374,8 +396,8 @@ def main():
                 r["_zoneLabel"] = z["label"]; r["_zoneCls"] = z["cls"]; r["爆量月位階"] = z["pos"]
         con.close()
     # ④⑥ 產生逐檔資料檔（2005 起日線 + 近一年投信）＋首頁搜尋索引
-    nstk = write_stock_data(DB_PATH, OUT_DIR) if have_db else 0
-    write_page(results, {}, market, trust, extras, flows, date, have_db, gentime)
+    nstk = write_stock_data(DB_PATH, OUT_DIR, industry) if have_db else 0
+    write_page(results, {}, market, trust, extras, flows, date, have_db, gentime, industry)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
     print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)}・投信候選 {tcount}・逐檔資料 {nstk} 檔・更新 {gentime}）")
 
@@ -516,8 +538,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .frow.sell .fbar{background:rgba(34,197,94,.10);}
   .frow>*{position:relative; z-index:1;}
   .frk{width:18px; text-align:center; font-weight:700; color:var(--dim); font-size:12px;}
-  .fnm2{flex:1; font-weight:600; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .fnm2{flex:1; min-width:0; font-weight:600; cursor:pointer; display:flex; flex-direction:column; justify-content:center;}
+  .fnmtxt{white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
   .fnm2 i{color:var(--dim); font-style:normal; font-size:11px; margin-left:4px;}
+  /* 產業類型標籤：股名下方小字 */
+  .indtag{display:block; font-size:10.5px; font-weight:600; color:#7c8aa0; letter-spacing:.2px; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .indtag.inline{display:inline-block; margin:0 0 0 6px; padding:1px 6px; border:1px solid var(--border); border-radius:6px; color:#8aa0b6; background:rgba(255,255,255,.03);}
   .fval{font-weight:800; font-variant-numeric:tabular-nums; white-space:nowrap;}
   .fval small{font-weight:600; color:var(--dim); font-size:10px; margin-left:1px;}
   .fcg{width:60px; text-align:right; font-size:12px; font-variant-numeric:tabular-nums;}
@@ -683,7 +709,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div id="cv">
   <div class="cvhead">
     <button class="back" onclick="closeChart()">◀ 返回</button>
-    <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span></div>
+    <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span><span class="indtag inline" id="cvInd"></span></div>
     <div class="cvchg" id="cvChg"></div>
     <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" style="margin-left:5px">下圖:MACD</button></div>
   </div>
@@ -704,7 +730,11 @@ const MARKET  = /*__MARKET__*/null;
 const TRUST   = /*__TRUST__*/null;
 const EXTRAS  = /*__EXTRAS__*/null;
 const FLOWS   = /*__FLOWS__*/null;
+const INDUSTRY= /*__INDUSTRY__*/null;
 const DB_OK   = /*__DBOK__*/false;
+/* 產業類型標籤：股名下方小字。indLabel 回字串，indTag 回 HTML(含樣式)。 */
+function indLabel(sid){ try{ return (INDUSTRY&&INDUSTRY[sid])?INDUSTRY[sid]:""; }catch(e){ return ""; } }
+function indTag(sid){ const s=indLabel(sid); return s?`<span class="indtag">${s}</span>`:""; }
 
 /* ---------- 分頁切換 ---------- */
 const PANES = ["home", "screen", "trust", "flow"];
@@ -788,7 +818,7 @@ function renderFlows(){
       const avc=cls==="buy"?"var(--up)":"var(--down)";
       return `<div class="frow ${cls}"><span class="fbar" style="width:${w}%"></span>
         <span class="frk">${i+1}</span>
-        <span class="fnm2" onclick="openChart('${x.sid}')">${x.name||x.sid}<i>${x.sid}</i></span>
+        <span class="fnm2" onclick="openChart('${x.sid}')"><span class="fnmtxt">${x.name||x.sid}<i>${x.sid}</i></span>${indTag(x.sid)}</span>
         <span class="fval" style="color:${avc}">${av}<small>億</small></span>
         <span class="fcg" style="color:${cgc}">${cg}</span></div>`;
     }).join("")||`<div class="tpempty">無</div>`;
@@ -900,7 +930,7 @@ function renderTrust(){
     const has = `onclick="openChart('${r.sid}')"`;
     return `<tr>
       <td class="l"><span class="code">${r.sid}</span></td>
-      <td class="l"><span class="nm" ${has}>${r.name||""}</span></td>
+      <td class="l"><span class="nm" ${has}>${r.name||""}</span>${indTag(r.sid)}</td>
       <td><span class="mkt ${mkt}">${r.market}</span></td>
       <td class="num" style="font-weight:700">${r.days}</td>
       <td class="num"><b style="color:${domc}">${(r.dominance*100).toFixed(1)}%</b></td>
@@ -971,7 +1001,7 @@ function renderTable(d){
     const sv=num(r["評分"])||0, scC=sv>=70?"var(--up)":sv>=45?"var(--amber)":"var(--dim)", mkt=r["市場"]==="上市"?"twse":"tpex";
     const has=`onclick="openChart('${r["代號"]}')"`;
     const tags=(r["強度標記"]||"").split("·").filter(Boolean).map(t=>{const c=TAGS[t]||["rgba(94,111,134,.15)","#93a3b8","rgba(94,111,134,.3)"]; return `<span class="tag" style="background:${c[0]};color:${c[1]};border-color:${c[2]}">${t}</span>`;}).join("");
-    return `<tr><td class="l"><span class="code">${r["代號"]}</span></td><td class="l"><span class="nm" ${has}>${r["名稱"]||""}</span></td>
+    return `<tr><td class="l"><span class="code">${r["代號"]}</span></td><td class="l"><span class="nm" ${has}>${r["名稱"]||""}</span>${indTag(r["代號"])}</td>
       <td><span class="mkt ${mkt}">${r["市場"]}</span></td><td class="num">${r["收盤"]}</td>
       <td class="num" style="color:${cc};font-weight:700">${chg>0?"+":""}${r["漲跌%"]}%${lim}</td>
       <td class="num">${fmtInt(r["成交量(張)"])}</td><td class="num" style="color:var(--muted)">${fmtInt(r["月均量(張)"])}</td>
@@ -1004,7 +1034,7 @@ function aggregate(daily, period){
   for(const b of daily){ const k=key(b[0]); if(!map[k]){ map[k]={d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}; order.push(k);} else { const g=map[k]; g.h=Math.max(g.h,b[2]); g.l=Math.min(g.l,b[3]); g.c=b[4]; g.v+=b[5]; g.d=b[0]; } }
   return order.map(k=>map[k]);
 }
-let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
+let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, hoverY:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
 function computeInd(bars){
   const close=bars.map(b=>b.c), vol=bars.map(b=>b.v);
   const ma={}; PRICE_MAS.forEach(n=>ma[n]=SMA(close,n));
@@ -1021,7 +1051,7 @@ async function fetchStock(sid){
     const j=await res.json();
     const n=j.d.length, bars=new Array(n);
     for(let i=0;i<n;i++) bars[i]=[j.d[i],j.o[i],j.h[i],j.l[i],j.c[i],j.v[i]];
-    const o={name:j.n||"", market:j.m||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]), mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[])};
+    const o={name:j.n||"", market:j.m||"", ind:j.ind||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]), mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[])};
     HISTORY[sid]=o; return o;
   }catch(e){ return null; }
 }
@@ -1033,6 +1063,7 @@ async function openChart(sid){
   const name=r["名稱"]||o.name||(td?td.name:"")||"";
   CH.sid=sid; CH.offset=0; CH.hover=null; CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t; CH.macdMode="macd"; CH.mfs=o.mfs; CH.mf=o.mf;
   document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
+  const cind=document.getElementById("cvInd"), indv=o.ind||indLabel(sid); if(cind){ cind.textContent=indv||""; cind.style.display=indv?"":"none"; }
   if(r["收盤"]!=null && r["漲跌%"]!=null){ const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
     document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
   } else { const lc=o.bars[o.bars.length-1][4];
@@ -1040,9 +1071,28 @@ async function openChart(sid){
   const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent="副圖:量";
   const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent="下圖:MACD";
   document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
-  setPeriod("D"); document.getElementById("cv").classList.add("open");
+  setPeriod("D");
+  const cv=document.getElementById("cv");
+  if(!cv.classList.contains("open")){
+    // 站內開圖：推一個歷史狀態，讓「返回」只關閉圖層、回到原本畫面（不離開頁面）。
+    // 深連結(從處置頁等以 ?stk= 進來)時不推，讓返回直接回到來源頁面。
+    if(!CHART_DEEPLINK){ try{ history.pushState({chart:sid}, "", "?stk="+encodeURIComponent(sid)); CHART_PUSHED=true; }catch(e){} }
+  }
+  cv.classList.add("open");
 }
-function closeChart(){ document.getElementById("cv").classList.remove("open"); }
+let CHART_DEEPLINK=false, CHART_PUSHED=false;
+function closeChart(){
+  const cv=document.getElementById("cv");
+  if(CHART_DEEPLINK){   // 從外部頁面(處置頁/通知等)進來：返回該來源頁面
+    CHART_DEEPLINK=false;
+    if(document.referrer && history.length>1){ history.back(); return; }
+    cv.classList.remove("open"); try{ history.replaceState({}, "", location.pathname); }catch(e){}
+    return;
+  }
+  if(CHART_PUSHED){ CHART_PUSHED=false; history.back(); return; }  // 觸發 popstate→關閉圖層
+  cv.classList.remove("open");
+}
+window.addEventListener("popstate",()=>{ const cv=document.getElementById("cv"); if(cv&&cv.classList.contains("open")){ cv.classList.remove("open"); CHART_PUSHED=false; } });
 function periodKey(ds,p){ if(p==="M") return ds.slice(0,7); if(p==="W"){ const a=ds.split("-").map(Number); const dt=new Date(Date.UTC(a[0],a[1]-1,a[2])); const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day); return dt.toISOString().slice(0,10);} return ds; }
 function setPeriod(p){
   CH.period=p; CH.offset=0; CH.hover=null;
@@ -1148,20 +1198,70 @@ function drawChart(){
   }
   ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="top";
   const ticks=Math.min(6,n); for(let t=0;t<ticks;t++){ const i=start+Math.floor((n-1)*t/(ticks-1||1)); ctx.fillText(CH.bars[i].d.slice(2),xOf(i),L.dateY+4); }
-  if(idx>=start&&idx<end){ const x=xOf(idx); ctx.strokeStyle="rgba(255,255,255,0.28)"; ctx.setLineDash([4,3]); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke(); ctx.setLineDash([]); }
+  if(idx>=start&&idx<end){
+    const x=xOf(idx);
+    ctx.font="11px sans-serif";
+    ctx.strokeStyle="rgba(255,255,255,0.32)"; ctx.setLineDash([4,3]); ctx.lineWidth=1;
+    // 垂直索引線：貫穿主圖＋副圖(量)＋下圖(MACD/主力)
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke();
+    // 水平價格線：滑鼠/手指 Y 落在主圖內就用該 Y(讀任意價)，否則用當天收盤
+    let hy, hp;
+    if(CH.hoverY!=null && CH.hoverY>=L.price.y0 && CH.hoverY<=L.price.y1){
+      hy=CH.hoverY; hp=pmax-(hy-(L.price.y0+4))/((L.price.y1-L.price.y0-8))*(pmax-pmin);
+    } else { hp=CH.bars[idx].c; hy=pY(hp); }
+    ctx.beginPath(); ctx.moveTo(PADL,hy); ctx.lineTo(W-PADR,hy); ctx.stroke();
+    ctx.setLineDash([]);
+    // 價格標籤(左軸)
+    const ptxt=hp.toFixed(2), pw=ctx.measureText(ptxt).width+8;
+    ctx.fillStyle="#f5a524"; ctx.fillRect(Math.max(0,PADL-pw-1), hy-8, pw, 16);
+    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(ptxt, Math.max(0,PADL-pw-1)+pw/2, hy);
+    // 日期標籤(底部)
+    const dtxt=CH.bars[idx].d, dw=ctx.measureText(dtxt).width+10;
+    const dx=Math.max(PADL, Math.min(W-PADR-dw, x-dw/2));
+    ctx.fillStyle="#f5a524"; ctx.fillRect(dx, L.dateY+2, dw, 15);
+    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(dtxt, dx+dw/2, L.dateY+9);
+  }
   updateReadout(idx);
 }
 function updateReadout(i){
   const b=CH.bars[i]; if(!b){document.getElementById("readout").innerHTML=""; return;}
   const prev=i>0?CH.bars[i-1].c:b.o, chg=((b.c-prev)/prev*100), cc=b.c>=prev?UP:DOWN;
   const it=(k,v,c)=>`<div class="it"><span class="k">${k}</span><span class="v" ${c?`style="color:${c}"`:""}>${v}</span></div>`;
-  document.getElementById("readout").innerHTML=it("日期",b.d)+it("開",b.o.toFixed(2),b.o>=prev?UP:DOWN)+it("高",b.h.toFixed(2),UP)+it("低",b.l.toFixed(2),DOWN)+it("收",b.c.toFixed(2),cc)+it("漲跌",(chg>=0?"+":"")+chg.toFixed(2)+"%",cc)+it("量",Math.round(b.v).toLocaleString()+" 張");
+  const sgn=(x)=>(x>=0?"+":"")+Math.round(x);
+  let h=it("日期",b.d)+it("開",b.o.toFixed(2),b.o>=prev?UP:DOWN)+it("高",b.h.toFixed(2),UP)+it("低",b.l.toFixed(2),DOWN)
+       +it("收",b.c.toFixed(2),cc)+it("漲跌",(chg>=0?"+":"")+chg.toFixed(2)+"%",cc)+it("量",Math.round(b.v).toLocaleString()+" 張");
+  // 主圖：5MA/10MA/20MA/60MA/240MA + 布林上中下（顯示點選當天的值）
+  PRICE_MAS.forEach(m=>{ const v=CH.ind.ma[m][i]; if(v!=null) h+=it("MA"+m, v.toFixed(2), MACOLOR[m]); });
+  const bu=CH.ind.boll.u[i], bm=CH.ind.boll.m[i], bl=CH.ind.boll.l[i];
+  if(bu!=null) h+=it("布林上", bu.toFixed(2), BOLL);
+  if(bm!=null) h+=it("布林中", bm.toFixed(2), BOLL);
+  if(bl!=null) h+=it("布林下", bl.toFixed(2), BOLL);
+  // 副圖：量 或 投信買賣超(當日)＋庫存(累計)
+  if(CH.volMode==="inst"){
+    const tn=CH.tnet[i], tc=CH.tcum[i];
+    if(tn!=null) h+=it("投信", sgn(tn)+" 張", tn>=0?UP:DOWN);
+    if(tc!=null) h+=it("投信庫存", Math.round(tc)+" 張", "#f5c518");
+  }
+  // 下圖：MACD(DIF/DEA/OSC) 或 主力買賣超(當日)＋累計
+  if(CH.macdMode==="mforce"){
+    const mn=CH.mnet[i], mc=CH.mcum[i];
+    if(mn!=null) h+=it("主力", sgn(mn)+" 張", mn>=0?UP:DOWN);
+    if(mc!=null) h+=it("主力累計", sgn(mc)+" 張", mc>=0?UP:DOWN);
+  } else if(CH.ind.macd){
+    const dif=CH.ind.macd.dif[i], dea=CH.ind.macd.dea[i], osc=CH.ind.macd.osc[i];
+    if(dif!=null) h+=it("DIF", dif.toFixed(2), "#e8c34a");
+    if(dea!=null) h+=it("DEA", dea.toFixed(2), "#4d9fff");
+    if(osc!=null) h+=it("OSC", osc.toFixed(2), osc>=0?UP:DOWN);
+  }
+  document.getElementById("readout").innerHTML=h;
 }
 const canvas=document.getElementById("chartCanvas");
 function cx(clientX){ const r=canvas.getBoundingClientRect(); return clientX-r.left; }
-function scrubAt(x){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; drawChart(); }
-canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX); });
-canvas.addEventListener("mouseleave",()=>{ CH.hover=null; drawChart(); });
+function scrubAt(x,y){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; CH.hoverY=(y==null?null:y); drawChart(); }
+canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX, e.offsetY); });
+canvas.addEventListener("mouseleave",()=>{ CH.hover=null; CH.hoverY=null; drawChart(); });
 canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; drawChart(); },{passive:false});
 let drag=null, suppressClick=false;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
@@ -1172,10 +1272,10 @@ let pinch=null, tap=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
 canvas.addEventListener("touchstart",e=>{ if(!CH.bars.length)return;
-  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX)); pinch=null; }
-  else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; } },{passive:false});
+  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); pinch=null; }
+  else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; CH.hoverY=null; } },{passive:false});
 canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDefault();
-  if(e.touches.length===1&&!pinch){ if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX)); }
+  if(e.touches.length===1&&!pinch){ const r=canvas.getBoundingClientRect(); if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); }
   else if(e.touches.length>=2&&pinch){ const nd=tdist(e.touches), ratio=pinch.d/(nd||1), N=CH.bars.length;
     CH.count=Math.max(20,Math.min(N,Math.round(pinch.cnt*ratio)));
     const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,N), dB=Math.round((tmid(e.touches)-pinch.mid)/bw);
@@ -1194,7 +1294,7 @@ function renderSug(q){
   const idx=STKIDX||[], ql=q.toLowerCase(), hit=[];
   for(const e of idx){ if(e[0].toLowerCase().includes(ql)||(e[1]||"").toLowerCase().includes(ql)){ hit.push(e); if(hit.length>=14)break; } }
   if(!hit.length){ box.innerHTML='<div class="sugitem dim">查無此股（資料更新後才會出現新上市股）</div>'; box.classList.add("on"); return; }
-  box.innerHTML=hit.map(e=>`<div class="sugitem" onclick="pickStock('${e[0]}')"><span class="sc">${e[0]}</span><span class="sn">${e[1]||""}</span><span class="sm">${e[2]||""}</span></div>`).join("");
+  box.innerHTML=hit.map(e=>`<div class="sugitem" onclick="pickStock('${e[0]}')"><span class="sc">${e[0]}</span><span class="sn">${e[1]||""}${indTag(e[0])}</span><span class="sm">${e[2]||""}</span></div>`).join("");
   box.classList.add("on");
 }
 function pickStock(sid){ const box=document.getElementById("sugbox"); box.innerHTML=""; box.classList.remove("on"); const q=document.getElementById("stkq"); if(q)q.value=""; openChart(sid); }
@@ -1210,7 +1310,7 @@ renderExtras();
 renderFlows();
 renderTrust();
 render();
-(function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ openChart(sid.trim()); } }catch(e){} })();
+(function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ CHART_DEEPLINK=true; openChart(sid.trim()); } }catch(e){} })();
 </script>
 </body>
 </html>"""

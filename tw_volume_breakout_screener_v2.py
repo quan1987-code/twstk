@@ -890,6 +890,15 @@ def main():
     except Exception as e:
         print(f"法人動向資料失敗（不影響主流程）：{e}")
 
+    # ⑧ 產業分類補底：抓 FinMind TaiwanStockInfo 大分類快取進 industry 表（每天若已有快取即略過）
+    try:
+        import tw_industry
+        nind = tw_industry.fetch_finmind_industry(con, CONFIG["FINMIND_TOKEN"])
+        if nind:
+            print(f"產業大分類：FinMind 補底寫入 {nind} 檔。")
+    except Exception as e:
+        print(f"產業分類補底失敗（不影響主流程，curated 表仍可用）：{e}")
+
     con.close()
 
 
