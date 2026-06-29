@@ -614,8 +614,13 @@ def main():
             if r is not None:
                 vol5 = sum(voln.get(d, 0) for d in mf_dates[-5:])
                 vol10 = sum(voln.get(d, 0) for d in mf_dates[-10:])
-                r["z5"] = window_concentration(con, sid, mf_dates[-5:], vol5)
-                r["z10"] = window_concentration(con, sid, mf_dates[-10:], vol10)
+                # 主5/主10：優先用 broker_net 區間彙總(前15大買-賣方)；broker_net 尚未累積到位時，
+                # 退回用 mainforce 每日主力淨買的量加權(window_cc)，避免顯示「—」。
+                z5 = window_concentration(con, sid, mf_dates[-5:], vol5)
+                z10 = window_concentration(con, sid, mf_dates[-10:], vol10)
+                if z5 is None: z5 = window_cc(ser, voln, mf_dates[-5:])
+                if z10 is None: z10 = window_cc(ser, voln, mf_dates[-10:])
+                r["z5"] = z5; r["z10"] = z10
         diag["notes"].append(f"分點：本次抓 {fetched} 日，升級為分點主力 {patched}/{len(targets)} 檔"
                              f"（未達 {MF_OVERRIDE_MIN_DAYS} 天者沿用三大法人主力基準；快取累積中）")
     con.close()
@@ -690,10 +695,30 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .mcell .mv{font-size:13.5px; font-weight:800; font-variant-numeric:tabular-nums;}
   .mcell .mv.sm{font-size:12px;}
 
-  /* 可排序工具列 */
-  .sortbar{display:flex; flex-wrap:wrap; gap:6px; margin:2px 2px 11px;}
-  .sortchip{background:var(--card2); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:5px 10px; font-size:12px; font-weight:600; cursor:pointer; font-variant-numeric:tabular-nums;}
-  .sortchip.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  /* 緊湊表格（仿處置神器；凍結首欄、可左右滑動、欄位標題排序） */
+  .tblhint{font-size:11px; color:var(--dim); margin:2px 2px 8px; line-height:1.5;}
+  .dtbl-wrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:11px; background:var(--card);}
+  .dtbl{border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-variant-numeric:tabular-nums;}
+  .dtbl th,.dtbl td{padding:7px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border);}
+  .dtbl tbody tr:last-child td{border-bottom:none;}
+  .dtbl thead th{position:sticky; top:0; z-index:3; background:var(--card2); color:var(--muted); font-size:11px; font-weight:700; line-height:1.55;}
+  .dtbl th.frz,.dtbl td.frz{position:sticky; left:0; z-index:2; text-align:left; background:var(--card);}
+  .dtbl thead th.frz{z-index:4; background:var(--card2); box-shadow:1px 0 0 var(--border);}
+  .dtbl td.frz{box-shadow:1px 0 0 var(--border);}
+  .dtbl .sortlbl{cursor:pointer; display:inline-block; padding:1px 3px; border-radius:5px;}
+  .dtbl .sortlbl.on{color:var(--amber); background:var(--amber-s);}
+  .dtbl .sortlbl i{font-style:normal; font-size:9px; margin-left:1px;}
+  .dtbl tbody tr{cursor:pointer;}
+  .dtbl tbody tr:active{background:rgba(255,255,255,.05);}
+  .dtbl tbody tr:active td.frz{background:#10192b;}
+  .dtbl .cv{font-weight:800; font-size:13px;}
+  .dtbl .nmcell{min-width:118px;}
+  .dtbl .nmcell .nm{font-weight:700; font-size:14px; color:var(--text);}
+  .dtbl .nmcell .sub{font-size:10.5px; color:var(--dim); margin-top:1px;}
+  .dtbl .nmcell .cind{font-size:10px; color:#7c8aa0; font-weight:600; margin-top:1px;}
+  .dtbl .nmcell .per{font-size:10px; color:var(--dim); margin-top:1px; font-variant-numeric:tabular-nums;}
+  .dtbl tr.side-up td.frz{box-shadow:inset 3px 0 0 var(--up), 1px 0 0 var(--border);}
+  .dtbl tr.side-down td.frz{box-shadow:inset 3px 0 0 var(--down), 1px 0 0 var(--border);}
   /* 通知卡 */
   .ncard{border-color:rgba(245,165,36,.35);}
   .ncard.t20{border-color:rgba(255,77,79,.45);}
@@ -776,7 +801,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="note">
       <b>燈號</b>：<span class="dot red"></span>紅＝今日已觸發漲幅型（第1款）　<span class="dot amber"></span>黃＝接近門檻　<span class="dot green"></span>綠＝安全。<br>
-      點任何個股的<b style="color:var(--blue)">名稱</b>可跳到該股 K 線圖（K 線下方副圖可切換 MACD／主力買賣超）。每張清單上方可<b>點指標排序</b>（再點切換升/降冪）。股名下方小字為<b>產業類型</b>。分點資料：FinMind Sponsor（T+1 盤後）。
+      點任何個股的<b style="color:var(--blue)">列</b>可跳到該股 K 線圖（K 線下方副圖可切換 MACD／主力買賣超）。清單為<b>緊湊表格</b>：可左右滑動看更多指標、點欄位標題排序。股名下方小字為<b>產業類型</b>。分點資料：FinMind Sponsor（T+1 盤後）。
     </div>
     <div class="note" id="diagbox" style="display:none"></div>
   </div>
@@ -789,21 +814,21 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 
   <div class="pane hidden" id="p-watch">
     <div class="sech">📈 可能進入處置 <span class="pill">注意/處置門檻・盤後自算</span></div>
-    <div id="sort-watch" class="sortbar"></div>
+    <div class="tblhint">點欄位標題排序（再點切換升/降冪）・表格可左右滑動看更多指標・點列看 K 線</div>
     <div id="list-watch"></div>
     <div id="expl-watch"></div>
   </div>
 
   <div class="pane hidden" id="p-confirm">
     <div class="sech">🔒 下一交易日確定進入處置 <span class="pill">FinMind 處置公告</span></div>
-    <div id="sort-confirm" class="sortbar"></div>
+    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
     <div id="list-confirm"></div>
     <div id="expl-confirm"></div>
   </div>
 
   <div class="pane hidden" id="p-ongoing">
     <div class="sech">⛓️ 處置中（坐牢） <span class="pill">分盤交易期</span></div>
-    <div id="sort-ongoing" class="sortbar"></div>
+    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
     <div id="list-ongoing"></div>
     <div id="expl-ongoing"></div>
   </div>
@@ -940,41 +965,79 @@ function renderNotify(arr){
   }).join("");
 }
 
-/* ---- 可排序工具列：點指標排序，再點切換升/降冪 ---- */
-const SORTBARS = {
-  watch:  [["漲幅","chg"],["位階","wj"],["月斜","yx"],["累幅","lf"],["剩天","st"],["量倍","vmult"],["主5","z5"],["主10","z10"]],
-  confirm:[["漲幅","chg"],["位階","wj"],["月斜","yx"],["累幅","lf"],["主5","z5"],["主10","z10"]],
-  ongoing:[["漲幅","chg"],["位階","wj"],["月斜","yx"],["累幅","lf"],["剩天","st"],["主5","z5"],["主10","z10"]]
-};
+/* ---- 緊湊表格（仿處置神器）：凍結首欄、可左右滑動、點欄位標題排序 ---- */
 const sortState = { watch:{key:null,asc:false}, confirm:{key:null,asc:false}, ongoing:{key:null,asc:false} };
 const LISTDATA = { watch:[], confirm:[], ongoing:[] };
 const LISTOPT = {
-  watch:{light:true, watch:true, empty:"目前沒有接近處置門檻的個股。"},
+  watch:{light:true, empty:"目前沒有接近處置門檻的個股。"},
   confirm:{empty:"下一交易日沒有新進處置的個股。"},
   ongoing:{prog:true, empty:"目前沒有處置中的個股。"}
 };
-function renderSortbar(name){
-  const el=$("sort-"+name); if(!el) return; const st=sortState[name];
-  el.innerHTML = (SORTBARS[name]||[]).map(([lab,key])=>{
-    const on=st.key===key, ar=on?(st.asc?" ▲":" ▼"):"";
-    return `<button class="sortchip${on?' on':''}" data-name="${name}" data-key="${key}">${lab}${ar}</button>`;
-  }).join("");
-  el.querySelectorAll(".sortchip").forEach(b=>b.onclick=()=>{
-    const k=b.dataset.key, s=sortState[name];
-    if(s.key===k) s.asc=!s.asc; else { s.key=k; s.asc=false; }
-    applySort(name);
-  });
+// 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻
+function colSpec(name){
+  const c=[
+    [["股價","close"],["漲幅","chg"]],
+    [["位階","wj"],["月斜","yx"]],
+    [["累幅","lf"],["剩天","st"]],
+    [["主5","z5"],["主10","z10"]],
+  ];
+  if(name==="watch") c.push([["量倍","vmult"],["價門檻","lf"]]);
+  if(name==="ongoing"||name==="confirm") c.push([["進度","day_n"],["剩","d2r"]]);
+  return c;
 }
-function applySort(name){
+function fmtCell(key,v,r){
+  if(key==="day_n"){ return (r.day_n&&r.day_total)?{t:r.day_n+"/"+r.day_total,c:""}:{t:"—",c:""}; }
+  if(!isNum(v)) return {t:"—",c:"dim"};
+  const n=Number(v);
+  switch(key){
+    case "close": return {t:priceTxt(n),c:""};
+    case "chg":   return {t:(n>0?"+":"")+n.toFixed(2)+"%",c:signCls(n)};
+    case "wj":    return {t:String(Math.round(n)),c:""};
+    case "yx":    return {t:n.toFixed(1)+"%",c:signCls(n)};
+    case "lf":    return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:(r.light!=null&&n>=32)?"up":signCls(n)};
+    case "st": case "d2r": return {t:String(Math.round(n)),c:""};
+    case "z5": case "z10": return {t:n.toFixed(1)+"%",c:signCls(n)};
+    case "vmult": return {t:n.toFixed(1)+"x", c:(n>=5?"up":"amb")};
+  }
+  return {t:String(n),c:""};
+}
+function sortRows(name){
   const s=sortState[name], arr=(LISTDATA[name]||[]).slice();
-  if(s.key){ arr.sort((a,b)=>{ const av=a[s.key], bv=b[s.key], an=isNum(av), bn=isNum(bv);
+  if(s.key){ arr.sort((a,b)=>{ const av=a[s.key],bv=b[s.key],an=isNum(av),bn=isNum(bv);
     if(!an&&!bn)return 0; if(!an)return 1; if(!bn)return -1; return s.asc?(av-bv):(bv-av); }); }
-  renderList("list-"+name, arr, LISTOPT[name]); renderSortbar(name);
+  return arr;
+}
+function renderTbl(name){
+  const el=$("list-"+name); if(!el) return;
+  const data=LISTDATA[name]||[];
+  if(!data.length){ el.innerHTML=`<div class="empty">${(LISTOPT[name]||{}).empty||"目前沒有資料。"}</div>`; return; }
+  const s=sortState[name], cols=colSpec(name), rows=sortRows(name);
+  const arrow=(k)=> s.key===k?(s.asc?"▲":"▼"):"";
+  let thead=`<th class="frz">名稱<br><span class="sub">代號 / 處置期</span></th>`;
+  cols.forEach(col=>{ thead+="<th>"+col.map(([lab,key])=>
+    `<span class="sortlbl${s.key===key?' on':''}" data-n="${name}" data-k="${key}">${lab}<i>${arrow(key)}</i></span>`).join("<br>")+"</th>"; });
+  let tb="";
+  rows.forEach(r=>{
+    const sc=isNum(r.chg)?(r.chg>0?"up":(r.chg<0?"down":"")):"";
+    let tds="";
+    cols.forEach(col=>{ tds+="<td>"+col.map(([lab,key])=>{ const f=fmtCell(key,r[key],r); return `<span class="cv ${f.c}">${f.t}</span>`; }).join("<br>")+"</td>"; });
+    const per=(r.start||r.end)?`${esc((r.start||"").slice(5))}~${esc((r.end||"").slice(5))}`:"";
+    tb+=`<tr class="side-${sc}" onclick="goChart('${esc(r.sid)}')">
+      <td class="frz nmcell">
+        <div class="nm">${r.light?dotFor(r.light):""}${esc(r.name||"")}${methodChip(r.method)}${roundChip(r.round)}</div>
+        <div class="sub">${esc(r.sid)}${r.mkt?" "+esc(r.mkt):""}</div>
+        ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
+        ${per?`<div class="per">${per}</div>`:""}
+      </td>${tds}</tr>`;
+  });
+  el.innerHTML=`<div class="dtbl-wrap"><table class="dtbl"><thead><tr>${thead}</tr></thead><tbody>${tb}</tbody></table></div>`;
+  el.querySelectorAll(".sortlbl").forEach(b=>b.addEventListener("click",ev=>{ ev.stopPropagation();
+    const n=b.dataset.n,k=b.dataset.k,st=sortState[n]; if(st.key===k)st.asc=!st.asc; else{st.key=k;st.asc=false;} renderTbl(n); }));
 }
 
 const EXPL = `
 <details class="expl"><summary>指標說明（點開）</summary><div class="expbody">
-這些指標協助快速判讀。<b>台股紅漲綠跌</b>。各清單上方可<b>點指標排序</b>（再點同一指標切換升/降冪）。
+這些指標協助快速判讀。<b>台股紅漲綠跌</b>。表格可<b>左右滑動</b>看更多指標、<b>點欄位標題排序</b>（再點同一欄切換升/降冪）、<b>點一列</b>看該股 K 線。
 <div class="g">
 <span class="k">處置 起~迄</span><span>該股分盤處置的起始與結束日。</span>
 <span class="k">產業</span><span>股名下方小字＝產業鏈分類（主要個股為上中下游＋子類，其餘為大分類）。</span>
@@ -1028,7 +1091,7 @@ async function boot(){
   $("cnt-o").textContent=c.ongoing!=null?c.ongoing:((d.ongoing||[]).length);
   renderNotify(d.notify||[]);
   LISTDATA.watch=d.watch||[]; LISTDATA.confirm=d.confirmed||[]; LISTDATA.ongoing=d.ongoing||[];
-  ["watch","confirm","ongoing"].forEach(applySort);
+  ["watch","confirm","ongoing"].forEach(renderTbl);
   if(d.diag && (d.diag.notes||[]).length){
     const box=$("diagbox"); box.style.display="block";
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
