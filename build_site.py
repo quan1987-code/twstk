@@ -1034,7 +1034,7 @@ function aggregate(daily, period){
   for(const b of daily){ const k=key(b[0]); if(!map[k]){ map[k]={d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}; order.push(k);} else { const g=map[k]; g.h=Math.max(g.h,b[2]); g.l=Math.min(g.l,b[3]); g.c=b[4]; g.v+=b[5]; g.d=b[0]; } }
   return order.map(k=>map[k]);
 }
-let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
+let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, hoverY:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
 function computeInd(bars){
   const close=bars.map(b=>b.c), vol=bars.map(b=>b.v);
   const ma={}; PRICE_MAS.forEach(n=>ma[n]=SMA(close,n));
@@ -1071,9 +1071,28 @@ async function openChart(sid){
   const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent="副圖:量";
   const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent="下圖:MACD";
   document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.classList.toggle("on",b.dataset.p==="D"));
-  setPeriod("D"); document.getElementById("cv").classList.add("open");
+  setPeriod("D");
+  const cv=document.getElementById("cv");
+  if(!cv.classList.contains("open")){
+    // 站內開圖：推一個歷史狀態，讓「返回」只關閉圖層、回到原本畫面（不離開頁面）。
+    // 深連結(從處置頁等以 ?stk= 進來)時不推，讓返回直接回到來源頁面。
+    if(!CHART_DEEPLINK){ try{ history.pushState({chart:sid}, "", "?stk="+encodeURIComponent(sid)); CHART_PUSHED=true; }catch(e){} }
+  }
+  cv.classList.add("open");
 }
-function closeChart(){ document.getElementById("cv").classList.remove("open"); }
+let CHART_DEEPLINK=false, CHART_PUSHED=false;
+function closeChart(){
+  const cv=document.getElementById("cv");
+  if(CHART_DEEPLINK){   // 從外部頁面(處置頁/通知等)進來：返回該來源頁面
+    CHART_DEEPLINK=false;
+    if(document.referrer && history.length>1){ history.back(); return; }
+    cv.classList.remove("open"); try{ history.replaceState({}, "", location.pathname); }catch(e){}
+    return;
+  }
+  if(CHART_PUSHED){ CHART_PUSHED=false; history.back(); return; }  // 觸發 popstate→關閉圖層
+  cv.classList.remove("open");
+}
+window.addEventListener("popstate",()=>{ const cv=document.getElementById("cv"); if(cv&&cv.classList.contains("open")){ cv.classList.remove("open"); CHART_PUSHED=false; } });
 function periodKey(ds,p){ if(p==="M") return ds.slice(0,7); if(p==="W"){ const a=ds.split("-").map(Number); const dt=new Date(Date.UTC(a[0],a[1]-1,a[2])); const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day); return dt.toISOString().slice(0,10);} return ds; }
 function setPeriod(p){
   CH.period=p; CH.offset=0; CH.hover=null;
@@ -1179,20 +1198,70 @@ function drawChart(){
   }
   ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="top";
   const ticks=Math.min(6,n); for(let t=0;t<ticks;t++){ const i=start+Math.floor((n-1)*t/(ticks-1||1)); ctx.fillText(CH.bars[i].d.slice(2),xOf(i),L.dateY+4); }
-  if(idx>=start&&idx<end){ const x=xOf(idx); ctx.strokeStyle="rgba(255,255,255,0.28)"; ctx.setLineDash([4,3]); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke(); ctx.setLineDash([]); }
+  if(idx>=start&&idx<end){
+    const x=xOf(idx);
+    ctx.font="11px sans-serif";
+    ctx.strokeStyle="rgba(255,255,255,0.32)"; ctx.setLineDash([4,3]); ctx.lineWidth=1;
+    // 垂直索引線：貫穿主圖＋副圖(量)＋下圖(MACD/主力)
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke();
+    // 水平價格線：滑鼠/手指 Y 落在主圖內就用該 Y(讀任意價)，否則用當天收盤
+    let hy, hp;
+    if(CH.hoverY!=null && CH.hoverY>=L.price.y0 && CH.hoverY<=L.price.y1){
+      hy=CH.hoverY; hp=pmax-(hy-(L.price.y0+4))/((L.price.y1-L.price.y0-8))*(pmax-pmin);
+    } else { hp=CH.bars[idx].c; hy=pY(hp); }
+    ctx.beginPath(); ctx.moveTo(PADL,hy); ctx.lineTo(W-PADR,hy); ctx.stroke();
+    ctx.setLineDash([]);
+    // 價格標籤(左軸)
+    const ptxt=hp.toFixed(2), pw=ctx.measureText(ptxt).width+8;
+    ctx.fillStyle="#f5a524"; ctx.fillRect(Math.max(0,PADL-pw-1), hy-8, pw, 16);
+    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(ptxt, Math.max(0,PADL-pw-1)+pw/2, hy);
+    // 日期標籤(底部)
+    const dtxt=CH.bars[idx].d, dw=ctx.measureText(dtxt).width+10;
+    const dx=Math.max(PADL, Math.min(W-PADR-dw, x-dw/2));
+    ctx.fillStyle="#f5a524"; ctx.fillRect(dx, L.dateY+2, dw, 15);
+    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(dtxt, dx+dw/2, L.dateY+9);
+  }
   updateReadout(idx);
 }
 function updateReadout(i){
   const b=CH.bars[i]; if(!b){document.getElementById("readout").innerHTML=""; return;}
   const prev=i>0?CH.bars[i-1].c:b.o, chg=((b.c-prev)/prev*100), cc=b.c>=prev?UP:DOWN;
   const it=(k,v,c)=>`<div class="it"><span class="k">${k}</span><span class="v" ${c?`style="color:${c}"`:""}>${v}</span></div>`;
-  document.getElementById("readout").innerHTML=it("日期",b.d)+it("開",b.o.toFixed(2),b.o>=prev?UP:DOWN)+it("高",b.h.toFixed(2),UP)+it("低",b.l.toFixed(2),DOWN)+it("收",b.c.toFixed(2),cc)+it("漲跌",(chg>=0?"+":"")+chg.toFixed(2)+"%",cc)+it("量",Math.round(b.v).toLocaleString()+" 張");
+  const sgn=(x)=>(x>=0?"+":"")+Math.round(x);
+  let h=it("日期",b.d)+it("開",b.o.toFixed(2),b.o>=prev?UP:DOWN)+it("高",b.h.toFixed(2),UP)+it("低",b.l.toFixed(2),DOWN)
+       +it("收",b.c.toFixed(2),cc)+it("漲跌",(chg>=0?"+":"")+chg.toFixed(2)+"%",cc)+it("量",Math.round(b.v).toLocaleString()+" 張");
+  // 主圖：5MA/10MA/20MA/60MA/240MA + 布林上中下（顯示點選當天的值）
+  PRICE_MAS.forEach(m=>{ const v=CH.ind.ma[m][i]; if(v!=null) h+=it("MA"+m, v.toFixed(2), MACOLOR[m]); });
+  const bu=CH.ind.boll.u[i], bm=CH.ind.boll.m[i], bl=CH.ind.boll.l[i];
+  if(bu!=null) h+=it("布林上", bu.toFixed(2), BOLL);
+  if(bm!=null) h+=it("布林中", bm.toFixed(2), BOLL);
+  if(bl!=null) h+=it("布林下", bl.toFixed(2), BOLL);
+  // 副圖：量 或 投信買賣超(當日)＋庫存(累計)
+  if(CH.volMode==="inst"){
+    const tn=CH.tnet[i], tc=CH.tcum[i];
+    if(tn!=null) h+=it("投信", sgn(tn)+" 張", tn>=0?UP:DOWN);
+    if(tc!=null) h+=it("投信庫存", Math.round(tc)+" 張", "#f5c518");
+  }
+  // 下圖：MACD(DIF/DEA/OSC) 或 主力買賣超(當日)＋累計
+  if(CH.macdMode==="mforce"){
+    const mn=CH.mnet[i], mc=CH.mcum[i];
+    if(mn!=null) h+=it("主力", sgn(mn)+" 張", mn>=0?UP:DOWN);
+    if(mc!=null) h+=it("主力累計", sgn(mc)+" 張", mc>=0?UP:DOWN);
+  } else if(CH.ind.macd){
+    const dif=CH.ind.macd.dif[i], dea=CH.ind.macd.dea[i], osc=CH.ind.macd.osc[i];
+    if(dif!=null) h+=it("DIF", dif.toFixed(2), "#e8c34a");
+    if(dea!=null) h+=it("DEA", dea.toFixed(2), "#4d9fff");
+    if(osc!=null) h+=it("OSC", osc.toFixed(2), osc>=0?UP:DOWN);
+  }
+  document.getElementById("readout").innerHTML=h;
 }
 const canvas=document.getElementById("chartCanvas");
 function cx(clientX){ const r=canvas.getBoundingClientRect(); return clientX-r.left; }
-function scrubAt(x){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; drawChart(); }
-canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX); });
-canvas.addEventListener("mouseleave",()=>{ CH.hover=null; drawChart(); });
+function scrubAt(x,y){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; CH.hoverY=(y==null?null:y); drawChart(); }
+canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX, e.offsetY); });
+canvas.addEventListener("mouseleave",()=>{ CH.hover=null; CH.hoverY=null; drawChart(); });
 canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; drawChart(); },{passive:false});
 let drag=null, suppressClick=false;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
@@ -1203,10 +1272,10 @@ let pinch=null, tap=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
 canvas.addEventListener("touchstart",e=>{ if(!CH.bars.length)return;
-  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX)); pinch=null; }
-  else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; } },{passive:false});
+  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); pinch=null; }
+  else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; CH.hoverY=null; } },{passive:false});
 canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDefault();
-  if(e.touches.length===1&&!pinch){ if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX)); }
+  if(e.touches.length===1&&!pinch){ const r=canvas.getBoundingClientRect(); if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); }
   else if(e.touches.length>=2&&pinch){ const nd=tdist(e.touches), ratio=pinch.d/(nd||1), N=CH.bars.length;
     CH.count=Math.max(20,Math.min(N,Math.round(pinch.cnt*ratio)));
     const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,N), dB=Math.round((tmid(e.touches)-pinch.mid)/bw);
@@ -1241,7 +1310,7 @@ renderExtras();
 renderFlows();
 renderTrust();
 render();
-(function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ openChart(sid.trim()); } }catch(e){} })();
+(function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ CHART_DEEPLINK=true; openChart(sid.trim()); } }catch(e){} })();
 </script>
 </body>
 </html>"""
