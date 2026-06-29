@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地建置產物（CI 會重新產生 / 由 actions/cache 還原）
+site/
+output/
+twstock.db
+breakout_*.csv
+trust_*.json
+extras_*.json
