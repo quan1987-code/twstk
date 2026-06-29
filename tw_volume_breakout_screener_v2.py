@@ -196,6 +196,36 @@ def get_today_snapshot(sess, retries=3):
     raise last
 
 
+def fetch_finmind_prices_all(token, start_date, end_date=None):
+    """個股日線『以 FinMind 為主』：用 TaiwanStockPrice 抓全市場(start_date 起)。
+    Sponsor 方案可不帶 data_id 直接取全部個股。回傳與官方快照同欄位的 normalized df；
+    失敗或空回 None（呼叫端會自動沿用官方 OpenAPI 快照）。"""
+    if not token:
+        return None
+    params = {"start_date": start_date}
+    if end_date:
+        params["end_date"] = end_date
+    try:
+        df = finmind_get("TaiwanStockPrice", token, **params)
+    except Exception as e:
+        print(f"  FinMind 全市場日線失敗：{e}")
+        return None
+    if df is None or df.empty:
+        return None
+    df = df.rename(columns={"max": "high", "min": "low",
+                            "Trading_Volume": "volume", "Trading_money": "amount"})
+    need = ["stock_id", "date", "open", "high", "low", "close", "volume", "amount"]
+    for c in need:
+        if c not in df.columns:
+            df[c] = None
+    df = df[df["stock_id"].astype(str).map(is_common_stock)].copy()
+    for c in ("open", "high", "low", "close", "volume", "amount"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    df = df[df["close"] > 0]
+    return df[need] if not df.empty else None
+
+
 # ============================================================
 #  歷史回補：FinMind 免費「逐檔」（只做一次）
 # ============================================================
@@ -844,6 +874,18 @@ def main():
             snap_ids = set(info["stock_id"])
         except Exception as e:
             print(f"抓當日資料失敗：{e}\n→ 改用資料庫既有最新資料選股（不影響整體流程）。")
+
+    # 1b) 個股日線『以 FinMind 為主』：抓最近約兩週全市場日線覆蓋官方快照（較可靠、避免日期卡住）。
+    #     成功則 FinMind 為準；失敗/無資料則沿用上面的官方 OpenAPI 快照。名稱仍由官方快照/DB 提供。
+    if not args.skip_update and CONFIG["FINMIND_TOKEN"]:
+        sd = (dt.date.today() - dt.timedelta(days=14)).isoformat()
+        fm = fetch_finmind_prices_all(CONFIG["FINMIND_TOKEN"], sd)
+        if fm is not None and not fm.empty:
+            upsert_price(con, fm)
+            snap_ids |= set(fm["stock_id"].astype(str))
+            print(f"FinMind 全市場日線：更新/覆蓋 {len(fm)} 列（最新日 {fm['date'].max()}）")
+        else:
+            print("FinMind 全市場日線：無資料，沿用官方 OpenAPI 快照。")
 
     # 標的清單：資料庫 ∪ 當日快照（首次執行資料庫為空，靠快照）
     info_all = pd.read_sql("SELECT * FROM stock", con)
