@@ -136,13 +136,25 @@ def write_stock_data(db_path, out_dir):
     os.makedirs(ddir, exist_ok=True)
     con = sqlite3.connect(db_path)
     info = {r[0]: (r[1], r[2]) for r in con.execute("SELECT stock_id,name,market FROM stock")}
-    # 近一年投信買賣超，預載成 {sid: {date: 張}}
-    inst = {}
+    # 近一年投信買賣超(trust_lots) 與 三大法人合計買賣超(total_lots，作為「主力」免費替代指標)，
+    # 預載成 {sid: {date: 張}}。三大法人合計讓『每一檔』股票都有 K 線下方「主力買賣超」副圖，
+    # 不再僅限處置相關個股；處置專區之後仍可用分點資料覆寫成更精準的主力序列。
+    inst = {}; mforce = {}
     try:
-        for sid, d, t in con.execute("SELECT stock_id,date,trust_lots FROM inst"):
-            inst.setdefault(sid, {})[d] = t
+        for sid, d, t, tot in con.execute("SELECT stock_id,date,trust_lots,total_lots FROM inst"):
+            if t is not None:
+                inst.setdefault(sid, {})[d] = t
+            if tot is not None:
+                mforce.setdefault(sid, {})[d] = tot
     except sqlite3.Error:
-        inst = {}
+        # 舊版 DB 可能還沒有 total_lots 欄位：退回只讀投信，主力副圖留待處置專區補。
+        inst = {}; mforce = {}
+        try:
+            for sid, d, t in con.execute("SELECT stock_id,date,trust_lots FROM inst"):
+                if t is not None:
+                    inst.setdefault(sid, {})[d] = t
+        except sqlite3.Error:
+            inst = {}
     sids = [r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price")]
     index = []
     n = 0
@@ -166,8 +178,19 @@ def write_stock_data(db_path, out_dir):
                 lo += 1
             ts = lo
             t = [round(im.get(dd, 0.0), 1) for dd in d[ts:]]
+        # 主力買賣超副圖：用三大法人合計，讓每一檔都有（涵蓋近一年，遠超過 60 天）。
+        mm = mforce.get(sid, {})
+        mfs = len(d); mf = []
+        if mm:
+            mmin = min(mm.keys())
+            lo = 0
+            while lo < len(d) and d[lo] < mmin:
+                lo += 1
+            mfs = lo
+            mf = [round(mm.get(dd, 0.0), 1) for dd in d[mfs:]]
         name, mk = info.get(sid, ("", ""))
-        obj = {"n": name, "m": mk, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v, "ts": ts, "t": t}
+        obj = {"n": name, "m": mk, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v,
+               "ts": ts, "t": t, "mfs": mfs, "mf": mf}
         with open(os.path.join(ddir, f"{sid}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
         index.append([sid, name, mk]); n += 1
@@ -669,7 +692,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <span><i style="background:var(--ma5)"></i>MA5</span><span><i style="background:var(--ma10)"></i>MA10</span>
     <span><i style="background:var(--ma20)"></i>MA20</span><span><i style="background:var(--ma60)"></i>MA60</span>
     <span><i style="background:var(--ma240)"></i>MA240</span><span><i style="background:#8aa0b6"></i>布林20</span>
-    <span style="color:var(--dim)">單指拖移看讀數 ・ 雙指縮放 ・ 點副圖切換 量↔投信</span>
+    <span style="color:var(--dim)">單指拖移看讀數 ・ 雙指縮放 ・ 點副圖切換 量↔投信 ・ 點下圖切換 MACD↔主力(三大法人，每檔皆有)</span>
   </div>
   <div class="chartbox"><canvas id="chartCanvas"></canvas></div>
 </div>
@@ -1054,7 +1077,7 @@ function drawMForce(ctx,L,start,end,xOf,bw,W){
     if(nv!=null){ any=true; vmax=Math.max(vmax,Math.abs(nv)); }
     if(cv!=null){ vmax=Math.max(vmax,Math.abs(cv)); lastCum=cv; } }
   if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle";
-    ctx.fillText("此區間無主力買賣超資料（僅處置相關個股提供）",(PADL+W-PADR)/2,mid);
+    ctx.fillText("此區間無主力買賣超資料（三大法人約近一年）",(PADL+W-PADR)/2,mid);
     ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("主力買賣超",PADL+2,y0+2); return; }
   const vY=(v)=> mid - v/vmax*hh;
   for(let i=start;i<end;i++){ const v=CH.mnet[i]; if(v==null)continue; const x=xOf(i), y=vY(v);

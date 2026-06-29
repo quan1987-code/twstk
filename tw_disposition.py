@@ -2,8 +2,9 @@
 r"""
 處置股專區資料產生器（tw_disposition.py）v2
 ================================================================
-產生 site/data/chuzhi.json 與 site/chuzhi.html，並把每檔「主力買賣超日序列」
-回寫進 site/data/{代號}.json（給 K 線副圖切換用）。
+產生 site/data/chuzhi.json 與 site/chuzhi.html。K 線下方「主力買賣超」副圖的基準資料
+已由 build_site.py 用『三大法人合計』為每一檔股票填好（近一年），本程式只在處置相關個股
+累積到足夠的『分點』資料時，把該檔的主力序列升級覆寫成更精準的分點主力（給 K 線副圖切換用）。
 與 build_site.py / tw_volume_breakout_screener_v2.py 共用 twstock.db 與 FinMind 串接。
 
 四狀態：watch(漲幅型估計) / confirmed(明日確定) / ongoing(處置中) / released(剛出關)
@@ -36,8 +37,9 @@ HTTP_TIMEOUT = 30
 CHIP_MAX_STOCKS = 60          # 分點最多處理幾檔（控制首次回補時間）
 CHIP_SLEEP = 0.25
 CHIP_TIMEOUT = 45             # 分點(單日)請求逾時秒
-MF_HISTORY_DAYS = 40          # 主力序列最多看回幾個交易日
-MF_BACKFILL_CAP = 10          # 每檔每次最多補抓幾日（首次回補上限；之後每日約+1）
+MF_HISTORY_DAYS = 60          # 主力(分點)序列最多看回幾個交易日
+MF_BACKFILL_CAP = 12          # 每檔每次最多補抓幾日（首次回補上限；之後每日約+1）
+MF_OVERRIDE_MIN_DAYS = 20     # 分點主力序列至少累積這麼多天才覆寫 build_site 的三大法人主力基準
 RELEASED_WINDOW_TD = 5
 WATCH_CUM6_MIN = 25.0
 K1_THRESHOLD = 32.0
@@ -297,7 +299,11 @@ def window_cc(ser, voln, dates):
     return round(num / den * 100, 1) if den > 0 else None
 
 def patch_stock_mf(out_dir, sid, mf_series):
-    """把主力買賣超日序列寫進 site/data/{sid}.json 的 mfs/mf。"""
+    """用『分點』主力買賣超日序列覆寫 site/data/{sid}.json 的 mfs/mf。
+    build_site 已先用三大法人合計為每一檔填好主力副圖基準；此處只在分點資料
+    累積到 MF_OVERRIDE_MIN_DAYS 天以上時，才把處置相關個股升級成更精準的分點主力，
+    避免用幾乎空白的分點序列蓋掉較完整的三大法人基準。但若該檔尚無基準
+    （例如上櫃股 T86 尚未涵蓋），則有多少分點就先寫多少，總比沒有好。"""
     p = os.path.join(out_dir, "data", f"{sid}.json")
     if not os.path.exists(p) or not mf_series: return False
     try:
@@ -305,6 +311,9 @@ def patch_stock_mf(out_dir, sid, mf_series):
     except Exception: return False
     d = o.get("d", [])
     if not d: return False
+    base_span = (len(d) - o["mfs"]) if (o.get("mf") and o.get("mfs") is not None) else 0
+    if base_span > 0 and len(mf_series) < MF_OVERRIDE_MIN_DAYS:
+        return False   # 已有較完整的三大法人基準，分點還太少，先別覆寫
     smin = min(mf_series.keys())
     mfs = 0
     while mfs < len(d) and d[mfs] < smin: mfs += 1
@@ -485,7 +494,8 @@ def main():
             if r is not None and ser:
                 r["z5"] = window_cc(ser, voln, mf_dates[-5:])
                 r["z10"] = window_cc(ser, voln, mf_dates[-10:])
-        diag["notes"].append(f"分點：本次抓 {fetched} 日，主力序列回寫 {patched}/{len(targets)} 檔（快取累積中）")
+        diag["notes"].append(f"分點：本次抓 {fetched} 日，升級為分點主力 {patched}/{len(targets)} 檔"
+                             f"（未達 {MF_OVERRIDE_MIN_DAYS} 天者沿用三大法人主力基準；快取累積中）")
     con.close()
     write_outputs(args.out, build_payload(today, next_td, watch, confirmed, ongoing, released, diag))
 
