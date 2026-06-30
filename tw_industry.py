@@ -114,18 +114,17 @@ def ensure_table(con):
     con.commit()
 
 
+_TYPE_MKT = {"twse": "上市", "tpex": "上櫃", "上市": "上市", "上櫃": "上櫃",
+             "TWSE": "上市", "TPEX": "上櫃"}
+
+
 def fetch_finmind_industry(con, token, force=False, min_have=200):
-    """抓 FinMind TaiwanStockInfo 的大分類 industry_category，快取到 industry 表的 category 欄。
-    已有足夠快取(>=min_have)且非 force 時略過，避免每天重抓。回傳本次寫入筆數。"""
+    """抓 FinMind TaiwanStockInfo（每次跑一次 1 call）：
+    1) industry_category 寫進 industry 表(產業大分類補底)。
+    2) stock_name/market 補進 stock 表 —— 解決部分清單『只有代號、沒有股名』。
+    回傳本次處理的個股數。"""
     ensure_table(con)
-    if not force:
-        try:
-            have = con.execute(
-                "SELECT COUNT(*) FROM industry WHERE category IS NOT NULL AND category!=''").fetchone()[0]
-        except sqlite3.Error:
-            have = 0
-        if have >= min_have:
-            return 0
+    con.execute("CREATE TABLE IF NOT EXISTS stock(stock_id TEXT PRIMARY KEY, name TEXT, market TEXT)")
     if requests is None or not token:
         return 0
     try:
@@ -139,12 +138,20 @@ def fetch_finmind_industry(con, token, force=False, min_have=200):
     seen = {}
     for it in data:
         sid = str(it.get("stock_id", "")).strip()
-        cat = str(it.get("industry_category", "")).strip()
         if len(sid) == 4 and sid.isdigit() and sid not in seen:
-            seen[sid] = cat
-    for sid, cat in seen.items():
+            seen[sid] = (str(it.get("industry_category", "")).strip(),
+                         str(it.get("stock_name", "")).strip(),
+                         str(it.get("type", "")).strip())
+    for sid, (cat, nm, typ) in seen.items():
         con.execute("INSERT INTO industry(stock_id,category) VALUES(?,?) "
                     "ON CONFLICT(stock_id) DO UPDATE SET category=excluded.category", (sid, cat))
+        if nm:   # 補股名（不覆寫既有市場別，只在缺漏時補）
+            con.execute("INSERT INTO stock(stock_id,name) VALUES(?,?) "
+                        "ON CONFLICT(stock_id) DO UPDATE SET name=excluded.name", (sid, nm))
+            m = _TYPE_MKT.get(typ)
+            if m:
+                con.execute("UPDATE stock SET market=? WHERE stock_id=? AND (market IS NULL OR market='')",
+                            (m, sid))
     con.commit()
     return len(seen)
 

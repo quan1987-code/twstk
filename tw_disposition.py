@@ -697,7 +697,8 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 
   /* 緊湊表格（仿處置神器；凍結首欄、可左右滑動、欄位標題排序） */
   .tblhint{font-size:11px; color:var(--dim); margin:2px 2px 8px; line-height:1.5;}
-  .dtbl-wrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:11px; background:var(--card);}
+  /* 同時可垂直＋水平捲動的盒：向下滑動時表頭(sticky top)固定、向右滑動時首欄(sticky left)固定 */
+  .dtbl-wrap{overflow:auto; max-height:74vh; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:11px; background:var(--card); overscroll-behavior:contain;}
   .dtbl{border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-variant-numeric:tabular-nums;}
   .dtbl th,.dtbl td{padding:7px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border);}
   .dtbl tbody tr:last-child td{border-bottom:none;}
@@ -727,6 +728,9 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .ntag{font-size:11px; font-weight:700; color:#ffd9da; background:var(--red-s); border:1px solid rgba(255,77,79,.3); border-radius:7px; padding:3px 8px;}
   .ntag.yx{color:var(--amber); background:var(--amber-s); border-color:rgba(245,165,36,.3);}
   .ntag.ma{color:#9fd0ff; background:rgba(77,159,255,.12); border-color:rgba(77,159,255,.3);}
+  /* 通知表格名稱欄內的觸發原因標籤 */
+  .nmcell .nrz{display:flex; flex-wrap:wrap; gap:3px; margin-top:4px; max-width:180px; white-space:normal;}
+  .nmcell .nrz .ntag{font-size:9.5px; font-weight:700; padding:1px 5px; border-radius:6px;}
 
   .up{color:var(--up);} .down{color:var(--down);} .flat{color:var(--muted);} .amb{color:var(--amber);}
   .dot{display:inline-block; width:9px; height:9px; border-radius:99px; margin-right:2px; vertical-align:middle;}
@@ -786,7 +790,6 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <button class="czt on" data-p="ov">總覽</button>
     <button class="czt" data-p="notify">🔔 通知</button>
     <button class="czt" data-p="watch">可能進入處置</button>
-    <button class="czt" data-p="confirm">明日確定</button>
     <button class="czt" data-p="ongoing">處置中</button>
     <button class="czt" data-p="teach">實戰教學</button>
     <button class="czt" data-p="rule">規則說明</button>
@@ -796,7 +799,6 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <div class="stats">
       <div class="stat r"><div class="n num" id="cnt-n">—</div><div class="l">🔔 通知</div></div>
       <div class="stat w"><div class="n num" id="cnt-w">—</div><div class="l">可能進入處置</div></div>
-      <div class="stat c"><div class="n num" id="cnt-c">—</div><div class="l">明日確定</div></div>
       <div class="stat o"><div class="n num" id="cnt-o">—</div><div class="l">處置中</div></div>
     </div>
     <div class="note">
@@ -808,6 +810,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 
   <div class="pane hidden" id="p-notify">
     <div class="sech">🔔 通知（每次更新重新掃描） <span class="pill">處置中・月斜&gt;1%・跌幅破關或觸月線</span></div>
+    <div class="tblhint">與「處置中」相同排版・點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
     <div id="list-notify"></div>
     <div id="expl-notify"></div>
   </div>
@@ -817,13 +820,6 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <div class="tblhint">點欄位標題排序（再點切換升/降冪）・表格可左右滑動看更多指標・點列看 K 線</div>
     <div id="list-watch"></div>
     <div id="expl-watch"></div>
-  </div>
-
-  <div class="pane hidden" id="p-confirm">
-    <div class="sech">🔒 下一交易日確定進入處置 <span class="pill">FinMind 處置公告</span></div>
-    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
-    <div id="list-confirm"></div>
-    <div id="expl-confirm"></div>
   </div>
 
   <div class="pane hidden" id="p-ongoing">
@@ -836,20 +832,46 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   <div class="pane hidden" id="p-teach">
     <div class="doc">
       <h3>一句話：處置股在玩什麼？</h3>
-      <p class="lead">股票短期漲太兇（或量／當沖太誇張）會被交易所「關起來」分盤交易、限制當沖。流動性被抽乾後籌碼鎖死，股價容易<b>暴漲暴跌</b>。我們不賭它被關，而是抓「進處置前、處置中、出關」三個時點的大波動。</p>
-      <h3>五種狀態，你各該做什麼</h3>
+      <p class="lead">股票短期漲太兇（或量、當沖太誇張）會被交易所「關起來」分盤交易、限制當沖。流動性被抽乾、籌碼鎖死，股價容易<b>暴漲暴跌</b>。我們不賭它被關，而是用本站指標，在「處置中被錯殺」時找低接、並嚴設停損。</p>
+
+      <h3>核心買點</h3>
+      <div class="step"><div class="no">1</div><div class="tx"><b>處置後跌深＝大買機會</b>：處置中個股自處置起算<b>累幅跌 20% 以上</b>（坐牢被殺過頭），常是恐慌錯殺、易反彈的大買點。跌破 -10%／-20%／-30% 會自動進「🔔 通知」。</div></div>
+      <div class="step"><div class="no">2</div><div class="tx"><b>浪子回頭（跟位階有關）</b>：強勢股拉回月線（20MA）止跌、量縮、主力沒走。要件＝<b>月斜為正</b>、<b>主5／主10 為正</b>（主力沒倒貨）、<b>位階偏低</b>（接近下軌 −10 最佳）、價格貼著月線。位階越低、拉回越深越安全。</div></div>
+      <div class="step"><div class="no">3</div><div class="tx"><b>低檔爆大量＝底部訊號</b>：位階低（基期低）時突然<b>爆出大量</b>，常是主力進場、打底訊號，可留意。</div></div>
+      <div class="step"><div class="no">4</div><div class="tx"><b>不破低點＋出紅K＝加碼點</b>：回測前低不破、收一根<b>實體紅K</b>，可考慮加碼。</div></div>
+
+      <h3>用本站指標選股（怎麼按）</h3>
+      <ul>
+        <li><span class="k">位階：低 → 高 排序</span>：點「位階」欄由小到大排，<b>從低位階（−10 附近）開始找</b>低接標的。</li>
+        <li><span class="k">月斜：只要正的</span>：月線斜率為正（&gt;1% 強勢）才看；<b>斜率為負的直接跳過</b>。</li>
+        <li><span class="k">主5／主10：要正的</span>：代表主力仍站在買方、沒在倒貨。</li>
+      </ul>
+
+      <h3>主力買盤強度（主5／主10 怎麼看）</h3>
       <table>
-        <tr><th>狀態</th><th>白話</th><th>怎麼做</th></tr>
-        <tr><td class="k">可能進入處置</td><td>漲幅/量能接近門檻、聽牌中</td><td>賭公告前最後一漲：須月線向上、主力沒跑；公告後可能跳水，控好部位</td></tr>
-        <tr><td class="k">明日確定</td><td>明天起被關</td><td>波段客可尾盤卡位「越關越大尾」標的；當沖客準備出關日反向操作</td></tr>
-        <tr><td class="k">處置中</td><td>分盤坐牢</td><td>低接「拉回月線且主力沒跑」；嚴禁現股當沖；跌破月線或主力撤退就走</td></tr>
+        <tr><th>主5／主10（集中度%）</th><th>解讀</th></tr>
+        <tr><td><b>0 ~ 10</b></td><td>小買</td></tr>
+        <tr><td><b>10 ~ 20</b></td><td>中買</td></tr>
+        <tr><td><b>20 以上</b></td><td>大買</td></tr>
       </table>
-      <h3>兩個核心買點</h3>
-      <div class="step"><div class="no">1</div><div class="tx"><b>浪子回頭</b>：強勢股拉回月線（20日線）止跌、量縮、主力沒走（月斜為正、集中度為正、距月線±3%內、量縮到平常3成以下）。</div></div>
-      <div class="step"><div class="no">2</div><div class="tx"><b>深蹲蓄力</b>：處置期被一根大單殺到近跌停（單日跌約9%↑），但盤後主力沒在倒貨（集中度沒轉負）＝恐慌錯殺，易反彈。</div></div>
-      <h3>鐵則</h3>
-      <div class="warn">① 收盤跌破月線超過3%、或主力集中度連3日轉負 → 隔天無條件出。② 不玩出關當天（開高走低機率高）。③ 當沖税費＋分盤滑價常吃光價差。④ 處置期間禁現股當沖。⑤ 漲停家數＞20 或處置股暴增＝末段訊號，降部位。</div>
-      <p class="discl">本頁為交易紀律整理，非投資建議。門檻數字為對公開教學的量化重構，需依你自己的回測校準。</p>
+      <p class="lead">處置股的主5／主10 <b>都是正的就不錯</b>（主力仍在買方）。轉負＝主力派發，警訊。</p>
+
+      <h3>停利</h3>
+      <p><span class="k">賺 10% 先賣一些</span>：獲利約 +10% 就<b>分批減碼</b>落袋，留部位續抱。</p>
+
+      <h3>停損鐵則</h3>
+      <div class="warn">
+        ① <b>收盤跌破月線(MA20) 超過 3%</b>，或<b>連續 2 個交易日收盤站不回月線</b> → 出。<br>
+        ② <b>主5 或主10（CC）轉為負值</b>，或<b>前 15 大買超券商分點（主力買賣超）出現集體撤退、大舉倒貨</b> → 即使價格還沒跌破月線，也代表支撐虛弱，必須<b>提早甚至立即出清停損</b>。
+      </div>
+
+      <h3>操作禁忌</h3>
+      <ul>
+        <li><b>跌停不要買</b>（分盤跌停易持續鎖死、流動性差）。</li>
+        <li><b>漲停不要賣</b>（強勢鎖漲停，賣了常少賺一大段）。</li>
+        <li>處置期間<b>禁現股／資券當沖</b>；當沖税費＋分盤滑價常吃光價差。</li>
+      </ul>
+      <p class="discl">本頁為交易紀律整理，非投資建議。門檻數字需依你自己的回測校準。</p>
     </div>
   </div>
 
@@ -948,32 +970,15 @@ function renderList(elId, arr, opt){
   </div>`).join("");
 }
 
-/* ---- 通知卡 ---- */
-function renderNotify(arr){
-  const el=$("list-notify"); if(!el) return;
-  if(!arr||!arr.length){ el.innerHTML=`<div class="empty">目前沒有達到通知標準的處置中個股。<br><span style="color:var(--dim)">標準：月斜&gt;1% 且（累計跌幅破 -10/-20/-30%，或當日K棒觸及20MA月線）</span></div>`; return; }
-  el.innerHTML=arr.map(r=>{
-    const tags=(r.reasons||[]).map(x=>`<span class="ntag">${esc(x)}</span>`).join("")
-             + `<span class="ntag yx">月斜 ${fx(r.yx,1)}%</span>`
-             + (isNum(r.ma20)?`<span class="ntag ma">20MA ${fx(r.ma20,2)}</span>`:"");
-    return `<div class="card ncard${r.tier!=null?(' t'+Math.abs(r.tier)):''}">
-      ${cardHead(r, false)}
-      <div class="nreasons">${tags}</div>
-      ${metricGrid(r)}
-      ${progRow(r)}
-    </div>`;
-  }).join("");
-}
-
 /* ---- 緊湊表格（仿處置神器）：凍結首欄、可左右滑動、點欄位標題排序 ---- */
-const sortState = { watch:{key:null,asc:false}, confirm:{key:null,asc:false}, ongoing:{key:null,asc:false} };
-const LISTDATA = { watch:[], confirm:[], ongoing:[] };
+const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, ongoing:{key:null,asc:false} };
+const LISTDATA = { notify:[], watch:[], ongoing:[] };
 const LISTOPT = {
+  notify:{prog:true, empty:"目前沒有達到通知標準的處置中個股。<br><span style=\"color:var(--dim)\">標準：月斜&gt;1% 且（累計跌幅破 -10/-20/-30%，或當日K棒觸及20MA月線）</span>"},
   watch:{light:true, empty:"目前沒有接近處置門檻的個股。"},
-  confirm:{empty:"下一交易日沒有新進處置的個股。"},
   ongoing:{prog:true, empty:"目前沒有處置中的個股。"}
 };
-// 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻
+// 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻、處置中/通知多一欄進度
 function colSpec(name){
   const c=[
     [["股價","close"],["漲幅","chg"]],
@@ -982,7 +987,7 @@ function colSpec(name){
     [["主5","z5"],["主10","z10"]],
   ];
   if(name==="watch") c.push([["量倍","vmult"],["價門檻","lf"]]);
-  if(name==="ongoing"||name==="confirm") c.push([["進度","day_n"],["剩","d2r"]]);
+  if(name==="ongoing"||name==="notify") c.push([["進度","day_n"],["剩","d2r"]]);
   return c;
 }
 function fmtCell(key,v,r){
@@ -1028,6 +1033,7 @@ function renderTbl(name){
         <div class="sub">${esc(r.sid)}${r.mkt?" "+esc(r.mkt):""}</div>
         ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
         ${per?`<div class="per">${per}</div>`:""}
+        ${(r.reasons&&r.reasons.length)?`<div class="nrz">${r.reasons.map(x=>`<span class="ntag">${esc(x)}</span>`).join("")}</div>`:""}
       </td>${tds}</tr>`;
   });
   el.innerHTML=`<div class="dtbl-wrap"><table class="dtbl"><thead><tr>${thead}</tr></thead><tbody>${tb}</tbody></table></div>`;
@@ -1065,7 +1071,7 @@ function goChart(sid){ location.href = "index.html?stk=" + encodeURIComponent(si
 
 function switchTab(p){
   document.querySelectorAll(".czt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  ["ov","notify","watch","confirm","ongoing","teach","rule"].forEach(x=>{
+  ["ov","notify","watch","ongoing","teach","rule"].forEach(x=>{
     const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p);
   });
   try{ window.scrollTo({top:0,behavior:"smooth"}); }catch(e){ window.scrollTo(0,0); }
@@ -1075,11 +1081,11 @@ document.querySelectorAll(".czt").forEach(b=>b.addEventListener("click",()=>swit
 async function boot(){
   let d=null;
   try{ const r=await fetch("data/chuzhi.json",{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
-  ["watch","confirm","ongoing"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
+  ["watch","ongoing"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
   const en=$("expl-notify"); if(en) en.innerHTML=NOTIFY_EXPL;
   if(!d){
     $("today").textContent="資料尚未產生";
-    ["notify","watch","confirm","ongoing"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
+    ["notify","watch","ongoing"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
     return;
   }
   $("today").textContent=d.today||"—";
@@ -1087,11 +1093,9 @@ async function boot(){
   const c=d.counts||{};
   $("cnt-n").textContent=c.notify!=null?c.notify:((d.notify||[]).length);
   $("cnt-w").textContent=c.watch!=null?c.watch:((d.watch||[]).length);
-  $("cnt-c").textContent=c.confirmed!=null?c.confirmed:((d.confirmed||[]).length);
   $("cnt-o").textContent=c.ongoing!=null?c.ongoing:((d.ongoing||[]).length);
-  renderNotify(d.notify||[]);
-  LISTDATA.watch=d.watch||[]; LISTDATA.confirm=d.confirmed||[]; LISTDATA.ongoing=d.ongoing||[];
-  ["watch","confirm","ongoing"].forEach(renderTbl);
+  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.ongoing=d.ongoing||[];
+  ["notify","watch","ongoing"].forEach(renderTbl);
   if(d.diag && (d.diag.notes||[]).length){
     const box=$("diagbox"); box.style.display="block";
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
