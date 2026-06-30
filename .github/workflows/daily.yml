@@ -43,6 +43,8 @@ jobs:
         run: python tw_disposition.py
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+      - name: Build 產業資金流向（熱圖＋120日資金輪動）
+        run: python tw_industry_flow.py
       - name: Save price DB
         if: always()
         uses: actions/cache/save@v6

@@ -784,15 +784,17 @@ def output_market_extras(extras):
 
 
 # ============================================================
-#  資金流向：大戶(三大法人合計) / 投信，最近一日 + 近30日 買賣超 TOP10（依金額億）
+#  資金流向：大戶(三大法人合計) / 投信，當日 + 近5/20/60日 買賣超 TOP10（依金額億）
 # ============================================================
-FLOW_WINDOW = 30        # 近 N 個交易日累計
+FLOW_WINDOW = 60        # 近 N 個交易日累計（最長窗）
 FLOW_TOPN = 10
+# (網頁端後綴, 交易日數)；當日以 1 表示
+FLOW_WINDOWS = (("d", 1), ("5", 5), ("20", 20), ("60", 60))
 
 
 def build_flows(con):
     """以 inst 表(三大法人/投信張數) × 當日收盤估算買賣超金額(億)，
-    產出 大戶/投信 各『最近一日』與『近30日累計』的買超/賣超 TOP10。"""
+    產出 大戶/投信 各『當日 / 近5日 / 近20日 / 近60日累計』的買超/賣超 TOP10。"""
     dates = [r[0] for r in con.execute(
         "SELECT DISTINCT date FROM inst WHERE total_lots IS NOT NULL "
         "ORDER BY date DESC LIMIT ?", (FLOW_WINDOW,))]
@@ -836,11 +838,16 @@ def build_flows(con):
                            "chg": chg.get(s)} for s, a in lst]
         return {"buy": mk(buy), "sell": mk(sell)}
 
-    return {"date": latest, "win_from": win_min, "win_days": len(dates),
-            "big_d": top(amounts("total_lots", latest)),
-            "big_30": top(amounts("total_lots", win_min)),
-            "trust_d": top(amounts("trust_lots", latest)),
-            "trust_30": top(amounts("trust_lots", win_min))}
+    def since_for(n):
+        # 近 n 個交易日的起算日（dates 為由新到舊）；資料不足時取最舊一筆
+        return dates[min(n, len(dates)) - 1]
+
+    out = {"date": latest, "win_from": win_min, "win_days": len(dates)}
+    for suf, n in FLOW_WINDOWS:
+        since = latest if n == 1 else since_for(n)
+        out[f"big_{suf}"] = top(amounts("total_lots", since))
+        out[f"trust_{suf}"] = top(amounts("trust_lots", since))
+    return out
 
 
 def output_flows(flows):
@@ -936,7 +943,7 @@ def main():
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
 
-    # 資金流向 TOP10（大戶=三大法人合計 / 投信；最近一日 + 近30日）
+    # 資金流向 TOP10（大戶=三大法人合計 / 投信；當日 + 近5/20/60日）
     try:
         output_flows(build_flows(con))
     except Exception as e:
