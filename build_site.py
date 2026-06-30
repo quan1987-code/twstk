@@ -360,8 +360,8 @@ def write_page(results, history, market, trust, extras, flows, date, db_ok, gent
         f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime, industry))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
-                   "orientation": "portrait", "background_color": "#0a0f1a",
-                   "theme_color": "#0a0f1a", "start_url": "."}, f, ensure_ascii=False)
+                   "orientation": "portrait", "background_color": "#000000",
+                   "theme_color": "#000000", "start_url": "."}, f, ensure_ascii=False)
 
 
 def main():
@@ -414,22 +414,22 @@ TEMPLATE = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="台股看板">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0a0f1a">
+<meta name="theme-color" content="#000000">
 <link rel="manifest" href="manifest.json">
 <title>台股看板 ・ __DATE__</title>
 <style>
   :root{
-    --bg:#0a0f1a; --card:#111827; --card2:#161f33; --border:#1f2a3d;
-    --text:#e6edf6; --muted:#93a3b8; --dim:#5e6f86;
-    --amber:#f5a524; --amber-s:rgba(245,165,36,.14);
-    --up:#ff4d4f; --down:#22c55e;
-    --blue:#4d9fff; --blue-s:rgba(77,159,255,.12);
+    --bg:#000000; --card:#121214; --card2:#1b1b1f; --border:#2a2a2f;
+    --text:#f0f1f3; --muted:#9a9aa2; --dim:#67676e;
+    --amber:#ffcf3a; --amber-s:rgba(255,207,58,.15);
+    --up:#fb3b41; --down:#1ec77a;
+    --blue:#5aa9ff; --blue-s:rgba(90,169,255,.12);
     --purple:#b794ff; --purple-s:rgba(183,148,255,.12);
     --ma5:#f5c518; --ma10:#e23fd0; --ma20:#27c4dc; --ma60:#c79a52; --ma240:#3b6fe0;
   }
   *{box-sizing:border-box;}
   body{margin:0; background:var(--bg); color:var(--text);
-    font-family:'Inter','Noto Sans TC','PingFang TC','Microsoft JhengHei',system-ui,sans-serif;
+    font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC","Microsoft JhengHei","Segoe UI",Roboto,sans-serif;
     -webkit-font-smoothing:antialiased; padding:16px 12px 36px; padding-top:calc(16px + env(safe-area-inset-top));}
   .num{font-variant-numeric:tabular-nums;}
   .wrap{max-width:1180px; margin:0 auto;}
@@ -438,23 +438,23 @@ TEMPLATE = r"""<!DOCTYPE html>
   .sub{font-size:12px; color:var(--muted); margin-top:4px;}
   .hidden{display:none !important;}
 
-  .tabbar{display:flex; gap:6px; margin:14px 0; background:var(--card); padding:5px; border-radius:11px; border:1px solid var(--border);}
-  .tab{flex:1; background:transparent; color:var(--muted); border:none; border-radius:8px; padding:10px 8px; font-size:14px; font-weight:700; cursor:pointer;}
-  .tab.on{background:var(--amber-s); color:var(--amber);}
-  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:linear-gradient(90deg,rgba(245,165,36,.16),rgba(77,159,255,.10)); border:1px solid rgba(245,165,36,.3); border-radius:11px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
+  .tabbar{display:flex; gap:8px; margin:12px 0; background:transparent; padding:2px 0; border-bottom:1px solid var(--border);}
+  .tab{flex:1; background:transparent; color:var(--muted); border:none; border-radius:99px; padding:9px 8px; font-size:14px; font-weight:700; cursor:pointer;}
+  .tab.on{background:var(--amber); color:#000; font-weight:800;}
+  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:var(--card); border:1px solid var(--border); border-left:3px solid var(--amber); border-radius:8px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
   .czentry .arr{color:var(--amber); font-weight:800; font-size:17px;}
   .czentry .czt2{display:block; font-size:11px; color:var(--muted); font-weight:600; margin-top:3px;}
-  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:linear-gradient(90deg,rgba(245,165,36,.16),rgba(77,159,255,.10)); border:1px solid rgba(245,165,36,.32); border-radius:11px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
+  .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:var(--card); border:1px solid var(--border); border-left:3px solid var(--amber); border-radius:8px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
   .czentry .czt2{font-size:11px; color:var(--muted); font-weight:600; margin-left:2px;}
   .czentry .arr{color:var(--amber); font-weight:800; font-size:16px;}
 
   /* 首頁回撤卡 */
   .ddcards{display:grid; grid-template-columns:1fr; gap:12px;}
-  .ddcard{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:16px 17px;}
+  .ddcard{background:var(--card); border:1px solid var(--border); border-radius:9px; padding:16px 17px;}
   .flowwrap{margin-top:16px;}
   .flowtitle{font-size:13px; font-weight:700; color:var(--muted); margin:0 2px 10px;}
   .flowgrid{display:grid; grid-template-columns:1fr; gap:12px;}
-  .fcard{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:14px 16px;}
+  .fcard{background:var(--card); border:1px solid var(--border); border-radius:9px; padding:14px 16px;}
   .fcard .ft{font-size:12px; color:var(--muted); font-weight:600; margin-bottom:7px; display:flex; align-items:center; gap:8px;}
   .fcard .fd{font-size:11px; color:var(--dim); font-weight:500;}
   .fcard .fv{font-size:23px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-.5px;}
@@ -465,7 +465,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .ddbig b{font-size:30px; font-weight:800; color:var(--amber); margin-left:4px; letter-spacing:.3px;}
   .ddbig b.flat{color:var(--up);}
   .ddbar{height:8px; background:#0e1626; border-radius:5px; overflow:hidden; margin-bottom:13px;}
-  .ddbarfill{height:100%; background:linear-gradient(90deg,#f5a524,#e0701f); border-radius:5px;}
+  .ddbarfill{height:100%; background:var(--amber); border-radius:5px;}
   .ddrow{display:flex; align-items:baseline; gap:8px; padding:4px 0; border-top:1px solid var(--border);}
   .ddrow .k{font-size:12px; color:var(--dim); width:96px; flex:none;}
   .ddrow .v{font-size:17px; font-weight:800; font-variant-numeric:tabular-nums;}
@@ -528,7 +528,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .fchip.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
   .toptop{display:grid; grid-template-columns:1fr; gap:14px;}
   @media(min-width:640px){ .toptop{grid-template-columns:1fr 1fr;} }
-  .tpanel{background:var(--card); border:1px solid var(--border); border-radius:13px; overflow:hidden;}
+  .tpanel{background:var(--card); border:1px solid var(--border); border-radius:9px; overflow:hidden;}
   .tphd{font-size:13px; font-weight:800; padding:11px 14px; border-bottom:1px solid var(--border);}
   .tphd.buy{color:var(--up);} .tphd.sell{color:var(--down);}
   .frow{position:relative; display:flex; align-items:center; gap:9px; padding:9px 13px; border-bottom:1px solid rgba(255,255,255,.04); font-size:13px;}
@@ -1020,7 +1020,7 @@ document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{do
 /* ===== 技術線圖引擎 ===== */
 const MACOLOR={5:"#f5c518",10:"#e23fd0",20:"#27c4dc",60:"#c79a52",240:"#3b6fe0"};
 const PRICE_MAS=[5,10,20,60,240], VOL_MAS=[5,20,60];
-const UP="#ff4d4f", DOWN="#22c55e", BOLL="#8aa0b6";
+const UP="#fb3b41", DOWN="#1ec77a", BOLL="#8a8a93";
 function SMA(a,n){const o=new Array(a.length).fill(null);let s=0,cnt=0; for(let i=0;i<a.length;i++){if(a[i]==null){o[i]=null;continue;} s+=a[i];cnt++; if(i>=n&&a[i-n]!=null){s-=a[i-n];cnt--;} if(cnt>=n)o[i]=s/n;} return o;}
 function EMA(a,n){const o=new Array(a.length).fill(null);const k=2/(n+1);let p=null; for(let i=0;i<a.length;i++){if(a[i]==null){o[i]=p;continue;} p=(p==null)?a[i]:a[i]*k+p*(1-k); o[i]=p;} return o;}
 function STD(a,n,ma){const o=new Array(a.length).fill(null); for(let i=n-1;i<a.length;i++){if(ma[i]==null)continue;let s=0,ok=true;for(let j=i-n+1;j<=i;j++){if(a[j]==null){ok=false;break;}const d=a[j]-ma[i];s+=d*d;} if(ok)o[i]=Math.sqrt(s/n);} return o;}
@@ -1079,6 +1079,8 @@ async function openChart(sid){
     if(!CHART_DEEPLINK){ try{ history.pushState({chart:sid}, "", "?stk="+encodeURIComponent(sid)); CHART_PUSHED=true; }catch(e){} }
   }
   cv.classList.add("open");
+  // 圖層剛顯示時版面可能尚未定位(寬高為0)，下一影格用正確尺寸重畫一次，避免空白圖。
+  requestAnimationFrame(()=>{ try{ if(CH.bars&&CH.bars.length) drawChart(); }catch(e){} });
 }
 let CHART_DEEPLINK=false, CHART_PUSHED=false;
 function closeChart(){
@@ -1214,13 +1216,13 @@ function drawChart(){
     // 價格標籤(左軸)
     const ptxt=hp.toFixed(2), pw=ctx.measureText(ptxt).width+8;
     ctx.fillStyle="#f5a524"; ctx.fillRect(Math.max(0,PADL-pw-1), hy-8, pw, 16);
-    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle="#000"; ctx.textAlign="center"; ctx.textBaseline="middle";
     ctx.fillText(ptxt, Math.max(0,PADL-pw-1)+pw/2, hy);
     // 日期標籤(底部)
     const dtxt=CH.bars[idx].d, dw=ctx.measureText(dtxt).width+10;
     const dx=Math.max(PADL, Math.min(W-PADR-dw, x-dw/2));
     ctx.fillStyle="#f5a524"; ctx.fillRect(dx, L.dateY+2, dw, 15);
-    ctx.fillStyle="#0a0f1a"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle="#000"; ctx.textAlign="center"; ctx.textBaseline="middle";
     ctx.fillText(dtxt, dx+dw/2, L.dateY+9);
   }
   updateReadout(idx);
