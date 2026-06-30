@@ -549,8 +549,13 @@ TEMPLATE = r"""<!DOCTYPE html>
   .fcg{width:60px; text-align:right; font-size:12px; font-variant-numeric:tabular-nums;}
   .tpempty{padding:26px; text-align:center; color:var(--dim); font-size:13px;}
   .hint{font-size:11px; color:var(--dim); width:100%;}
-  .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:12px; background:var(--card);}
+  /* 可垂直＋水平捲動的盒；向下滑動時表頭(sticky)固定 */
+  .tablewrap{overflow:auto; max-height:74vh; -webkit-overflow-scrolling:touch; border:1px solid var(--border); border-radius:12px; background:var(--card); overscroll-behavior:contain;}
+  /* 移到列表上方的水平捲動bar（與表格同步） */
+  .hbar{overflow-x:auto; overflow-y:hidden; height:13px; margin-bottom:5px; border-radius:8px; background:var(--card2);}
+  .hbar>div{height:1px;}
   table{width:100%; border-collapse:collapse; font-size:13px; min-width:860px;}
+  thead th{position:sticky; top:0; z-index:3; background:var(--card2);}
   th{padding:10px 11px; text-align:right; color:var(--dim); font-weight:600; font-size:11px; white-space:nowrap; cursor:pointer; border-bottom:1px solid var(--border);}
   th.l, td.l{text-align:left;}
   th .ar{color:var(--amber); margin-left:2px;}
@@ -580,8 +585,10 @@ TEMPLATE = r"""<!DOCTYPE html>
   .pswitch{display:flex; gap:4px; margin-left:auto;}
   .pbtn{background:var(--card); border:1px solid var(--border); color:var(--muted); border-radius:7px; padding:7px 15px; font-size:14px; cursor:pointer; font-weight:600;}
   .pbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  .rotoggle{display:block; width:100%; text-align:left; background:var(--card); color:var(--amber); border:none; border-bottom:1px solid var(--border); padding:7px 14px; font-size:12px; font-weight:700; cursor:pointer;}
   .readout{display:flex; gap:13px; flex-wrap:wrap; padding:8px 14px; font-size:13px; border-bottom:1px solid var(--border); background:var(--card);}
   .readout .it{display:flex; gap:5px;}
+  .readout:not(.full) .it.ext{display:none;}   /* 收摺時隱藏 MA/布林/MACD 等進階數據 */
   .readout .k{color:var(--dim);}
   .readout .v{font-weight:700; font-variant-numeric:tabular-nums;}
   .malegend{display:flex; gap:11px; flex-wrap:wrap; padding:6px 14px 0; font-size:11px;}
@@ -651,7 +658,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       <button class="chip" data-mkt="上櫃">上櫃</button>
       <span class="hint">點欄位排序 ・ 點名稱看K線</span>
     </div>
-    <div class="tablewrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
+    <div class="hbar" id="screenHbar"><div></div></div>
+    <div class="tablewrap" id="screenWrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
   </div>
 
   <!-- 分頁三：投信連買 -->
@@ -713,6 +721,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <div class="cvchg" id="cvChg"></div>
     <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" style="margin-left:5px">下圖:MACD</button></div>
   </div>
+  <button class="rotoggle" id="roToggle" onclick="toggleReadout()">▾ 展開指標數據(MA/布林/MACD…)</button>
   <div class="readout" id="readout"></div>
   <div class="malegend">
     <span><i style="background:var(--ma5)"></i>MA5</span><span><i style="background:var(--ma10)"></i>MA10</span>
@@ -1013,7 +1022,17 @@ function renderTable(d){
   }).join("")||`<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
 }
 function render(){const d=view(); renderCards(d); renderBars(d); renderHead(); renderTable(d);
-  document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔`;}
+  document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔`; syncTopScroll();}
+// 列表上方的水平捲動bar 與表格同步
+function syncTopScroll(){
+  const wrap=document.getElementById("screenWrap"), bar=document.getElementById("screenHbar");
+  if(!wrap||!bar) return; const inner=bar.firstElementChild, tbl=wrap.querySelector("table"); if(!tbl) return;
+  inner.style.width=tbl.scrollWidth+"px";
+  let lock=false;
+  bar.onscroll=()=>{ if(lock)return; lock=true; wrap.scrollLeft=bar.scrollLeft; lock=false; };
+  wrap.onscroll=()=>{ if(lock)return; lock=true; bar.scrollLeft=wrap.scrollLeft; lock=false; };
+}
+window.addEventListener("resize",()=>{ try{ syncTopScroll(); }catch(e){} });
 document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value; render();});
 document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{document.querySelectorAll(".chip").forEach(x=>x.classList.remove("on")); c.classList.add("on"); state.mkt=c.dataset.mkt; render();}));
 
@@ -1161,7 +1180,7 @@ function drawChart(){
   for(let i=start;i<end;i++){ const b=CH.bars[i], x=xOf(i), up=b.c>=b.o, col=up?UP:DOWN; ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(x,pY(b.h)); ctx.lineTo(x,pY(b.l)); ctx.stroke();
     const bodyW=Math.max(bw*0.6,1), yo=pY(b.o),yc=pY(b.c), top=Math.min(yo,yc), hgt=Math.max(Math.abs(yc-yo),1);
-    if(up) ctx.strokeRect(x-bodyW/2,top,bodyW,hgt); else ctx.fillRect(x-bodyW/2,top,bodyW,hgt); }
+    ctx.fillRect(x-bodyW/2,top,bodyW,hgt); }   // 紅K/綠K 一律實體
   ctx.lineWidth=1.4;
   PRICE_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.ma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=pY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
   const N=CH.bars.length;
@@ -1230,34 +1249,38 @@ function drawChart(){
 function updateReadout(i){
   const b=CH.bars[i]; if(!b){document.getElementById("readout").innerHTML=""; return;}
   const prev=i>0?CH.bars[i-1].c:b.o, chg=((b.c-prev)/prev*100), cc=b.c>=prev?UP:DOWN;
-  const it=(k,v,c)=>`<div class="it"><span class="k">${k}</span><span class="v" ${c?`style="color:${c}"`:""}>${v}</span></div>`;
+  const it=(k,v,c,ex)=>`<div class="it${ex?" ext":""}"><span class="k">${k}</span><span class="v" ${c?`style="color:${c}"`:""}>${v}</span></div>`;
   const sgn=(x)=>(x>=0?"+":"")+Math.round(x);
+  // 基本(收摺時也顯示)：開高低收漲跌量
   let h=it("日期",b.d)+it("開",b.o.toFixed(2),b.o>=prev?UP:DOWN)+it("高",b.h.toFixed(2),UP)+it("低",b.l.toFixed(2),DOWN)
        +it("收",b.c.toFixed(2),cc)+it("漲跌",(chg>=0?"+":"")+chg.toFixed(2)+"%",cc)+it("量",Math.round(b.v).toLocaleString()+" 張");
-  // 主圖：5MA/10MA/20MA/60MA/240MA + 布林上中下（顯示點選當天的值）
-  PRICE_MAS.forEach(m=>{ const v=CH.ind.ma[m][i]; if(v!=null) h+=it("MA"+m, v.toFixed(2), MACOLOR[m]); });
+  // 進階(可收摺 .ext)：均線/布林/副圖/下圖數據
+  PRICE_MAS.forEach(m=>{ const v=CH.ind.ma[m][i]; if(v!=null) h+=it("MA"+m, v.toFixed(2), MACOLOR[m], 1); });
   const bu=CH.ind.boll.u[i], bm=CH.ind.boll.m[i], bl=CH.ind.boll.l[i];
-  if(bu!=null) h+=it("布林上", bu.toFixed(2), BOLL);
-  if(bm!=null) h+=it("布林中", bm.toFixed(2), BOLL);
-  if(bl!=null) h+=it("布林下", bl.toFixed(2), BOLL);
-  // 副圖：量 或 投信買賣超(當日)＋庫存(累計)
+  if(bu!=null) h+=it("布林上", bu.toFixed(2), BOLL, 1);
+  if(bm!=null) h+=it("布林中", bm.toFixed(2), BOLL, 1);
+  if(bl!=null) h+=it("布林下", bl.toFixed(2), BOLL, 1);
   if(CH.volMode==="inst"){
     const tn=CH.tnet[i], tc=CH.tcum[i];
-    if(tn!=null) h+=it("投信", sgn(tn)+" 張", tn>=0?UP:DOWN);
-    if(tc!=null) h+=it("投信庫存", Math.round(tc)+" 張", "#f5c518");
+    if(tn!=null) h+=it("投信", sgn(tn)+" 張", tn>=0?UP:DOWN, 1);
+    if(tc!=null) h+=it("投信庫存", Math.round(tc)+" 張", "#f5c518", 1);
   }
-  // 下圖：MACD(DIF/DEA/OSC) 或 主力買賣超(當日)＋累計
   if(CH.macdMode==="mforce"){
     const mn=CH.mnet[i], mc=CH.mcum[i];
-    if(mn!=null) h+=it("主力", sgn(mn)+" 張", mn>=0?UP:DOWN);
-    if(mc!=null) h+=it("主力累計", sgn(mc)+" 張", mc>=0?UP:DOWN);
+    if(mn!=null) h+=it("主力", sgn(mn)+" 張", mn>=0?UP:DOWN, 1);
+    if(mc!=null) h+=it("主力累計", sgn(mc)+" 張", mc>=0?UP:DOWN, 1);
   } else if(CH.ind.macd){
     const dif=CH.ind.macd.dif[i], dea=CH.ind.macd.dea[i], osc=CH.ind.macd.osc[i];
-    if(dif!=null) h+=it("DIF", dif.toFixed(2), "#e8c34a");
-    if(dea!=null) h+=it("DEA", dea.toFixed(2), "#4d9fff");
-    if(osc!=null) h+=it("OSC", osc.toFixed(2), osc>=0?UP:DOWN);
+    if(dif!=null) h+=it("DIF", dif.toFixed(2), "#e8c34a", 1);
+    if(dea!=null) h+=it("DEA", dea.toFixed(2), "#4d9fff", 1);
+    if(osc!=null) h+=it("OSC", osc.toFixed(2), osc>=0?UP:DOWN, 1);
   }
   document.getElementById("readout").innerHTML=h;
+}
+function toggleReadout(){
+  const ro=document.getElementById("readout"), btn=document.getElementById("roToggle");
+  const full=ro.classList.toggle("full");
+  if(btn) btn.textContent=full?"▴ 收起指標數據":"▾ 展開指標數據(MA/布林/MACD…)";
 }
 const canvas=document.getElementById("chartCanvas");
 function cx(clientX){ const r=canvas.getBoundingClientRect(); return clientX-r.left; }

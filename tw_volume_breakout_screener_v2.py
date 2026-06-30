@@ -954,7 +954,7 @@ def main():
         import tw_industry
         nind = tw_industry.fetch_finmind_industry(con, CONFIG["FINMIND_TOKEN"])
         if nind:
-            print(f"產業大分類：FinMind 補底寫入 {nind} 檔。")
+            print(f"FinMind TaiwanStockInfo：產業分類＋股名/市場 補齊 {nind} 檔。")
     except Exception as e:
         print(f"產業分類補底失敗（不影響主流程，curated 表仍可用）：{e}")
 
