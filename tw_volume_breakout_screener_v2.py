@@ -196,19 +196,13 @@ def get_today_snapshot(sess, retries=3):
     raise last
 
 
-def fetch_finmind_prices_all(token, start_date, end_date=None):
-    """個股日線『以 FinMind 為主』：用 TaiwanStockPrice 抓全市場(start_date 起)。
-    Sponsor 方案可不帶 data_id 直接取全部個股。回傳與官方快照同欄位的 normalized df；
-    失敗或空回 None（呼叫端會自動沿用官方 OpenAPI 快照）。"""
-    if not token:
-        return None
-    params = {"start_date": start_date}
-    if end_date:
-        params["end_date"] = end_date
+def _finmind_oneday(token, d):
+    """FinMind TaiwanStockPrice 單日(start=end=d)取全市場，回傳 normalized df 或 None。
+    單日查詢比『不帶 data_id 抓區間』可靠（後者常被截斷成舊資料）。"""
     try:
-        df = finmind_get("TaiwanStockPrice", token, **params)
+        df = finmind_get("TaiwanStockPrice", token, start_date=d, end_date=d)
     except Exception as e:
-        print(f"  FinMind 全市場日線失敗：{e}")
+        print(f"    FinMind {d} 失敗：{e}")
         return None
     if df is None or df.empty:
         return None
@@ -224,6 +218,29 @@ def fetch_finmind_prices_all(token, start_date, end_date=None):
     df = df.dropna(subset=["date", "close"])
     df = df[df["close"] > 0]
     return df[need] if not df.empty else None
+
+
+def fetch_finmind_prices_recent(token, want_days=4, scan=12):
+    """個股日線『以 FinMind 為主』：逐交易日抓最近 want_days 個交易日的全市場日線。
+    從今天往回掃最多 scan 個日曆日(跳週末/休市)，蒐集到足夠交易日即停。
+    回傳合併後的 normalized df；全失敗回 None（呼叫端沿用官方 OpenAPI 快照）。"""
+    if not token:
+        return None
+    frames = []
+    got = 0
+    d = dt.date.today()
+    for _ in range(scan):
+        if got >= want_days:
+            break
+        if d.weekday() < 5:                       # 跳週末（國定假日靠『回空就跳過』處理）
+            one = _finmind_oneday(token, d.isoformat())
+            if one is not None and not one.empty:
+                frames.append(one)
+                got += 1
+        d -= dt.timedelta(days=1)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
 
 
 # ============================================================
@@ -875,15 +892,15 @@ def main():
         except Exception as e:
             print(f"抓當日資料失敗：{e}\n→ 改用資料庫既有最新資料選股（不影響整體流程）。")
 
-    # 1b) 個股日線『以 FinMind 為主』：抓最近約兩週全市場日線覆蓋官方快照（較可靠、避免日期卡住）。
+    # 1b) 個股日線『以 FinMind 為主』：逐交易日抓最近數日全市場日線覆蓋官方快照（較可靠）。
     #     成功則 FinMind 為準；失敗/無資料則沿用上面的官方 OpenAPI 快照。名稱仍由官方快照/DB 提供。
     if not args.skip_update and CONFIG["FINMIND_TOKEN"]:
-        sd = (dt.date.today() - dt.timedelta(days=14)).isoformat()
-        fm = fetch_finmind_prices_all(CONFIG["FINMIND_TOKEN"], sd)
+        fm = fetch_finmind_prices_recent(CONFIG["FINMIND_TOKEN"])
         if fm is not None and not fm.empty:
             upsert_price(con, fm)
             snap_ids |= set(fm["stock_id"].astype(str))
-            print(f"FinMind 全市場日線：更新/覆蓋 {len(fm)} 列（最新日 {fm['date'].max()}）")
+            ndays = fm["date"].nunique()
+            print(f"FinMind 全市場日線：更新/覆蓋 {len(fm)} 列、{ndays} 個交易日（最新日 {fm['date'].max()}）")
         else:
             print("FinMind 全市場日線：無資料，沿用官方 OpenAPI 快照。")
 
