@@ -631,22 +631,22 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0a0f1a">
+<meta name="theme-color" content="#000000">
 <title>處置股專區 ・ 台股看板</title>
 <link rel="manifest" href="manifest.json">
 <style>
   :root{
-    --bg:#0a0f1a; --card:#111827; --card2:#161f33; --border:#1f2a3d;
-    --text:#e6edf6; --muted:#93a3b8; --dim:#5e6f86;
-    --amber:#f5a524; --amber-s:rgba(245,165,36,.14);
-    --up:#ff4d4f; --down:#22c55e;
-    --blue:#4d9fff; --blue-s:rgba(77,159,255,.12);
+    --bg:#000000; --card:#121214; --card2:#1b1b1f; --border:#2a2a2f;
+    --text:#f0f1f3; --muted:#9a9aa2; --dim:#67676e;
+    --amber:#ffcf3a; --amber-s:rgba(255,207,58,.15);
+    --up:#fb3b41; --down:#1ec77a;
+    --blue:#5aa9ff; --blue-s:rgba(90,169,255,.12);
     --purple:#b794ff; --purple-s:rgba(183,148,255,.12);
-    --red-s:rgba(255,77,79,.13); --grn-s:rgba(34,197,94,.13);
+    --red-s:rgba(251,59,65,.14); --grn-s:rgba(30,199,122,.13);
   }
   *{box-sizing:border-box;}
   body{margin:0; background:var(--bg); color:var(--text);
-    font-family:'Inter','Noto Sans TC','PingFang TC','Microsoft JhengHei',system-ui,sans-serif;
+    font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC","Microsoft JhengHei","Segoe UI",Roboto,sans-serif;
     -webkit-font-smoothing:antialiased; padding:16px 12px 40px; padding-top:calc(16px + env(safe-area-inset-top));}
   .num{font-variant-numeric:tabular-nums;}
   .wrap{max-width:1180px; margin:0 auto;}
@@ -655,12 +655,12 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .sub{font-size:12px; color:var(--muted); margin-top:5px; line-height:1.5;}
   .hidden{display:none !important;}
 
-  .cztabs{display:flex; gap:6px; margin:14px 0; background:var(--card); padding:5px; border-radius:11px;
-    border:1px solid var(--border); overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none;}
+  .cztabs{display:flex; gap:8px; margin:12px 0; background:transparent; padding:2px 0; border-bottom:1px solid var(--border);
+    overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none;}
   .cztabs::-webkit-scrollbar{display:none;}
-  .czt{flex:0 0 auto; background:transparent; color:var(--muted); border:none; border-radius:8px;
-    padding:9px 13px; font-size:13.5px; font-weight:700; cursor:pointer; white-space:nowrap;}
-  .czt.on{background:var(--amber-s); color:var(--amber);}
+  .czt{flex:0 0 auto; background:transparent; color:var(--muted); border:none; border-radius:99px;
+    padding:8px 14px; font-size:13.5px; font-weight:700; cursor:pointer; white-space:nowrap;}
+  .czt.on{background:var(--amber); color:#000;}
 
   .pane{animation:fade .2s ease;}
   @keyframes fade{from{opacity:0; transform:translateY(4px);}to{opacity:1; transform:none;}}
@@ -675,7 +675,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .sech{font-size:13px; font-weight:700; color:var(--muted); margin:18px 2px 9px; display:flex; align-items:center; gap:7px;}
   .sech .pill{font-size:11px; font-weight:600; color:var(--dim); background:var(--card2); border:1px solid var(--border); padding:2px 8px; border-radius:99px;}
 
-  .card{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:12px 14px; margin-bottom:9px;}
+  .card{background:var(--card); border:1px solid var(--border); border-radius:9px; padding:12px 14px; margin-bottom:9px;}
   .card .top{display:flex; align-items:flex-start; gap:9px;}
   .card .lhs{flex:1; min-width:0; cursor:pointer;}
   .card .sid{font-size:16px; font-weight:800; color:var(--text); font-variant-numeric:tabular-nums;}
@@ -730,12 +730,12 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 
   .up{color:var(--up);} .down{color:var(--down);} .flat{color:var(--muted);} .amb{color:var(--amber);}
   .dot{display:inline-block; width:9px; height:9px; border-radius:99px; margin-right:2px; vertical-align:middle;}
-  .dot.red{background:var(--up); box-shadow:0 0 7px rgba(255,77,79,.7);}
-  .dot.amber{background:var(--amber); box-shadow:0 0 7px rgba(245,165,36,.7);}
+  .dot.red{background:var(--up);}
+  .dot.amber{background:var(--amber);}
   .dot.green{background:var(--down);}
 
-  .prog{height:6px; background:#0e1626; border-radius:5px; overflow:hidden; flex:1;}
-  .progf{height:100%; background:linear-gradient(90deg,#4d9fff,#27c4dc); border-radius:5px;}
+  .prog{height:6px; background:#000; border:1px solid var(--border); border-radius:5px; overflow:hidden; flex:1;}
+  .progf{height:100%; background:var(--amber); border-radius:5px;}
   .progline{display:flex; align-items:center; gap:9px; margin-top:10px;}
   .progline .pt{font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap;}
 
@@ -758,7 +758,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .expbody .g{display:grid; grid-template-columns:auto 1fr; gap:5px 11px; margin-top:6px;}
   .expbody .k{color:var(--amber); font-weight:700; white-space:nowrap;}
 
-  .doc{background:var(--card); border:1px solid var(--border); border-radius:13px; padding:17px 18px; line-height:1.72; font-size:14px;}
+  .doc{background:var(--card); border:1px solid var(--border); border-radius:9px; padding:17px 18px; line-height:1.72; font-size:14px;}
   .doc h3{font-size:15.5px; margin:20px 0 9px; color:var(--amber);}
   .doc h3:first-child{margin-top:2px;}
   .doc p{margin:8px 0; color:var(--text);}
