@@ -54,12 +54,17 @@ jobs:
           path: twstock.db
           key: twstockdb-${{ github.run_id }}
       - uses: actions/configure-pages@v6
+      # artifact 名帶 run_attempt：同一 run 手動 Re-run 時不會出現兩份同名
+      # github-pages artifact（deploy-pages 遇到重名會直接失敗）
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
+          name: github-pages-${{ github.run_attempt }}
       # Pages 後端偶發「Deployment failed, try again later.」，失敗時退避重試最多 3 次
       - id: deploy
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
         continue-on-error: true
       - name: 部署失敗，等 90 秒重試
         if: steps.deploy.outcome == 'failure'
@@ -67,6 +72,8 @@ jobs:
       - id: deploy2
         if: steps.deploy.outcome == 'failure'
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
         continue-on-error: true
       - name: 仍失敗，等 5 分鐘做最後一次重試
         if: steps.deploy.outcome == 'failure' && steps.deploy2.outcome == 'failure'
@@ -74,3 +81,5 @@ jobs:
       - id: deploy3
         if: steps.deploy.outcome == 'failure' && steps.deploy2.outcome == 'failure'
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
