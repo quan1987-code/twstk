@@ -783,7 +783,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>🚦 處置股專區</h1>
-    <div class="sub">資料日 <span id="today" class="num">—</span> ・ 更新 <span id="gentime" class="num">—</span>（台北）　<a href="index.html">← 回主看板</a></div>
+    <div class="sub">資料日 <span id="today" class="num">—</span> ・ 更新 <span id="gentime" class="num">—</span>（台北）　<a href="index.html">← 回主看板</a>　<a href="market.html">市場分析</a></div>
   </header>
 
   <div class="cztabs" id="cztabs">

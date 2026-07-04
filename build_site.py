@@ -664,7 +664,11 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="tab" data-tab="flow">資金流向</button>
   </div>
 
-  <a class="czentry" href="chuzhi.html">
+  <a class="czentry" href="market.html" style="border-left-color:var(--blue)">
+    <span>📊 市場分析<span class="czt2">台美股每日盤勢・資金流向・族群雷達・每日監控清單</span></span>
+    <span class="arr" style="color:var(--blue)">→</span>
+  </a>
+  <a class="czentry" href="chuzhi.html" style="margin-top:-6px">
     <span>🚦 處置股專區<span class="czt2">即將／確定／處置中／出關 監控 ＋ 實戰SOP</span></span>
     <span class="arr">→</span>
   </a>
