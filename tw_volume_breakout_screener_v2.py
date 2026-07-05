@@ -481,12 +481,13 @@ INST_LOOKBACK = 250      # 每日 T86 前向更新的交易日數（近端；更
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
 
-# 個股K線副圖「深度歷史」目標起始日：主力(三大法人合計)/外資/投信買賣超與 400張大戶持股%
-# 都回補到這一天。深度回補走 FinMind（全市場、單次抓一日/一週），以「快取 DB＋每次 run 上限」
-# 分批補齊，不影響每日主流程；上限可用環境變數調高做一次性長跑（見 daily.yml 的 deep_backfill）。
-HISTORY_START = os.environ.get("HISTORY_START", "2019-01-01") or "2019-01-01"
+# 個股K線副圖「深度歷史」目標起始日。以「快取 DB＋每次 run 上限」分批補齊，不影響每日主流程；
+# 上限可用環境變數調高做一次性長跑（見 daily.yml 的 deep_backfill）。
+# 主力(三大法人)＝逐檔抓(data_id)避免全市場單次列數上限截斷漏股，涵蓋上市＋上櫃；400大戶＝全市場週抓。
+HISTORY_START = os.environ.get("HISTORY_START", "2019-01-01") or "2019-01-01"           # 400張大戶回補起點
+INST_HISTORY_START = os.environ.get("INST_HISTORY_START", "2020-01-01") or "2020-01-01"  # 主力(三大法人)回補起點
 INST_HIST_DATASET = "TaiwanStockInstitutionalInvestorsBuySell"  # 三大法人個股表（含 2005 以來）
-INST_BACKFILL_PER_RUN = int(os.environ.get("INST_BACKFILL_PER_RUN", "150") or "150")  # 每次 run 回補天數上限
+INST_BACKFILL_PER_RUN = int(os.environ.get("INST_BACKFILL_PER_RUN", "150") or "150")  # 每次 run 逐檔回補的『個股數』上限
 SHAREHOLD_MAX_PER_RUN = int(os.environ.get("SHAREHOLD_MAX_PER_RUN", "12") or "12")     # 每次 run 回補週數上限
 
 
@@ -611,10 +612,11 @@ def _inst_cat(name):
 
 
 def backfill_inst_history(con, token):
-    """把『三大法人(外資/投信/自營/合計)買賣超』深度回補到 HISTORY_START。
-    每日近端由 update_inst 走 T86（上市全市場）；更早的歷史改用 FinMind 個股三大法人表
-    （單次抓一天全市場、資料含 2005 以來）。只補上市、以『最舊缺口優先』分批補齊，
-    每次 run 上限 INST_BACKFILL_PER_RUN，其餘留待後續 run（DB 有快取，不重抓）。"""
+    """把『三大法人(外資/投信/自營/合計)買賣超』逐檔回補到 INST_HISTORY_START，涵蓋上市＋上櫃。
+    ★改為『逐檔』抓取(data_id=sid)：先前用全市場單日抓取會被 FinMind 單次回傳列數上限截斷，
+    導致很多個股（尤其非權值、及全部上櫃）只剩近端 T86 的資料、歷史整段缺。逐檔抓可保證每檔完整。
+    用 inst_done 表記錄已處理個股避免重抓；只挑『歷史不足或從未抓過』者，每次 run 上限
+    INST_BACKFILL_PER_RUN 檔（deep_backfill 時調高一次補完）。近端上市仍由 update_inst(T86) 每日更新。"""
     if not token:
         print("主力歷史回補：無 FinMind token，略過。")
         return
@@ -625,63 +627,61 @@ def backfill_inst_history(con, token):
             con.execute(f"ALTER TABLE inst ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass
+    con.execute("CREATE TABLE IF NOT EXISTS inst_done(stock_id TEXT PRIMARY KEY, done_date TEXT)")
     con.commit()
-    sii = set(r[0] for r in con.execute("SELECT stock_id FROM stock WHERE market='上市'"))
-    if not sii:
-        print("主力歷史回補：stock 表尚無上市清單，略過。")
+    latest = con.execute("SELECT MAX(date) FROM price").fetchone()[0]
+    if not latest:
         return
-    target = [r[0] for r in con.execute(
-        "SELECT DISTINCT date FROM price WHERE date >= ? ORDER BY date", (HISTORY_START,))]
-    have = set(r[0] for r in con.execute(
-        "SELECT DISTINCT date FROM inst WHERE total_lots IS NOT NULL"))
-    todo = [d for d in target if d not in have]
+    # 已足夠(min(total_lots 日期) 早於 cutoff)或已處理過(inst_done)的個股跳過，避免重抓。
+    cutoff = (dt.date.fromisoformat(INST_HISTORY_START) + dt.timedelta(days=45)).isoformat()
+    mind = {r[0]: r[1] for r in con.execute(
+        "SELECT stock_id, MIN(date) FROM inst WHERE total_lots IS NOT NULL GROUP BY stock_id")}
+    done = set(r[0] for r in con.execute("SELECT stock_id FROM inst_done"))
+    universe = sorted(r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price"))
+    todo = [s for s in universe
+            if is_common_stock(s) and s not in done and (s not in mind or mind[s] > cutoff)]
     if not todo:
-        print(f"主力歷史回補：已補齊至 {HISTORY_START}。")
+        print(f"主力歷史逐檔回補：所有個股已補齊至 {INST_HISTORY_START}。")
         return
     todo_total = len(todo)
-    todo = todo[:INST_BACKFILL_PER_RUN]   # 最舊缺口優先，逐次往新補；近端由 T86 每日補
-    if todo_total > len(todo):
-        print(f"主力歷史（三大法人）回補：待補 {todo_total} 個交易日，"
-              f"本次先抓最舊 {len(todo)} 日（其餘後續 run 逐步補齊）…")
-    else:
-        print(f"主力歷史（三大法人）回補：需抓 {len(todo)} 個交易日…")
+    todo = todo[:INST_BACKFILL_PER_RUN]
+    print(f"主力歷史逐檔回補(上市+上櫃)：待補 {todo_total} 檔，本次 {len(todo)} 檔"
+          f"（目標 {INST_HISTORY_START}；其餘後續 run 逐步補齊）…")
     n = 0
-    for d in todo:
+    for sid in todo:
         try:
             df = finmind_get(INST_HIST_DATASET, token, max_retry=2,
-                             start_date=d, end_date=d)
+                             data_id=sid, start_date=INST_HISTORY_START, end_date=latest)
         except Exception as e:
-            print(f"  三大法人 {d} 失敗：{e}")
-            continue
-        if (df is None or df.empty or "stock_id" not in df.columns
-                or "buy" not in df.columns or "sell" not in df.columns or "name" not in df.columns):
-            continue
-        df = df.copy()
-        df["_sid"] = df["stock_id"].astype(str)
-        df["_net"] = (pd.to_numeric(df["buy"], errors="coerce").fillna(0)
-                      - pd.to_numeric(df["sell"], errors="coerce").fillna(0))
-        df["_cat"] = df["name"].map(_inst_cat)
+            print(f"  三大法人 {sid} 失敗：{e}")
+            continue   # 未標記 done → 下次 run 再試
         rows = []
-        for sid, g in df.groupby("_sid"):
-            if sid not in sii or not is_common_stock(sid):
-                continue
-            fnet = float(g.loc[g["_cat"] == "foreign", "_net"].sum())
-            tnet = float(g.loc[g["_cat"] == "trust", "_net"].sum())
-            dnet = float(g.loc[g["_cat"] == "dealer", "_net"].sum())
-            if fnet == 0 and tnet == 0 and dnet == 0:
-                continue   # 全零（多為當日無法人進出）：留白，網頁端前向填 0，省空間
-            tot = fnet + tnet + dnet
-            rows.append((sid, d, round(fnet / 1000.0, 1), round(tnet / 1000.0, 1),
-                         round(dnet / 1000.0, 1), round(tot / 1000.0, 1)))
+        if (df is not None and not df.empty and "date" in df.columns and "name" in df.columns
+                and "buy" in df.columns and "sell" in df.columns):
+            df = df.copy()
+            df["_net"] = (pd.to_numeric(df["buy"], errors="coerce").fillna(0)
+                          - pd.to_numeric(df["sell"], errors="coerce").fillna(0))
+            df["_cat"] = df["name"].map(_inst_cat)
+            for d, g in df.groupby("date"):
+                fnet = float(g.loc[g["_cat"] == "foreign", "_net"].sum())
+                tnet = float(g.loc[g["_cat"] == "trust", "_net"].sum())
+                dnet = float(g.loc[g["_cat"] == "dealer", "_net"].sum())
+                if fnet == 0 and tnet == 0 and dnet == 0:
+                    continue   # 全零：留白，網頁端前向填 0，省空間
+                tot = fnet + tnet + dnet
+                rows.append((sid, str(d), round(fnet / 1000.0, 1), round(tnet / 1000.0, 1),
+                             round(dnet / 1000.0, 1), round(tot / 1000.0, 1)))
         if rows:
             con.executemany(
                 "INSERT OR REPLACE INTO inst"
                 "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
                 " VALUES (?,?,?,?,?,?)", rows)
-            con.commit()
-            n += 1
+        # 不論抓到與否都標記 done（即使該股 FinMind 無資料，也不必每次重試）
+        con.execute("INSERT OR REPLACE INTO inst_done(stock_id,done_date) VALUES (?,?)", (sid, latest))
+        con.commit()
+        n += 1
         time.sleep(0.6)
-    print(f"主力歷史回補完成：本次新增/補齊 {n} 個交易日（目標 {HISTORY_START}）。")
+    print(f"主力歷史逐檔回補完成：本次 {n} 檔（其餘後續 run 逐步補齊，目標 {INST_HISTORY_START}）。")
 
 
 def _is_big400_level(level):

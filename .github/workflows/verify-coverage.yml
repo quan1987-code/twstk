@@ -1,0 +1,60 @@
+name: verify-coverage
+
+# 診斷用（暫時）：還原快取 DB，印出主力(inst)逐檔涵蓋範圍，確認上市+上櫃都回補到 2020。
+# 驗證完會移除。不抓網路、不部署。
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Restore price DB
+        uses: actions/cache/restore@v6
+        with:
+          path: twstock.db
+          key: twstockdb-coverage
+          restore-keys: twstockdb-
+      - name: Report inst coverage
+        run: |
+          python - <<'PY'
+          import sqlite3, os
+          if not os.path.exists("twstock.db"):
+              print("NO DB restored"); raise SystemExit(0)
+          c = sqlite3.connect("twstock.db")
+          def one(sql, *a):
+              try: return c.execute(sql, a).fetchone()
+              except Exception as e: return ("ERR", str(e))
+          CUT = "2020-02-15"   # min(total_lots) 早於此視為『已回補到 2020』
+          print("inst total_lots:", one("SELECT COUNT(*),MIN(date),MAX(date) FROM inst WHERE total_lots IS NOT NULL"))
+          try:
+              print("inst_done 檔數:", c.execute("SELECT COUNT(*) FROM inst_done").fetchone()[0])
+          except Exception as e:
+              print("inst_done: (無此表)", e)
+          # 每檔 min(total_lots)；分『已到2020』vs『只有近端』
+          mind = list(c.execute("SELECT stock_id, MIN(date) FROM inst WHERE total_lots IS NOT NULL GROUP BY stock_id"))
+          to2020 = sum(1 for _, d in mind if d and d <= CUT)
+          recent = sum(1 for _, d in mind if d and d > CUT)
+          print(f"有主力資料的股數: {len(mind)}  其中 回補到2020: {to2020}  只有近端(>{CUT}): {recent}")
+          # 市場別：上市/上櫃 各有主力資料的股數
+          try:
+              mk = dict(c.execute("SELECT stock_id, market FROM stock"))
+              sii = sum(1 for s, _ in mind if mk.get(s) == "上市")
+              otc = sum(1 for s, _ in mind if mk.get(s) == "上櫃")
+              print(f"有主力資料：上市 {sii} 檔 / 上櫃 {otc} 檔")
+              # 抽樣幾檔上櫃看範圍
+              otcs = [s for s, m in mk.items() if m == "上櫃"][:6]
+              for s in otcs:
+                  print(f"   上櫃 {s}:", one("SELECT COUNT(*),MIN(date),MAX(date) FROM inst WHERE total_lots IS NOT NULL AND stock_id=?", s))
+          except Exception as e:
+              print("market 分析 ERR:", e)
+          # 抽樣中小型上市
+          for s in ("3661", "6805", "8069", "4966"):
+              print(f"   上市 {s}:", one("SELECT COUNT(*),MIN(date),MAX(date) FROM inst WHERE total_lots IS NOT NULL AND stock_id=?", s))
+          print("stockmeta 檔數:", one("SELECT COUNT(*) FROM stockmeta"))
+          PY
