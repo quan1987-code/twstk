@@ -21,17 +21,18 @@ r"""
   7) 風險儀表：VIX、利率變動、台股廣度、融資動向、外資期貨部位、美股廣度 → 綜合燈號。
 
 資料來源：
-  台股：twstock.db（price/inst/stock/industry，由 FinMind Sponsor 方案每日更新）、
+  台股：twstock.db（price/inst/stock/industry，由 FinMind Sponsor 方案每日更新，與其他分頁同源）、
         output/extras_*.json（官方三大法人 BFI82U、融資融券 MI_MARGN、期交所外資未平倉）。
-  美股/總經：yfinance（GitHub Actions 內可連 Yahoo）。
+  美股/總經/全球：Stooq 免金鑰 CSV 為主來源（對雲端 IP 穩定，不易被限流），
+        yfinance 作缺漏備援；加權指數亦走此雙來源（Stooq ^twse / yfinance ^TWII）。
 
 只『讀』DB、只『寫』site/market.html；任何一段資料失敗都以「暫無資料」呈現，
 不會讓整個 pipeline 掛掉。
 
 用法：
-  python tw_market_analysis.py            # 正常（需 twstock.db；美股需可連網）
+  python tw_market_analysis.py            # 正常（需 twstock.db；美股/總經連 Stooq）
   python tw_market_analysis.py --demo     # 離線示範（合成假資料，驗證輸出/前端）
-  python tw_market_analysis.py --no-us    # 跳過 yfinance（只出台股區塊）
+  python tw_market_analysis.py --no-us    # 跳過美股抓取（只出台股區塊）
 """
 import os
 import sys
@@ -78,7 +79,8 @@ def _r(x, n=2):
         return None
     if math.isnan(f) or math.isinf(f):
         return None
-    return round(f, n)
+    r = round(f, n)
+    return 0.0 if r == 0 else r     # 消除 -0.0
 
 
 def _pct(now, base, n=2):
@@ -104,13 +106,16 @@ def _ret(closes, n):
 
 
 def _pos(closes, highs=None, lows=None, window=120):
-    """位階：最近收盤在近 window 日高低區間的位置 0~100。"""
-    cs = closes[-window:]
+    """位階：最近收盤在近 window 日高低區間的位置 0~100。
+    真實資料含停牌/新上市/處置的 None 缺口，min/max 前務必先濾 None。"""
+    cs = [x for x in closes[-window:] if x is not None]
     if len(cs) < 20:
         return None
-    hi = max(highs[-window:]) if highs else max(cs)
-    lo = min(lows[-window:]) if lows else min(cs)
-    if hi is None or lo is None or hi <= lo:
+    hs = [x for x in (highs[-window:] if highs else []) if x is not None]
+    ls = [x for x in (lows[-window:] if lows else []) if x is not None]
+    hi = max(hs) if hs else max(cs)
+    lo = min(ls) if ls else min(cs)
+    if hi <= lo:
         return None
     return _r((cs[-1] - lo) / (hi - lo) * 100.0, 0)
 
@@ -431,7 +436,7 @@ def load_extras():
 
 
 # ============================================================
-#  美股 / 總經：yfinance
+#  美股 / 總經：Stooq 優先（免金鑰、雲端 IP 穩定）＋ yfinance 備援
 # ============================================================
 US_INDICES = [("^GSPC", "S&P 500"), ("^IXIC", "那斯達克"), ("^DJI", "道瓊工業"),
               ("^SOX", "費城半導體"), ("^RUT", "羅素2000")]
@@ -451,6 +456,29 @@ US_RATIO_SYMS = ["SPY", "IWM", "RSP", "HYG", "IEF", "XLY", "XLP", "SMH"]
 US_EXTRA = ["TSM", "2330.TW", "^TWII", "^TWOII"]
 
 
+# Yahoo 代號 → Stooq 代號。個股/ETF 統一加 .us；指數 ^、期貨 .f、殖利率 10usy.b。
+# 不在此表者（如 ^TWOII 櫃買）Stooq 無穩定對應，交給 yfinance 備援。
+STOOQ_MAP = {
+    "^GSPC": "^spx", "^IXIC": "^ndq", "^DJI": "^dji", "^SOX": "^sox", "^RUT": "^rut",
+    "^N225": "^nkx", "^KS11": "^kospi", "^TWII": "^twse",
+    "^VIX": "^vix", "^TNX": "10usy.b", "DX-Y.NYB": "^dxy",
+    "TWD=X": "usdtwd", "CL=F": "cl.f", "GC=F": "gc.f", "BTC-USD": "btcusd",
+    "TSM": "tsm.us", "2330.TW": "2330.tw",
+    "SPY": "spy.us", "IWM": "iwm.us", "RSP": "rsp.us", "HYG": "hyg.us", "IEF": "ief.us",
+    "XLK": "xlk.us", "XLC": "xlc.us", "XLY": "xly.us", "XLP": "xlp.us", "XLV": "xlv.us",
+    "XLF": "xlf.us", "XLI": "xli.us", "XLE": "xle.us", "XLB": "xlb.us", "XLRE": "xlre.us",
+    "XLU": "xlu.us", "SMH": "smh.us", "IGV": "igv.us", "XBI": "xbi.us", "KRE": "kre.us",
+    "ITA": "ita.us", "TAN": "tan.us", "URA": "ura.us", "XME": "xme.us", "GDX": "gdx.us",
+    "OIH": "oih.us", "XHB": "xhb.us", "IYT": "iyt.us", "JETS": "jets.us", "ARKK": "arkk.us",
+    "KWEB": "kweb.us", "FXI": "fxi.us", "EEM": "eem.us",
+    "NVDA": "nvda.us", "MSFT": "msft.us", "AAPL": "aapl.us", "GOOGL": "googl.us",
+    "AMZN": "amzn.us", "META": "meta.us", "AVGO": "avgo.us", "TSLA": "tsla.us",
+    "AMD": "amd.us", "MU": "mu.us",
+}
+# Stooq 的 10 年債殖利率(10usy.b)本身即為百分比；yfinance 的 ^TNX 為殖利率×10。
+# 為讓下游一致，抓進來後一律正規化成「百分比」。
+
+
 def all_us_symbols():
     syms = []
     for lst in (US_INDICES, ASIA_INDICES, US_SECTORS, US_THEMES, US_MACRO):
@@ -459,18 +487,78 @@ def all_us_symbols():
     return sorted(set(syms))
 
 
-def fetch_us(symbols):
-    """yfinance 批次抓日線（10 個月），回傳 {sym: {'dates':[iso], 'closes':[...], 'highs', 'lows'}}。"""
+def _to_f(x):
+    try:
+        v = float(x)
+        return None if (v != v or v == 0.0 and x in ("", "N/D")) else v
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_stooq_csv(text):
+    """Stooq 日線 CSV → {dates,closes,highs,lows}；空/限流/錯誤回 None。
+    正常標頭：Date,Open,High,Low,Close,Volume。"""
+    text = (text or "").strip()
+    low = text.lower()
+    if (not text or low.startswith("<") or "no data" in low
+            or "exceeded" in low or not low.startswith("date")):
+        return None
+    dates, closes, highs, lows = [], [], [], []
+    for ln in text.splitlines()[1:]:
+        p = ln.split(",")
+        if len(p) < 5:
+            continue
+        c = _to_f(p[4])
+        if c is None:
+            continue
+        dates.append(p[0])
+        closes.append(c)
+        highs.append(_to_f(p[2]))
+        lows.append(_to_f(p[3]))
+    if len(closes) < 2:
+        return None
+    return {"dates": dates, "closes": closes, "highs": highs, "lows": lows}
+
+
+def _fetch_stooq(symbols, start_yyyymmdd, session=None):
+    """對每個 Yahoo 代號查 STOOQ_MAP，逐檔抓 Stooq 日線 CSV。回傳 {yahoo_sym: series}。"""
+    import requests
+    sess = session or requests.Session()
+    out, ok, miss = {}, 0, []
+    for ysym in symbols:
+        ssym = STOOQ_MAP.get(ysym)
+        if not ssym:
+            miss.append(ysym)
+            continue
+        url = f"https://stooq.com/q/d/l/?s={ssym}&i=d&d1={start_yyyymmdd}"
+        try:
+            r = sess.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+            s = _parse_stooq_csv(r.text)
+        except Exception as e:
+            print(f"  [stooq] {ysym}({ssym}) 失敗：{e}")
+            s = None
+        if s:
+            out[ysym] = s
+            ok += 1
+        else:
+            miss.append(ysym)
+    print(f"  [stooq] 成功 {ok} 檔；待備援 {len(miss)} 檔：{miss}")
+    return out
+
+
+def _fetch_yf(symbols):
+    """yfinance 備援：批次抓日線（10 個月）。回傳 {sym: series}。"""
     import yfinance as yf
+    import pandas as pd
     out = {}
     df = yf.download(symbols, period="10mo", interval="1d", group_by="ticker",
                      auto_adjust=True, threads=True, progress=False)
     if df is None or df.empty:
         return out
+    multi = isinstance(df.columns, pd.MultiIndex)
     for sym in symbols:
         try:
-            sub = df[sym] if isinstance(df.columns, __import__("pandas").MultiIndex) else df
-            sub = sub.dropna(subset=["Close"])
+            sub = (df[sym] if multi else df).dropna(subset=["Close"])
             if sub.empty:
                 continue
             out[sym] = {
@@ -481,6 +569,38 @@ def fetch_us(symbols):
             }
         except Exception:
             continue
+    return out
+
+
+def _normalize_tnx(data, from_stooq):
+    """把 ^TNX 統一成百分比：Stooq(10usy.b) 已是 %；yfinance(^TNX) 為 ×10 需除 10。"""
+    s = data.get("^TNX")
+    if not s or from_stooq:
+        return
+    for k in ("closes", "highs", "lows"):
+        s[k] = [None if v is None else v / 10.0 for v in s[k]]
+
+
+def fetch_us(symbols, start_yyyymmdd=None):
+    """美股/總經日線：Stooq 主，yfinance 補缺。回傳 {yahoo_sym: {dates,closes,highs,lows}}。"""
+    if start_yyyymmdd is None:
+        start_yyyymmdd = "20240101"
+    out = {}
+    tnx_from_stooq = False
+    try:
+        out = _fetch_stooq(symbols, start_yyyymmdd)
+        tnx_from_stooq = "^TNX" in out
+    except Exception as e:
+        print(f"Stooq 抓取失敗（改用 yfinance）：{e}")
+    missing = [s for s in symbols if s not in out]
+    if missing:
+        try:
+            yout = _fetch_yf(missing)
+            print(f"  [yfinance] 補回 {len(yout)} 檔")
+            out.update(yout)
+        except Exception as e:
+            print(f"yfinance 備援失敗：{e}")
+    _normalize_tnx(out, tnx_from_stooq)
     return out
 
 
@@ -521,14 +641,14 @@ def us_build(data):
         m = met(sym)
         if not m:
             continue
+        # ^TNX 於 fetch_us 已正規化為百分比，這裡直接用不再除 10
         val, unit, dec = m["close"], "", 2
         if sym == "^TNX":
-            val, unit, dec = _r(m["close"] / 10.0, 3), "%", 3   # ^TNX 為殖利率×10
+            val, unit, dec = _r(m["close"], 2), "%", 2
         m5 = None
-        if sym in data and len(data[sym]["closes"]) > 5:
-            base = data[sym]["closes"][-6]
-            m5 = _r((data[sym]["closes"][-1] - base) / (10.0 if sym == "^TNX" else 1.0),
-                    3 if sym == "^TNX" else 2)
+        cl = data[sym]["closes"]
+        if sym in data and len(cl) > 5 and cl[-1] is not None and cl[-6] is not None:
+            m5 = _r(cl[-1] - cl[-6], 2)
         macro.append({"sym": sym, "name": name, "val": val, "unit": unit,
                       "chg_pct": m["chg_pct"], "chg5_abs": m5, "spark": m["spark"]})
 
@@ -639,7 +759,7 @@ def tw_comment(tw, twii, extras, quad):
     # 指數結構
     idx_txt = ""
     trend_score = 0
-    if twii:
+    if twii and twii.get("close") is not None:
         c = twii["close"]
         m5, m20, m60 = twii.get("ma5"), twii.get("ma20"), twii.get("ma60")
         stat = []
@@ -961,6 +1081,7 @@ def demo_con():
     ]
     bottom_turn = {"面板", "觀光餐飲"}     # 走空後近 5 日轉強＋法人回補（驗證『底部起漲』象限）
     sid = 1101
+    gap_idx = 0
     for label, drift, n in demo_groups:
         for k in range(n):
             s = str(sid); sid += 7
@@ -971,7 +1092,15 @@ def demo_con():
             con.execute("INSERT INTO industry VALUES (?,?)", (s, label))
             phase = random.uniform(0, 6.28)
             nlast = len(dates) - 1
+            # 每 4 檔挑一檔製造「停牌缺口」：跳過部分交易日 → 真實資料常見的 None gap，
+            # 用來重現並驗證 _pos()/max()/min() 的 None-safe 修復。
+            gap_idx += 1
+            gap_days = set()
+            if gap_idx % 4 == 0:
+                gap_days = set(random.sample(range(10, nlast - 3), 12))
             for i, dd in enumerate(dates):
+                if i in gap_days:
+                    continue          # 該日無任何 price/inst 資料
                 if label in bottom_turn:
                     r = (random.gauss(2.5, 0.6) if i > nlast - 5
                          else random.gauss(-0.6, 0.8)) / 100.0
@@ -1010,7 +1139,7 @@ def demo_us():
     for sym in all_us_symbols():
         base = {"^GSPC": 6800, "^IXIC": 23500, "^DJI": 46500, "^SOX": 6200, "^RUT": 2400,
                 "^N225": 43000, "^KS11": 3200, "^TWII": 24500, "^TWOII": 260,
-                "^VIX": 16, "^TNX": 42.0, "DX-Y.NYB": 102, "TWD=X": 30.8,
+                "^VIX": 16, "^TNX": 4.2, "DX-Y.NYB": 102, "TWD=X": 30.8,
                 "CL=F": 72, "GC=F": 3400, "BTC-USD": 105000,
                 "TSM": 240, "2330.TW": 1200}.get(sym, random.uniform(30, 300))
         drift = random.uniform(-0.1, 0.15)
@@ -1038,56 +1167,72 @@ def demo_extras(date):
 # ============================================================
 #  Payload 組裝
 # ============================================================
+def _safe(fn, fallback, label):
+    """呼叫 fn()，任何例外都吞掉並回 fallback，讓單一區塊失敗不牽連整頁。"""
+    try:
+        return fn()
+    except Exception as e:
+        import traceback
+        print(f"[{label}] 失敗，該區塊以暫缺呈現：{e}")
+        traceback.print_exc()
+        return fallback
+
+
 def build_payload(demo=False, no_us=False):
     flags = {"demo": demo, "tw_ok": False, "us_ok": False}
 
-    # ---- 台股 ----
+    # ---- 台股（讀 FinMind 建置的 twstock.db，與其他分頁同源）----
     tw = None
     extras = {}
     if demo:
         con, _ = demo_con()
-        tw = tw_load(con)
-        extras = demo_extras(tw["date"])
+        tw = _safe(lambda: tw_load(con), None, "tw_load")
+        extras = demo_extras(tw["date"]) if tw else {}
         con.close()
     elif os.path.exists(DB_PATH):
         con = sqlite3.connect(DB_PATH)
         try:
-            tw = tw_load(con)
+            tw = _safe(lambda: tw_load(con), None, "tw_load")
         finally:
             con.close()
-        extras = load_extras()
+        extras = _safe(load_extras, {}, "load_extras")
     flags["tw_ok"] = tw is not None
 
-    # ---- 美股 / 全球 ----
+    # ---- 美股 / 全球（Stooq 主・yfinance 備援）----
     us_raw = {}
     if demo:
         us_raw = demo_us()
     elif not no_us:
-        try:
-            us_raw = fetch_us(all_us_symbols())
-        except Exception as e:
-            print(f"yfinance 抓取失敗：{e}")
-    us = us_build(us_raw) if us_raw else None
+        # 抓 10 個月日線；起始日以今天回推
+        start = (dt.datetime.now(TPE_TZ).date() - dt.timedelta(days=320)).strftime("%Y%m%d")
+        us_raw = _safe(lambda: fetch_us(all_us_symbols(), start), {}, "fetch_us")
+    us = _safe(lambda: us_build(us_raw), None, "us_build") if us_raw else None
     flags["us_ok"] = us is not None
 
-    # ---- 加權指數（yfinance ^TWII，補均線）----
+    # ---- 加權指數（Stooq ^twse / yfinance ^TWII，補均線）----
     twii = None
     if us_raw.get("^TWII"):
         s = us_raw["^TWII"]
-        twii = _series_metrics(s)
-        twii["ma5"] = _r(_ma(s["closes"], 5), 0)
-        twii["ma20"] = _r(_ma(s["closes"], 20), 0)
-        twii["ma60"] = _r(_ma(s["closes"], 60), 0)
-    twoii = _series_metrics(us_raw["^TWOII"]) if us_raw.get("^TWOII") else None
+        twii = _safe(lambda: _series_metrics(s), None, "twii")
+        if twii:
+            twii["ma5"] = _r(_ma(s["closes"], 5), 0)
+            twii["ma20"] = _r(_ma(s["closes"], 20), 0)
+            twii["ma60"] = _r(_ma(s["closes"], 60), 0)
+    twoii = _safe(lambda: _series_metrics(us_raw["^TWOII"]), None, "twoii") if us_raw.get("^TWOII") else None
 
-    # ---- 分析 ----
-    quad = tw_quadrants(tw["groups"]) if tw else {"lead": [], "lag": [], "bottom": [], "strong": []}
-    flow = tw_group_flow(tw["groups"]) if tw else {"in": [], "out": []}
-    tw_paras, tw_risks, tw_light = (tw_comment(tw, twii, extras, quad)
+    # ---- 分析（各自 _safe，互不牽連）----
+    quad = _safe(lambda: tw_quadrants(tw["groups"]), {"lead": [], "lag": [], "bottom": [], "strong": []},
+                 "tw_quadrants") if tw else {"lead": [], "lag": [], "bottom": [], "strong": []}
+    flow = _safe(lambda: tw_group_flow(tw["groups"]), {"in": [], "out": []}, "tw_group_flow") \
+        if tw else {"in": [], "out": []}
+    tw_paras, tw_risks, tw_light = (_safe(lambda: tw_comment(tw, twii, extras, quad),
+                                          (["台股研判暫缺。"], [], "neutral"), "tw_comment")
                                     if tw else (["台股資料暫缺（twstock.db 未就緒）。"], [], "neutral"))
-    us_paras, us_risks, us_light = us_comment(us)
-    gauges = build_gauges(tw, twii, us, extras)
-    checklist = build_checklist(tw, twii, us, extras, quad)
+    us_paras, us_risks, us_light = _safe(lambda: us_comment(us), (["美股資料暫缺。"], [], "neutral"), "us_comment")
+    gauges = _safe(lambda: build_gauges(tw, twii, us, extras),
+                   {"items": [], "overall": "yellow", "overall_zh": "風險資料暫缺"}, "build_gauges")
+    checklist = _safe(lambda: build_checklist(tw, twii, us, extras, quad),
+                      {"pre": [], "intraday": [], "post": []}, "build_checklist")
 
     # ---- 頭條一句話 ----
     zh_light = {"bull": "偏多", "bear": "偏空", "neutral": "中性"}
