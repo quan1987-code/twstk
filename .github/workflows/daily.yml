@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '30 9 * * 1-5'
   workflow_dispatch:
+    inputs:
+      deep_backfill:
+        description: '深度回補 主力/大戶 歷史至 2019（高上限、單次長跑；平時排程用低上限逐步補）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,6 +41,10 @@ jobs:
       - name: Run screener
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          # 平時排程：留空 → 程式用預設低上限(150日/12週)，每日 run 快、逐步補歷史。
+          # 手動 deep_backfill：拉高上限做一次性長跑，盡量一次補到 2019（timeout 350 分內）。
+          INST_BACKFILL_PER_RUN: ${{ inputs.deep_backfill && '4000' || '' }}
+          SHAREHOLD_MAX_PER_RUN: ${{ inputs.deep_backfill && '500' || '' }}
         run: python tw_volume_breakout_screener_v2.py
       - name: Build site
         run: python build_site.py

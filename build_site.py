@@ -151,7 +151,8 @@ def load_industry(db_path):
 
 
 def write_stock_data(db_path, out_dir, industry=None):
-    """為『每一檔』股票輸出精簡版逐檔資料檔 site/data/{代號}.json（含 2005 以來日線 + 近一年投信買賣超），
+    """為『每一檔』股票輸出精簡版逐檔資料檔 site/data/{代號}.json（含 2005 以來日線，
+    及三大法人/外資/主力買賣超與 400張大戶持股% 之深度歷史、發行張數），
     並輸出 site/data/_index.json（全清單，給首頁搜尋用）。圖表改成『點哪檔才抓哪檔』，HTML 不再內嵌歷史。"""
     if not os.path.exists(db_path):
         return 0
@@ -160,36 +161,22 @@ def write_stock_data(db_path, out_dir, industry=None):
     os.makedirs(ddir, exist_ok=True)
     con = sqlite3.connect(db_path)
     info = {r[0]: (r[1], r[2]) for r in con.execute("SELECT stock_id,name,market FROM stock")}
-    # 近一年投信買賣超(trust_lots) 與 三大法人合計買賣超(total_lots，作為「主力」免費替代指標)，
-    # 預載成 {sid: {date: 張}}。三大法人合計讓『每一檔』股票都有 K 線下方「主力買賣超」副圖，
-    # 不再僅限處置相關個股；處置專區之後仍可用分點資料覆寫成更精準的主力序列。
-    inst = {}; mforce = {}; foreign = {}
+    # 發行張數（表頭『發行 / 流通張數』用；流通 = 發行 ×(1−400張大戶%) 於網頁端計算）。
+    issued = {}
     try:
-        for sid, d, t, tot, fr in con.execute(
-                "SELECT stock_id,date,trust_lots,total_lots,foreign_lots FROM inst"):
-            if t is not None:
-                inst.setdefault(sid, {})[d] = t
-            if tot is not None:
-                mforce.setdefault(sid, {})[d] = tot
-            if fr is not None:
-                foreign.setdefault(sid, {})[d] = fr
+        for sid, iss in con.execute("SELECT stock_id,issued_lots FROM stockmeta"):
+            if iss is not None:
+                issued[sid] = iss
     except sqlite3.Error:
-        # 舊版 DB 可能還沒有 total_lots/foreign_lots 欄位：退回只讀投信，其餘副圖留待補。
-        inst = {}; mforce = {}; foreign = {}
-        try:
-            for sid, d, t in con.execute("SELECT stock_id,date,trust_lots FROM inst"):
-                if t is not None:
-                    inst.setdefault(sid, {})[d] = t
-        except sqlite3.Error:
-            inst = {}
-    # 400張大戶持股%（集保週資料，稀疏）：{sid: {date: pct}}
-    share = {}
+        issued = {}
+    # 三大法人(投信 trust_lots / 合計「主力」total_lots / 外資 foreign_lots) 與 400張大戶持股%
+    # 都可能有多年歷史、資料量大，故『逐檔查詢』（PRIMARY KEY(stock_id,date) 走索引），
+    # 不整表預載以省記憶體。has_inst_cols 判斷舊版 DB 是否只有 trust_lots。
     try:
-        for sid, dd, pct in con.execute("SELECT stock_id,date,big400_pct FROM shareholding"):
-            if pct is not None:
-                share.setdefault(sid, {})[dd] = pct
+        con.execute("SELECT total_lots,foreign_lots FROM inst LIMIT 1").fetchone()
+        has_inst_cols = True
     except sqlite3.Error:
-        share = {}
+        has_inst_cols = False
     sids = [r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price")]
     index = []
     n = 0
@@ -204,7 +191,26 @@ def write_stock_data(db_path, out_dir, industry=None):
             c.append(_r2(cc)); v.append(round((vv or 0) / 1000.0, 1))
         if not d:
             continue
-        im = inst.get(sid, {})
+        # 逐檔取三大法人與集保大戶（隨個股歷史深度可能達多年；走 (stock_id,date) 索引）
+        im = {}; mm = {}; fim = {}
+        if has_inst_cols:
+            for dd, tt, tot, fr in con.execute(
+                    "SELECT date,trust_lots,total_lots,foreign_lots FROM inst "
+                    "WHERE stock_id=? ORDER BY date", (sid,)):
+                if tt is not None: im[dd] = tt
+                if tot is not None: mm[dd] = tot
+                if fr is not None: fim[dd] = fr
+        else:
+            for dd, tt in con.execute(
+                    "SELECT date,trust_lots FROM inst WHERE stock_id=? ORDER BY date", (sid,)):
+                if tt is not None: im[dd] = tt
+        sh = {}
+        try:
+            for dd, pct in con.execute(
+                    "SELECT date,big400_pct FROM shareholding WHERE stock_id=? ORDER BY date", (sid,)):
+                if pct is not None: sh[dd] = pct
+        except sqlite3.Error:
+            sh = {}
         ts = len(d); t = []
         if im:
             imin = min(im.keys())
@@ -213,8 +219,7 @@ def write_stock_data(db_path, out_dir, industry=None):
                 lo += 1
             ts = lo
             t = [round(im.get(dd, 0.0), 1) for dd in d[ts:]]
-        # 主力買賣超副圖：用三大法人合計，讓每一檔都有（涵蓋近一年，遠超過 60 天）。
-        mm = mforce.get(sid, {})
+        # 主力買賣超副圖：用三大法人合計，讓每一檔都有（深度歷史回補到約 2019 起）。
         mfs = len(d); mf = []
         if mm:
             mmin = min(mm.keys())
@@ -224,7 +229,6 @@ def write_stock_data(db_path, out_dir, industry=None):
             mfs = lo
             mf = [round(mm.get(dd, 0.0), 1) for dd in d[mfs:]]
         # 外資買賣超副圖（與投信同結構：起始索引 fs + 逐日淨買超 f）
-        fim = foreign.get(sid, {})
         fs = len(d); fser = []
         if fim:
             fmin = min(fim.keys())
@@ -234,12 +238,12 @@ def write_stock_data(db_path, out_dir, industry=None):
             fs = lo
             fser = [round(fim.get(dd, 0.0), 1) for dd in d[fs:]]
         # 400張大戶持股%：稀疏 [日期,%] 點（僅週快照；網頁端對每根K棒前向填補）
-        sh = share.get(sid, {})
         b4 = [[dd, round(sh[dd], 2)] for dd in sorted(sh.keys())]
         name, mk = info.get(sid, ("", ""))
         ind = industry.get(sid, "")
         obj = {"n": name, "m": mk, "ind": ind, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v,
-               "ts": ts, "t": t, "mfs": mfs, "mf": mf, "fs": fs, "f": fser, "b4": b4}
+               "ts": ts, "t": t, "mfs": mfs, "mf": mf, "fs": fs, "f": fser, "b4": b4,
+               "iss": issued.get(sid)}
         with open(os.path.join(ddir, f"{sid}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
         index.append([sid, name, mk, ind]); n += 1
@@ -670,6 +674,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   .cvtitle{font-size:17px; font-weight:800;}
   .cvtitle .c{color:var(--amber); margin-right:7px;}
   .cvchg{font-size:14px; font-weight:700;}
+  /* 表頭空白處：發行張數 + 扣董監大戶後流通張數 */
+  .cvfloat{display:flex; align-items:baseline; gap:5px; font-size:12px; color:var(--muted); flex-wrap:wrap;}
+  .cvfloat .cvfk{color:var(--dim);}
+  .cvfloat .cvfv{color:var(--text); font-weight:700; font-variant-numeric:tabular-nums;}
+  .cvfloat .cvfsep{color:var(--border);}
+  .cvfloat .cvfnote{color:var(--dim); font-size:11px;}
   .pswitch{display:flex; gap:4px; margin-left:auto;}
   .pbtn{background:var(--card); border:1px solid var(--border); color:var(--muted); border-radius:7px; padding:7px 15px; font-size:14px; cursor:pointer; font-weight:600;}
   .pbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
@@ -847,6 +857,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="back" onclick="closeChart()">◀ 返回</button>
     <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span><span class="indtag inline" id="cvInd"></span></div>
     <div class="cvchg" id="cvChg"></div>
+    <div class="cvfloat" id="cvFloat"></div>
     <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" title="循環切換：量 → 投信 → 外資 → 400張大戶" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" title="循環切換：MACD → RSI → KD → 主力" style="margin-left:5px">下圖:MACD</button></div>
   </div>
   <div class="cvconcepts" id="cvConcepts"></div>
@@ -1357,7 +1368,7 @@ function aggregate(daily, period){
 }
 let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, hoverY:null, lock:null, lockY:null,
   volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[],
-  fs:0, f:[], fnet:[], fcum:[], b4:[], big:[] };
+  fs:0, f:[], fnet:[], fcum:[], b4:[], big:[], iss:null };
 // 副圖(中)可切換：量→投信→外資→400張大戶；下圖可切換：MACD→RSI→KD→主力
 const VOL_MODES=["vol","inst","foreign","big400"], VOL_LABEL={vol:"副圖:量",inst:"副圖:投信",foreign:"副圖:外資",big400:"副圖:大戶"};
 const MACD_MODES=["macd","rsi","kd","mforce"], MACD_LABEL={macd:"下圖:MACD",rsi:"下圖:RSI",kd:"下圖:KD",mforce:"下圖:主力"};
@@ -1378,9 +1389,24 @@ async function fetchStock(sid){
     const n=j.d.length, bars=new Array(n);
     for(let i=0;i<n;i++) bars[i]=[j.d[i],j.o[i],j.h[i],j.l[i],j.c[i],j.v[i]];
     const o={name:j.n||"", market:j.m||"", ind:j.ind||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]),
-      mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[]), fs:(j.fs!=null?j.fs:n), f:(j.f||[]), b4:(j.b4||[])};
+      mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[]), fs:(j.fs!=null?j.fs:n), f:(j.f||[]), b4:(j.b4||[]),
+      iss:(j.iss!=null?j.iss:null)};
     HISTORY[sid]=o; return o;
   }catch(e){ return null; }
+}
+/* 表頭『發行 / 流通張數』：流通 = 發行 ×(1−最新400張大戶%)。400張大戶已含董監＋法人大股東。 */
+function fmtLots(n){ if(n==null||!isFinite(n)) return "—"; n=Math.round(n); const s=String(Math.abs(n)); let out=""; for(let i=0;i<s.length;i++){ if(i>0&&(s.length-i)%3===0) out+=","; out+=s[i]; } return (n<0?"-":"")+out; }
+function renderFloat(o){
+  const el=document.getElementById("cvFloat"); if(!el) return;
+  const iss=(o&&o.iss!=null&&o.iss>0)?o.iss:null;
+  if(iss==null){ el.innerHTML=""; el.style.display="none"; return; }
+  const b4=(o&&o.b4)||[], big=b4.length?b4[b4.length-1][1]:null;   // 最新一週 400張大戶%
+  let h=`<span class="cvfk">發行</span><span class="cvfv">${fmtLots(iss)}張</span>`;
+  if(big!=null&&isFinite(big)){
+    h+=`<span class="cvfsep">·</span><span class="cvfk">流通</span><span class="cvfv">${fmtLots(iss*(1-big/100))}張</span>`
+      +`<span class="cvfnote">(扣董監大戶${big.toFixed(1)}%)</span>`;
+  }
+  el.innerHTML=h; el.style.display="";
 }
 async function openChart(sid){
   const o=await fetchStock(sid);
@@ -1390,10 +1416,11 @@ async function openChart(sid){
   const name=r["名稱"]||o.name||(td?td.name:"")||"";
   CH.sid=sid; CH.offset=0; CH.hover=null; CH.hoverY=null; CH.lock=null; CH.lockY=null;
   CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t; CH.macdMode="macd"; CH.mfs=o.mfs; CH.mf=o.mf;
-  CH.fs=o.fs; CH.f=o.f; CH.b4=o.b4||[];
+  CH.fs=o.fs; CH.f=o.f; CH.b4=o.b4||[]; CH.iss=(o.iss!=null?o.iss:null);
   document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
   const cind=document.getElementById("cvInd"), indv=o.ind||indLabel(sid); if(cind){ cind.textContent=indv||""; cind.style.display=indv?"":"none"; }
   const ccp=document.getElementById("cvConcepts"); if(ccp){ ccp.innerHTML=conceptChips(sid); }
+  renderFloat(o);
   if(r["收盤"]!=null && r["漲跌%"]!=null){ const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
     document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
   } else { const lc=o.bars[o.bars.length-1][4];
@@ -1474,7 +1501,7 @@ function drawFlow(ctx,zone,start,end,xOf,bw,W,idx,netArr,cumArr,title,emptyMsg,c
   const nv=netArr[idx]; return (nv!=null&&idx>=start&&idx<end)?{y:nbY(nv),txt:(nv>=0?"+":"")+Math.round(nv),col:nv>=0?"#fb3b41":"#1ec77a"}:null;
 }
 function drawMForce(ctx,L,start,end,xOf,bw,W,idx){
-  return drawFlow(ctx,L.macd,start,end,xOf,bw,W,idx,CH.mnet,CH.mcum,"主力買賣超(柱) ▏累計(橘線)","此區間無主力買賣超資料（三大法人約近一年）","#f5a524");
+  return drawFlow(ctx,L.macd,start,end,xOf,bw,W,idx,CH.mnet,CH.mcum,"主力買賣超(柱) ▏累計(橘線)","此區間無主力買賣超資料（三大法人）","#f5a524");
 }
 function drawVolume(ctx,L,start,end,xOf,bw,W,idx){
   let vmax=0; for(let i=start;i<end;i++){ vmax=Math.max(vmax,CH.bars[i].v); VOL_MAS.forEach(m=>{const v=CH.ind.vma[m][i]; if(v!=null)vmax=Math.max(vmax,v);}); }
@@ -1489,7 +1516,7 @@ function drawBig400(ctx,L,start,end,xOf,bw,W,idx){
   const y0=L.vol.y0, y1=L.vol.y1;
   let any=false, vmin=Infinity, vmax=-Infinity;
   for(let i=start;i<end;i++){ const v=CH.big[i]; if(v!=null){any=true; vmin=Math.min(vmin,v); vmax=Math.max(vmax,v);} }
-  if(!any){ const mid=Math.round((y0+y1)/2); ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("此區間無集保大戶資料（約近一年・週更新）",(PADL+W-PADR)/2,mid);
+  if(!any){ const mid=Math.round((y0+y1)/2); ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("此區間無集保大戶資料（週更新）",(PADL+W-PADR)/2,mid);
     ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("400張大戶持股%",PADL+2,y0+2); return null; }
   if(vmax-vmin<0.4){ vmin-=0.4; vmax+=0.4; } const pad=(vmax-vmin)*0.12||0.2; vmin-=pad; vmax+=pad;
   const gY=(v)=> y1-3 - (v-vmin)/(vmax-vmin)*(y1-y0-8);
