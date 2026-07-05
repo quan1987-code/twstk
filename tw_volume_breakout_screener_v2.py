@@ -481,6 +481,8 @@ INST_LOOKBACK = 250      # 投信買賣超在 inst 表保留的交易日數（�
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
 SHAREHOLD_WEEKS = 52     # 集保「400張大戶持股%」保留週數（供個股K線副圖，約一年）
+SHAREHOLD_MAX_PER_RUN = 8  # 每次 run 最多回補週數：避免首次 52 週一次抓被 FinMind 限流拖成長跑；
+#                            以「最近週優先」回補，其餘週於後續每日 run 逐步補齊（DB 有快取）
 
 
 def _t86_indices(fields):
@@ -628,12 +630,19 @@ def update_shareholding(con, token):
     if not todo:
         print("集保大戶：已是最新。")
         return
-    print(f"集保大戶：需抓 {len(todo)} 週（每週全市場一次）…")
+    todo_total = len(todo)
+    todo = todo[-SHAREHOLD_MAX_PER_RUN:]   # 最近週優先；其餘留待後續每日 run 補回（避免單次長跑）
+    if todo_total > len(todo):
+        print(f"集保大戶：待補 {todo_total} 週，本次先抓最近 {len(todo)} 週（其餘後續 run 逐步補齊）…")
+    else:
+        print(f"集保大戶：需抓 {len(todo)} 週（每週全市場一次）…")
     n = 0
     logged_levels = False
     for d in todo:
         try:
-            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3, date=d)
+            # 每檔查詢較重、FinMind 限流較兇：max_retry=2 讓被限流的週約 30s 內快速放棄，
+            # 留待下一次 run 補回，避免長時間退避拖住整個 daily 流程。
+            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2, date=d)
         except Exception as e:
             print(f"  集保 {d} 失敗：{e}")
             continue
