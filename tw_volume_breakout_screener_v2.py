@@ -480,6 +480,7 @@ TRUST_LOOKBACK = 30      # 連買候選觀察窗（最近約一個月）
 INST_LOOKBACK = 250      # 投信買賣超在 inst 表保留的交易日數（供個股K線投信副圖，約一年）
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
+SHAREHOLD_WEEKS = 52     # 集保「400張大戶持股%」保留週數（供個股K線副圖，約一年）
 
 
 def _t86_indices(fields):
@@ -576,6 +577,91 @@ def update_inst(con, sess):
             n += 1
         time.sleep(1.2)
     print(f"三大法人買賣超更新完成：新增/補齊 {n} 個交易日。")
+
+
+def _is_big400_level(level):
+    """集保股權分散級距是否屬『400張(=400,000股)以上大戶』（下界 ≥ 400,001 股）。
+    相容兩種級距標記：範圍字串(如 '400,001-600,000'、'more than 1,000,001'、'1,000,001以上')
+    與純數字級距索引(1~15，其中 12~15 為 ≥400,001 股的四個大戶級距)。"""
+    s = str(level).strip()
+    if re.fullmatch(r"\d{1,2}", s):          # 純級距索引
+        return int(s) in (12, 13, 14, 15)
+    low = s.lower()
+    if "total" in low or "合計" in s or "差異" in s:
+        return False
+    m = re.search(r"([\d,]+)", s)
+    if not m:
+        return False
+    try:
+        return int(m.group(1).replace(",", "")) >= 400001
+    except ValueError:
+        return False
+
+
+def update_shareholding(con, token):
+    """集保股權分散：計算『400張以上大戶持股比率(%)』週資料，供個股K線副圖。
+    FinMind TaiwanStockHoldingSharesPer 依日期回傳全市場；只補尚未存的近 SHAREHOLD_WEEKS 週。
+    包在 try/except 內呼叫，失敗不影響主流程；資料週更新，多數日子只需 1 次探測即『已是最新』。"""
+    con.execute("CREATE TABLE IF NOT EXISTS shareholding("
+                "stock_id TEXT, date TEXT, big400_pct REAL, PRIMARY KEY(stock_id,date))")
+    con.commit()
+    if not token:
+        print("集保大戶：無 FinMind token，略過。")
+        return
+    latest = con.execute("SELECT MAX(date) FROM price").fetchone()[0]
+    base = dt.date.fromisoformat(latest) if latest else dt.date.today()
+    start = (base - dt.timedelta(days=520)).isoformat()
+    # 用 2330 探測「可用週日期清單」（1 call）
+    try:
+        probe = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3,
+                            data_id="2330", start_date=start)
+    except Exception as e:
+        print(f"集保大戶：探測失敗，略過（{e}）。")
+        return
+    if probe is None or probe.empty or "date" not in probe.columns:
+        print("集保大戶：探測無資料，略過。")
+        return
+    all_dates = sorted(str(x) for x in probe["date"].unique())
+    want = all_dates[-SHAREHOLD_WEEKS:]
+    have = set(r[0] for r in con.execute("SELECT DISTINCT date FROM shareholding"))
+    todo = [d for d in want if d not in have]
+    if not todo:
+        print("集保大戶：已是最新。")
+        return
+    print(f"集保大戶：需抓 {len(todo)} 週（每週全市場一次）…")
+    n = 0
+    logged_levels = False
+    for d in todo:
+        try:
+            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3, date=d)
+        except Exception as e:
+            print(f"  集保 {d} 失敗：{e}")
+            continue
+        if df is None or df.empty or "HoldingSharesLevel" not in df.columns or "percent" not in df.columns:
+            continue
+        if not logged_levels:   # 首批印出實際級距標記，方便日後於 CI log 核對大戶判定
+            print(f"  集保級距樣本：{sorted(df['HoldingSharesLevel'].astype(str).unique())}")
+            logged_levels = True
+        big = df[df["HoldingSharesLevel"].map(_is_big400_level)].copy()
+        big["_sid"] = big["stock_id"].astype(str)
+        big["_pct"] = pd.to_numeric(big["percent"], errors="coerce")
+        rows = []
+        for sid, g in big.groupby("_sid"):
+            if len(sid) != 4 or not sid.isdigit():
+                continue
+            pct = round(float(g["_pct"].sum()), 2)
+            if pct == pct and pct > 0:   # 排除 NaN / 0
+                rows.append((sid, d, pct))
+        if rows:
+            con.executemany(
+                "INSERT OR REPLACE INTO shareholding(stock_id,date,big400_pct) VALUES (?,?,?)", rows)
+            con.commit()
+            n += 1
+        time.sleep(1.0)
+    if want:   # 只保留近 SHAREHOLD_WEEKS 週
+        con.execute("DELETE FROM shareholding WHERE date < ?", (want[0],))
+        con.commit()
+    print(f"集保大戶更新完成：新增/補齊 {n} 週。")
 
 
 def build_trust_candidates(con):
@@ -942,6 +1028,12 @@ def main():
         print(f"投信連買候選：{len(cands)} 檔（張數門檻於網頁端切換）")
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
+
+    # 集保 400 張大戶持股%（週更新；供個股K線副圖，失敗不影響主流程）
+    try:
+        update_shareholding(con, CONFIG["FINMIND_TOKEN"])
+    except Exception as e:
+        print(f"集保大戶資料失敗（不影響主流程）：{e}")
 
     # 資金流向 TOP10（大戶=三大法人合計 / 投信；當日 + 近5/20/60日）
     try:

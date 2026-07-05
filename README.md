@@ -9,7 +9,7 @@ stock-screener
 
 | 頁面 | 產生器 | 內容 |
 |---|---|---|
-| `index.html` | `build_site.py` | 指數回撤・爆量起漲選股・投信連買・資金流向（熱圖＋120日輪動）・個股K線 |
+| `index.html` | `build_site.py` | 指數回撤・爆量起漲選股・投信連買・資金流向（熱圖＋120日輪動）・個股K線（點按鎖定十字線＋副圖同步；副圖 量/投信/外資/400張大戶、下圖 MACD/RSI/KD/主力；概念股標籤） |
 | `market.html` | `tw_market_analysis.py` | 台美股每日市場分析：總覽/盤勢研判/資金流向/族群雷達（漲跌主軸・底部起漲・持續強勢）/每日監控清單/風險儀表 |
 | `chuzhi.html` | `tw_disposition.py` | 處置股專區（即將/確定/處置中/出關＋分點籌碼） |
 
@@ -20,3 +20,7 @@ stock-screener
 
 美股/總經資料由 `tw_market_analysis.py` 透過 yfinance 抓取；本地離線預覽可用
 `python tw_market_analysis.py --demo`。
+
+個股K線副圖資料：三大法人（外資/投信/合計「主力」）來自 TWSE T86；
+「400張大戶持股%」來自 FinMind `TaiwanStockHoldingSharesPer`（集保股權分散，週更新，
+存於 `twstock.db` 的 `shareholding` 表）。概念股標籤由 `tw_concepts.py`（人工維護對照表）提供。

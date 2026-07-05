@@ -32,6 +32,11 @@ try:
 except Exception:
     tw_industry = None
 
+try:
+    import tw_concepts
+except Exception:
+    tw_concepts = None
+
 DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
 TRUST_CHART_BARS = 320   # 投信候選嵌入較短歷史以控制檔案大小
@@ -158,22 +163,33 @@ def write_stock_data(db_path, out_dir, industry=None):
     # 近一年投信買賣超(trust_lots) 與 三大法人合計買賣超(total_lots，作為「主力」免費替代指標)，
     # 預載成 {sid: {date: 張}}。三大法人合計讓『每一檔』股票都有 K 線下方「主力買賣超」副圖，
     # 不再僅限處置相關個股；處置專區之後仍可用分點資料覆寫成更精準的主力序列。
-    inst = {}; mforce = {}
+    inst = {}; mforce = {}; foreign = {}
     try:
-        for sid, d, t, tot in con.execute("SELECT stock_id,date,trust_lots,total_lots FROM inst"):
+        for sid, d, t, tot, fr in con.execute(
+                "SELECT stock_id,date,trust_lots,total_lots,foreign_lots FROM inst"):
             if t is not None:
                 inst.setdefault(sid, {})[d] = t
             if tot is not None:
                 mforce.setdefault(sid, {})[d] = tot
+            if fr is not None:
+                foreign.setdefault(sid, {})[d] = fr
     except sqlite3.Error:
-        # 舊版 DB 可能還沒有 total_lots 欄位：退回只讀投信，主力副圖留待處置專區補。
-        inst = {}; mforce = {}
+        # 舊版 DB 可能還沒有 total_lots/foreign_lots 欄位：退回只讀投信，其餘副圖留待補。
+        inst = {}; mforce = {}; foreign = {}
         try:
             for sid, d, t in con.execute("SELECT stock_id,date,trust_lots FROM inst"):
                 if t is not None:
                     inst.setdefault(sid, {})[d] = t
         except sqlite3.Error:
             inst = {}
+    # 400張大戶持股%（集保週資料，稀疏）：{sid: {date: pct}}
+    share = {}
+    try:
+        for sid, dd, pct in con.execute("SELECT stock_id,date,big400_pct FROM shareholding"):
+            if pct is not None:
+                share.setdefault(sid, {})[dd] = pct
+    except sqlite3.Error:
+        share = {}
     sids = [r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price")]
     index = []
     n = 0
@@ -207,10 +223,23 @@ def write_stock_data(db_path, out_dir, industry=None):
                 lo += 1
             mfs = lo
             mf = [round(mm.get(dd, 0.0), 1) for dd in d[mfs:]]
+        # 外資買賣超副圖（與投信同結構：起始索引 fs + 逐日淨買超 f）
+        fim = foreign.get(sid, {})
+        fs = len(d); fser = []
+        if fim:
+            fmin = min(fim.keys())
+            lo = 0
+            while lo < len(d) and d[lo] < fmin:
+                lo += 1
+            fs = lo
+            fser = [round(fim.get(dd, 0.0), 1) for dd in d[fs:]]
+        # 400張大戶持股%：稀疏 [日期,%] 點（僅週快照；網頁端對每根K棒前向填補）
+        sh = share.get(sid, {})
+        b4 = [[dd, round(sh[dd], 2)] for dd in sorted(sh.keys())]
         name, mk = info.get(sid, ("", ""))
         ind = industry.get(sid, "")
         obj = {"n": name, "m": mk, "ind": ind, "d": d, "o": o, "h": h, "l": l, "c": c, "v": v,
-               "ts": ts, "t": t, "mfs": mfs, "mf": mf}
+               "ts": ts, "t": t, "mfs": mfs, "mf": mf, "fs": fs, "f": fser, "b4": b4}
         with open(os.path.join(ddir, f"{sid}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
         index.append([sid, name, mk, ind]); n += 1
@@ -339,7 +368,7 @@ def get_market():
     return out
 
 
-def build_html(results, history, market, trust, extras, flows, date, count, db_ok, gentime, industry=None):
+def build_html(results, history, market, trust, extras, flows, date, count, db_ok, gentime, industry=None, concepts=None):
     return (TEMPLATE
             .replace("/*__RESULTS__*/null", json.dumps(results, ensure_ascii=False))
             .replace("/*__HISTORY__*/null", json.dumps(history, ensure_ascii=False))
@@ -348,16 +377,17 @@ def build_html(results, history, market, trust, extras, flows, date, count, db_o
             .replace("/*__EXTRAS__*/null", json.dumps(extras, ensure_ascii=False))
             .replace("/*__FLOWS__*/null", json.dumps(flows, ensure_ascii=False))
             .replace("/*__INDUSTRY__*/null", json.dumps(industry or {}, ensure_ascii=False))
+            .replace("/*__CONCEPTS__*/null", json.dumps(concepts or {}, ensure_ascii=False))
             .replace("/*__DBOK__*/false", "true" if db_ok else "false")
             .replace("__DATE__", date or "")
             .replace("__GENTIME__", gentime)
             .replace("__COUNT__", str(count)))
 
 
-def write_page(results, history, market, trust, extras, flows, date, db_ok, gentime, industry=None):
+def write_page(results, history, market, trust, extras, flows, date, db_ok, gentime, industry=None, concepts=None):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime, industry))
+        f.write(build_html(results, history, market, trust, extras, flows, date, len(results), db_ok, gentime, industry, concepts))
     with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({"name": "台股看板", "short_name": "台股看板", "display": "standalone",
                    "orientation": "portrait", "background_color": "#000000",
@@ -373,12 +403,13 @@ def main():
     flows = load_flows()
     have_db = os.path.exists(DB_PATH)
     industry = load_industry(DB_PATH) if have_db else {}
+    concepts = tw_concepts.concept_map() if tw_concepts is not None else {}
 
     path = sys.argv[1] if len(sys.argv) > 1 else find_latest_csv()
     if not path or not os.path.exists(path):
         print("找不到選股 CSV，第二分頁顯示空清單（首頁與投信頁仍正常）。")
         nstk = write_stock_data(DB_PATH, OUT_DIR, industry) if have_db else 0
-        write_page([], {}, market, trust, extras, flows, "", have_db, gentime, industry)
+        write_page([], {}, market, trust, extras, flows, "", have_db, gentime, industry, concepts)
         print(f"已產生 {OUT_DIR}/index.html（無爆量清單・逐檔資料 {nstk} 檔・更新 {gentime}）")
         return
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str).fillna("")
@@ -397,7 +428,7 @@ def main():
         con.close()
     # ④⑥ 產生逐檔資料檔（2005 起日線 + 近一年投信）＋首頁搜尋索引
     nstk = write_stock_data(DB_PATH, OUT_DIR, industry) if have_db else 0
-    write_page(results, {}, market, trust, extras, flows, date, have_db, gentime, industry)
+    write_page(results, {}, market, trust, extras, flows, date, have_db, gentime, industry, concepts)
     tcount = len(trust.get("data", {})) if isinstance(trust, dict) else 0
     print(f"已產生 {OUT_DIR}/index.html（爆量 {len(results)}・投信候選 {tcount}・逐檔資料 {nstk} 檔・更新 {gentime}）")
 
@@ -544,6 +575,12 @@ TEMPLATE = r"""<!DOCTYPE html>
   /* 產業類型標籤：股名下方小字 */
   .indtag{display:block; font-size:10.5px; font-weight:600; color:#7c8aa0; letter-spacing:.2px; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
   .indtag.inline{display:inline-block; margin:0 0 0 6px; padding:1px 6px; border:1px solid var(--border); border-radius:6px; color:#8aa0b6; background:rgba(255,255,255,.03);}
+  /* 概念股標籤（個股K線頁）：可換行小膠囊 */
+  .cvconcepts{display:flex; flex-wrap:wrap; gap:5px; padding:6px 14px 0;}
+  .cvconcepts:empty{display:none;}
+  .cchip{display:inline-block; font-size:11px; font-weight:600; line-height:1.5; padding:1px 8px; border-radius:999px;
+    color:#a7c5e8; border:1px solid rgba(96,165,250,.35); background:rgba(96,165,250,.10); white-space:nowrap;}
+  .cchip.concept-sm{font-size:10px; padding:0 6px; margin-left:5px; vertical-align:middle;}
   .fval{font-weight:800; font-variant-numeric:tabular-nums; white-space:nowrap;}
   .fval small{font-weight:600; color:var(--dim); font-size:10px; margin-left:1px;}
   .fcg{width:60px; text-align:right; font-size:12px; font-variant-numeric:tabular-nums;}
@@ -810,15 +847,16 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="back" onclick="closeChart()">◀ 返回</button>
     <div class="cvtitle"><span class="c" id="cvCode"></span><span id="cvName"></span><span class="indtag inline" id="cvInd"></span></div>
     <div class="cvchg" id="cvChg"></div>
-    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" style="margin-left:5px">下圖:MACD</button></div>
+    <div class="pswitch"><button class="pbtn on" data-p="D">日K</button><button class="pbtn" data-p="W">週K</button><button class="pbtn" data-p="M">月K</button><button class="pbtn" id="volModeBtn" onclick="toggleVol()" title="循環切換：量 → 投信 → 外資 → 400張大戶" style="margin-left:7px">副圖:量</button><button class="pbtn" id="macdModeBtn" onclick="toggleMacd()" title="循環切換：MACD → RSI → KD → 主力" style="margin-left:5px">下圖:MACD</button></div>
   </div>
+  <div class="cvconcepts" id="cvConcepts"></div>
   <button class="rotoggle" id="roToggle" onclick="toggleReadout()">▾ 展開指標數據(MA/布林/MACD…)</button>
   <div class="readout" id="readout"></div>
   <div class="malegend">
     <span><i style="background:var(--ma5)"></i>MA5</span><span><i style="background:var(--ma10)"></i>MA10</span>
     <span><i style="background:var(--ma20)"></i>MA20</span><span><i style="background:var(--ma60)"></i>MA60</span>
     <span><i style="background:var(--ma240)"></i>MA240</span><span><i style="background:#8aa0b6"></i>布林20</span>
-    <span style="color:var(--dim)">單指拖移看讀數 ・ 雙指縮放 ・ 點副圖切換 量↔投信 ・ 點下圖切換 MACD↔主力(三大法人，每檔皆有)</span>
+    <span style="color:var(--dim)">點K棒鎖定十字線（日期／價位＋副圖同步）・ 單指拖移掃描 ・ 雙指縮放 ・ 上方按鈕切換 副圖(量/投信/外資/400張大戶)、下圖(MACD/RSI/KD/主力)</span>
   </div>
   <div class="chartbox"><canvas id="chartCanvas"></canvas></div>
 </div>
@@ -831,10 +869,15 @@ const TRUST   = /*__TRUST__*/null;
 const EXTRAS  = /*__EXTRAS__*/null;
 const FLOWS   = /*__FLOWS__*/null;
 const INDUSTRY= /*__INDUSTRY__*/null;
+const CONCEPTS= /*__CONCEPTS__*/null;   // {sid: ["ABF載板","被動元件",...]}（概念股標籤）
 const DB_OK   = /*__DBOK__*/false;
 /* 產業類型標籤：股名下方小字。indLabel 回字串，indTag 回 HTML(含樣式)。 */
 function indLabel(sid){ try{ return (INDUSTRY&&INDUSTRY[sid])?INDUSTRY[sid]:""; }catch(e){ return ""; } }
 function indTag(sid){ const s=indLabel(sid); return s?`<span class="indtag">${s}</span>`:""; }
+/* 概念股標籤：conceptList 回陣列，conceptChips 回K線頁膠囊列，conceptInline 回搜尋列小標。 */
+function conceptList(sid){ try{ return (CONCEPTS&&CONCEPTS[sid])?CONCEPTS[sid]:[]; }catch(e){ return []; } }
+function conceptChips(sid){ const a=conceptList(sid); return a.length?a.map(c=>`<span class="cchip">${c}</span>`).join(""):""; }
+function conceptInline(sid){ const a=conceptList(sid); return a.length?`<span class="cchip concept-sm">${a[0]}${a.length>1?" +"+(a.length-1):""}</span>`:""; }
 
 /* ---------- 分頁切換 ---------- */
 const PANES = ["home", "screen", "trust", "flow"];
@@ -1295,6 +1338,16 @@ function STD(a,n,ma){const o=new Array(a.length).fill(null); for(let i=n-1;i<a.l
 function MACD(c){const e12=EMA(c,12),e26=EMA(c,26); const dif=c.map((_,i)=>(e12[i]!=null&&e26[i]!=null&&i>=25)?e12[i]-e26[i]:null);
   const dea=new Array(c.length).fill(null);const k=2/10;let p=null; for(let i=0;i<dif.length;i++){if(dif[i]==null)continue; p=(p==null)?dif[i]:dif[i]*k+p*(1-k); dea[i]=p;}
   const osc=dif.map((d,i)=>(d!=null&&dea[i]!=null)?d-dea[i]:null); return {dif,dea,osc};}
+function RSI(c,n){ const o=new Array(c.length).fill(null); if(c.length<=n) return o;
+  let ag=0,al=0; for(let i=1;i<=n;i++){ const ch=c[i]-c[i-1]; if(ch>=0)ag+=ch; else al-=ch; }
+  ag/=n; al/=n; o[n]=(al===0)?100:100-100/(1+ag/al);
+  for(let i=n+1;i<c.length;i++){ const ch=c[i]-c[i-1], g=ch>0?ch:0, l=ch<0?-ch:0;
+    ag=(ag*(n-1)+g)/n; al=(al*(n-1)+l)/n; o[i]=(al===0)?100:100-100/(1+ag/al); } return o; }
+function KD(bars,n,ks,ds){ const len=bars.length, kk=new Array(len).fill(null), dd=new Array(len).fill(null);
+  let pk=50, pd=50; for(let i=0;i<len;i++){ if(i<n-1) continue;
+    let hi=-Infinity, lo=Infinity; for(let j=i-n+1;j<=i;j++){ const b=bars[j]; if(b.h>hi)hi=b.h; if(b.l<lo)lo=b.l; }
+    const rsv=(hi===lo)?50:(bars[i].c-lo)/(hi-lo)*100;
+    pk=pk*(1-1/ks)+rsv*(1/ks); pd=pd*(1-1/ds)+pk*(1/ds); kk[i]=pk; dd[i]=pd; } return {k:kk,d:dd}; }
 function aggregate(daily, period){
   if(period==="D") return daily.map(b=>({d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}));
   const key=(s)=>{ if(period==="M") return s.slice(0,7); const p=s.split("-").map(Number); const dt=new Date(Date.UTC(p[0],p[1]-1,p[2])); const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day); return dt.toISOString().slice(0,10); };
@@ -1302,14 +1355,19 @@ function aggregate(daily, period){
   for(const b of daily){ const k=key(b[0]); if(!map[k]){ map[k]={d:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}; order.push(k);} else { const g=map[k]; g.h=Math.max(g.h,b[2]); g.l=Math.min(g.l,b[3]); g.c=b[4]; g.v+=b[5]; g.d=b[0]; } }
   return order.map(k=>map[k]);
 }
-let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, hoverY:null, volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[] };
+let CH={ sid:null, period:"D", bars:[], ind:null, count:90, offset:0, hover:null, hoverY:null, lock:null, lockY:null,
+  volMode:"vol", ts:0, t:[], tnet:[], tcum:[], macdMode:"macd", mfs:0, mf:[], mnet:[], mcum:[],
+  fs:0, f:[], fnet:[], fcum:[], b4:[], big:[] };
+// 副圖(中)可切換：量→投信→外資→400張大戶；下圖可切換：MACD→RSI→KD→主力
+const VOL_MODES=["vol","inst","foreign","big400"], VOL_LABEL={vol:"副圖:量",inst:"副圖:投信",foreign:"副圖:外資",big400:"副圖:大戶"};
+const MACD_MODES=["macd","rsi","kd","mforce"], MACD_LABEL={macd:"下圖:MACD",rsi:"下圖:RSI",kd:"下圖:KD",mforce:"下圖:主力"};
 function computeInd(bars){
   const close=bars.map(b=>b.c), vol=bars.map(b=>b.v);
   const ma={}; PRICE_MAS.forEach(n=>ma[n]=SMA(close,n));
   const mid=SMA(close,20), sd=STD(close,20,mid);
   const bu=mid.map((m,i)=>(m!=null&&sd[i]!=null)?m+2*sd[i]:null), bl=mid.map((m,i)=>(m!=null&&sd[i]!=null)?m-2*sd[i]:null);
   const vma={}; VOL_MAS.forEach(n=>vma[n]=SMA(vol,n));
-  return { ma, boll:{u:bu,m:mid,l:bl}, vma, macd:MACD(close) };
+  return { ma, boll:{u:bu,m:mid,l:bl}, vma, macd:MACD(close), rsi:RSI(close,14), rsi6:RSI(close,6), kd:KD(bars,9,3,3) };
 }
 async function fetchStock(sid){
   if(HISTORY[sid]) return HISTORY[sid];
@@ -1319,7 +1377,8 @@ async function fetchStock(sid){
     const j=await res.json();
     const n=j.d.length, bars=new Array(n);
     for(let i=0;i<n;i++) bars[i]=[j.d[i],j.o[i],j.h[i],j.l[i],j.c[i],j.v[i]];
-    const o={name:j.n||"", market:j.m||"", ind:j.ind||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]), mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[])};
+    const o={name:j.n||"", market:j.m||"", ind:j.ind||"", bars, ts:(j.ts!=null?j.ts:n), t:(j.t||[]),
+      mfs:(j.mfs!=null?j.mfs:n), mf:(j.mf||[]), fs:(j.fs!=null?j.fs:n), f:(j.f||[]), b4:(j.b4||[])};
     HISTORY[sid]=o; return o;
   }catch(e){ return null; }
 }
@@ -1329,9 +1388,12 @@ async function openChart(sid){
   const r=RESULTS.find(x=>x["代號"]===sid)||{};
   const td=(TRUST&&TRUST.data&&TRUST.data[sid])||null;
   const name=r["名稱"]||o.name||(td?td.name:"")||"";
-  CH.sid=sid; CH.offset=0; CH.hover=null; CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t; CH.macdMode="macd"; CH.mfs=o.mfs; CH.mf=o.mf;
+  CH.sid=sid; CH.offset=0; CH.hover=null; CH.hoverY=null; CH.lock=null; CH.lockY=null;
+  CH.volMode="vol"; CH.ts=o.ts; CH.t=o.t; CH.macdMode="macd"; CH.mfs=o.mfs; CH.mf=o.mf;
+  CH.fs=o.fs; CH.f=o.f; CH.b4=o.b4||[];
   document.getElementById("cvCode").textContent=sid; document.getElementById("cvName").textContent=name;
   const cind=document.getElementById("cvInd"), indv=o.ind||indLabel(sid); if(cind){ cind.textContent=indv||""; cind.style.display=indv?"":"none"; }
+  const ccp=document.getElementById("cvConcepts"); if(ccp){ ccp.innerHTML=conceptChips(sid); }
   if(r["收盤"]!=null && r["漲跌%"]!=null){ const chg=num(r["漲跌%"]), cc=chg>0?UP:chg<0?DOWN:"var(--muted)";
     document.getElementById("cvChg").innerHTML=`<span style="color:${cc}">${r["收盤"]} (${chg>0?"+":""}${r["漲跌%"]}%)</span>`;
   } else { const lc=o.bars[o.bars.length-1][4];
@@ -1364,50 +1426,106 @@ function closeChart(){
 }
 window.addEventListener("popstate",()=>{ const cv=document.getElementById("cv"); if(cv&&cv.classList.contains("open")){ cv.classList.remove("open"); CHART_PUSHED=false; } });
 function periodKey(ds,p){ if(p==="M") return ds.slice(0,7); if(p==="W"){ const a=ds.split("-").map(Number); const dt=new Date(Date.UTC(a[0],a[1]-1,a[2])); const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day); return dt.toISOString().slice(0,10);} return ds; }
+// 把「逐日買賣超(張)」依期別彙總成每根K棒的『淨買超(net)＋累計庫存(cum)』。投信/外資/主力共用。
+function periodNetCum(daily, startIdx, arr, p, bars){
+  const net={}, has={};
+  for(let i=0;i<daily.length;i++){ const k=periodKey(daily[i][0],p); const val=(i>=startIdx)?arr[i-startIdx]:null;
+    if(val!=null){ net[k]=(net[k]||0)+val; has[k]=true; } }
+  const outNet=[], outCum=[]; let cum=0, started=false;
+  for(const b of bars){ const k=periodKey(b.d,p); const hv=has[k]===true; const nv=hv?net[k]:null;
+    outNet.push(nv); if(hv){ started=true; cum+=nv; } outCum.push(started?cum:null); }
+  return {net:outNet, cum:outCum};
+}
 function setPeriod(p){
   CH.period=p; CH.offset=0; CH.hover=null;
   const o=HISTORY[CH.sid]; const daily=o.bars;
   CH.bars=aggregate(daily,p); CH.ind=computeInd(CH.bars);
-  const ts=CH.ts, tt=CH.t, net={}, has={};
-  for(let i=0;i<daily.length;i++){ const k=periodKey(daily[i][0],p); const val=(i>=ts)?tt[i-ts]:null;
-    if(val!=null){ net[k]=(net[k]||0)+val; has[k]=true; } }
-  CH.tnet=[]; CH.tcum=[]; let cum=0, started=false;
-  for(const b of CH.bars){ const k=periodKey(b.d,p); const hv=has[k]===true; const nv=hv?net[k]:null;
-    CH.tnet.push(nv); if(hv){ started=true; cum+=nv; } CH.tcum.push(started?cum:null); }
-  const mfs=CH.mfs, mm=CH.mf, mnet={}, mhas={};
-  for(let i=0;i<daily.length;i++){ const k=periodKey(daily[i][0],p); const val=(i>=mfs)?mm[i-mfs]:null;
-    if(val!=null){ mnet[k]=(mnet[k]||0)+val; mhas[k]=true; } }
-  CH.mnet=[]; CH.mcum=[]; let mcum=0, mstarted=false;
-  for(const b of CH.bars){ const k=periodKey(b.d,p); const hv=mhas[k]===true; const nv=hv?mnet[k]:null;
-    CH.mnet.push(nv); if(hv){ mstarted=true; mcum+=nv; } CH.mcum.push(mstarted?mcum:null); }
+  const tr=periodNetCum(daily, CH.ts, CH.t, p, CH.bars); CH.tnet=tr.net; CH.tcum=tr.cum;
+  const fr=periodNetCum(daily, CH.fs, CH.f, p, CH.bars); CH.fnet=fr.net; CH.fcum=fr.cum;
+  const mr=periodNetCum(daily, CH.mfs, CH.mf, p, CH.bars); CH.mnet=mr.net; CH.mcum=mr.cum;
+  // 400張大戶持股%（週資料稀疏）：對每根K棒用「日期 ≤ 該棒」的最近一筆前向填補。
+  CH.big=[]; { const b4=CH.b4||[]; let j=0, last=null;
+    for(const bar of CH.bars){ while(j<b4.length && b4[j][0]<=bar.d){ last=b4[j][1]; j++; } CH.big.push(last); } }
   CH.count=Math.min(CH.bars.length, p==="D"?90:(p==="W"?80:60)); drawChart();
 }
-function toggleVol(){ if(!CH.bars.length)return; CH.volMode=CH.volMode==="vol"?"inst":"vol"; const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent=CH.volMode==="vol"?"副圖:量":"副圖:投信"; drawChart(); }
-function toggleMacd(){ if(!CH.bars.length)return; CH.macdMode=CH.macdMode==="macd"?"mforce":"macd"; const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent=CH.macdMode==="macd"?"下圖:MACD":"下圖:主力"; drawChart(); }
+function toggleVol(){ if(!CH.bars.length)return; const i=VOL_MODES.indexOf(CH.volMode); CH.volMode=VOL_MODES[(i+1)%VOL_MODES.length]; const vb=document.getElementById("volModeBtn"); if(vb) vb.textContent=VOL_LABEL[CH.volMode]||"副圖:量"; drawChart(); }
+function toggleMacd(){ if(!CH.bars.length)return; const i=MACD_MODES.indexOf(CH.macdMode); CH.macdMode=MACD_MODES[(i+1)%MACD_MODES.length]; const mb=document.getElementById("macdModeBtn"); if(mb) mb.textContent=MACD_LABEL[CH.macdMode]||"下圖:MACD"; drawChart(); }
 document.querySelectorAll(".pbtn[data-p]").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".pbtn[data-p]").forEach(x=>x.classList.remove("on")); b.classList.add("on"); setPeriod(b.dataset.p);}));
 function visRange(){ const N=CH.bars.length, cnt=Math.min(CH.count,N); let end=N-CH.offset; if(end>N)end=N; let start=end-cnt; if(start<0)start=0; return {start,end}; }
 const PADL=50, PADR=12, GAP=8, DATEH=20;
 function layout(W,H){ const usable=H-DATEH, ph=Math.round(usable*0.56), vh=Math.round(usable*0.20);
   return { price:{y0:0,y1:ph}, vol:{y0:ph+GAP,y1:ph+GAP+vh}, macd:{y0:ph+GAP+vh+GAP,y1:usable}, dateY:usable }; }
-function drawMForce(ctx,L,start,end,xOf,bw,W){
-  const y0=L.macd.y0, y1=L.macd.y1, mid=Math.round((y0+y1)/2), hh=(y1-y0-4)/2;
-  ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mid); ctx.lineTo(W-PADR,mid); ctx.stroke();
-  let vmax=1e-9, any=false, lastCum=null;
-  for(let i=start;i<end;i++){ const nv=CH.mnet[i], cv=CH.mcum[i];
-    if(nv!=null){ any=true; vmax=Math.max(vmax,Math.abs(nv)); }
-    if(cv!=null){ vmax=Math.max(vmax,Math.abs(cv)); lastCum=cv; } }
-  if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle";
-    ctx.fillText("此區間無主力買賣超資料（三大法人約近一年）",(PADL+W-PADR)/2,mid);
-    ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("主力買賣超",PADL+2,y0+2); return; }
-  const vY=(v)=> mid - v/vmax*hh;
-  for(let i=start;i<end;i++){ const v=CH.mnet[i]; if(v==null)continue; const x=xOf(i), y=vY(v);
-    ctx.fillStyle=v>=0?"rgba(255,77,79,.8)":"rgba(34,197,94,.8)"; const bodyW=Math.max(bw*0.55,1);
-    ctx.fillRect(x-bodyW/2,Math.min(y,mid),bodyW,Math.abs(y-mid)||1); }
-  ctx.lineWidth=1.5; ctx.strokeStyle="#f5a524"; let st=false; ctx.beginPath();
-  for(let i=start;i<end;i++){ const v=CH.mcum[i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v);
-    if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke();
-  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("\u00b1"+Math.round(vmax)+"\u5f35",PADL-6,y0+8);
-  ctx.fillStyle="#f5a524"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("\u4e3b\u529b\u8cb7\u8ce3\u8d85(\u67f1) \u258f\u7d2f\u8a08(\u6a58\u7dda)"+(lastCum!=null?" "+Math.round(lastCum):""),PADL+2,y0+2);
+// 十字線輔助：水平虛線 + 左軸數值標籤
+function hLine(ctx,W,y){ ctx.save(); ctx.strokeStyle="rgba(255,255,255,0.26)"; ctx.setLineDash([4,3]); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(PADL,y); ctx.lineTo(W-PADR,y); ctx.stroke(); ctx.restore(); }
+function axisTag(ctx,txt,y,col){ ctx.save(); ctx.font="10px sans-serif"; const w=ctx.measureText(txt).width+8, x0=Math.max(0,PADL-w-1); ctx.fillStyle=col||"#f5a524"; ctx.fillRect(x0,y-8,w,16); ctx.fillStyle="#000"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(txt,x0+w/2,y); ctx.restore(); }
+// 主力/投信/外資買賣超共用：淨買超柱 + 累計庫存線；回傳選取棒的十字線資訊(y/txt/col)。
+function drawFlow(ctx,zone,start,end,xOf,bw,W,idx,netArr,cumArr,title,emptyMsg,cumCol){
+  const y0=zone.y0, y1=zone.y1, hh=(y1-y0-4)/2, mid=Math.round((y0+y1)/2);
+  ctx.strokeStyle="rgba(255,255,255,0.1)"; ctx.beginPath(); ctx.moveTo(PADL,mid); ctx.lineTo(W-PADR,mid); ctx.stroke();
+  let any=false, nmax=1e-9; for(let i=start;i<end;i++){ const v=netArr[i]; if(v!=null){any=true; nmax=Math.max(nmax,Math.abs(v));} }
+  if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(emptyMsg,(PADL+W-PADR)/2,mid);
+    ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(title,PADL+2,y0+2); return null; }
+  const nbY=(v)=> mid - v/nmax*hh;
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("±"+Math.round(nmax)+"張",PADL-6,y0+8);
+  for(let i=start;i<end;i++){ const v=netArr[i]; if(v==null||v===0)continue; const x=xOf(i), y=nbY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.85)":"rgba(34,197,94,.85)"; const bodyW=Math.max(bw*0.6,1); ctx.fillRect(x-bodyW/2,Math.min(y,mid),bodyW,Math.abs(y-mid)||1); }
+  let cmin=Infinity,cmax=-Infinity; for(let i=start;i<end;i++){ const v=cumArr[i]; if(v!=null){cmin=Math.min(cmin,v);cmax=Math.max(cmax,v);} }
+  if(cmin<cmax){ const cY=(v)=> y1-2 - (v-cmin)/(cmax-cmin)*(y1-y0-4); ctx.strokeStyle=cumCol; ctx.lineWidth=1.6; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=cumArr[i]; if(v==null){st=false;continue;} const x=xOf(i),y=cY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); }
+  ctx.fillStyle=cumCol; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(title,PADL+2,y0+2);
+  const nv=netArr[idx]; return (nv!=null&&idx>=start&&idx<end)?{y:nbY(nv),txt:(nv>=0?"+":"")+Math.round(nv),col:nv>=0?"#fb3b41":"#1ec77a"}:null;
+}
+function drawMForce(ctx,L,start,end,xOf,bw,W,idx){
+  return drawFlow(ctx,L.macd,start,end,xOf,bw,W,idx,CH.mnet,CH.mcum,"主力買賣超(柱) ▏累計(橘線)","此區間無主力買賣超資料（三大法人約近一年）","#f5a524");
+}
+function drawVolume(ctx,L,start,end,xOf,bw,W,idx){
+  let vmax=0; for(let i=start;i<end;i++){ vmax=Math.max(vmax,CH.bars[i].v); VOL_MAS.forEach(m=>{const v=CH.ind.vma[m][i]; if(v!=null)vmax=Math.max(vmax,v);}); }
+  vmax=vmax||1; const vY=(v)=> L.vol.y1 - v/vmax*(L.vol.y1-L.vol.y0-4);
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText(Math.round(vmax)+"張",PADL-6,L.vol.y0+8);
+  for(let i=start;i<end;i++){ const b=CH.bars[i], x=xOf(i), up=b.c>=b.o; ctx.fillStyle=up?"rgba(255,77,79,.75)":"rgba(34,197,94,.75)"; const bodyW=Math.max(bw*0.6,1), y=vY(b.v); ctx.fillRect(x-bodyW/2,y,bodyW,L.vol.y1-y); }
+  ctx.lineWidth=1.3; VOL_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.vma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("成交量",PADL+2,L.vol.y0+2);
+  const b=CH.bars[idx]; return (b&&idx>=start&&idx<end)?{y:vY(b.v),txt:Math.round(b.v)+"張",col:"#8aa0b6"}:null;
+}
+function drawBig400(ctx,L,start,end,xOf,bw,W,idx){
+  const y0=L.vol.y0, y1=L.vol.y1;
+  let any=false, vmin=Infinity, vmax=-Infinity;
+  for(let i=start;i<end;i++){ const v=CH.big[i]; if(v!=null){any=true; vmin=Math.min(vmin,v); vmax=Math.max(vmax,v);} }
+  if(!any){ const mid=Math.round((y0+y1)/2); ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("此區間無集保大戶資料（約近一年・週更新）",(PADL+W-PADR)/2,mid);
+    ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("400張大戶持股%",PADL+2,y0+2); return null; }
+  if(vmax-vmin<0.4){ vmin-=0.4; vmax+=0.4; } const pad=(vmax-vmin)*0.12||0.2; vmin-=pad; vmax+=pad;
+  const gY=(v)=> y1-3 - (v-vmin)/(vmax-vmin)*(y1-y0-8);
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText(vmax.toFixed(1)+"%",PADL-6,y0+8); ctx.fillText(vmin.toFixed(1)+"%",PADL-6,y1-6);
+  ctx.strokeStyle="#c084fc"; ctx.lineWidth=1.7; ctx.beginPath(); let st=false;
+  for(let i=start;i<end;i++){ const v=CH.big[i]; if(v==null){st=false;continue;} const x=xOf(i),y=gY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke();
+  ctx.fillStyle="#c084fc"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("400張大戶持股%（週）",PADL+2,y0+2);
+  const gv=CH.big[idx]; return (gv!=null&&idx>=start&&idx<end)?{y:gY(gv),txt:gv.toFixed(1)+"%",col:"#c084fc"}:null;
+}
+function drawMACD(ctx,L,start,end,xOf,bw,W,idx){
+  const {dif,dea,osc}=CH.ind.macd; let mmax=1e-9; for(let i=start;i<end;i++){ [dif[i],dea[i],osc[i]].forEach(v=>{if(v!=null)mmax=Math.max(mmax,Math.abs(v));}); }
+  const mMid=(L.macd.y0+L.macd.y1)/2, mH=(L.macd.y1-L.macd.y0-4)/2, mY=(v)=> mMid - v/mmax*mH;
+  ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mMid); ctx.lineTo(W-PADR,mMid); ctx.stroke();
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("MACD(12,26,9)",PADL+2,L.macd.y0+2);
+  for(let i=start;i<end;i++){ const v=osc[i]; if(v==null)continue; const x=xOf(i), y=mY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.8)":"rgba(34,197,94,.8)"; const bodyW=Math.max(bw*0.5,1); ctx.fillRect(x-bodyW/2,Math.min(y,mMid),bodyW,Math.abs(y-mMid)||1); }
+  const dl=(arr,col)=>{ ctx.strokeStyle=col; ctx.lineWidth=1.3; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=arr[i]; if(v==null){st=false;continue;} const x=xOf(i),y=mY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); };
+  dl(dif,"#e8c34a"); dl(dea,"#4d9fff");
+  const ov=osc[idx]; return (ov!=null&&idx>=start&&idx<end)?{y:mY(ov),txt:ov.toFixed(2),col:ov>=0?"#fb3b41":"#1ec77a"}:null;
+}
+// RSI / KD 共用：0~100 區間 + 參考線 + 雙線
+function drawBand(ctx,L,start,end,xOf,idx,arrA,arrB,colA,colB,levels,title,valArr,valCol){
+  const y0=L.macd.y0, y1=L.macd.y1, gY=(v)=> y1-2 - v/100*(y1-y0-4), xR=xOf(end-1)+20;
+  levels.forEach(p=>{ ctx.strokeStyle=p[1]; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(PADL,gY(p[0])); ctx.lineTo(xR,gY(p[0])); ctx.stroke(); });
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText(""+levels[0][0],PADL-6,gY(levels[0][0])); ctx.fillText(""+levels[levels.length-1][0],PADL-6,gY(levels[levels.length-1][0]));
+  const dl=(arr,col)=>{ ctx.strokeStyle=col; ctx.lineWidth=1.4; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=arr[i]; if(v==null){st=false;continue;} const x=xOf(i),y=gY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); };
+  dl(arrB,colB); dl(arrA,colA);
+  ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(title,PADL+2,y0+2);
+  const vv=valArr[idx]; return (vv!=null&&idx>=start&&idx<end)?{y:gY(vv),txt:vv.toFixed(1),col:valCol}:null;
+}
+function drawRSI(ctx,L,start,end,xOf,bw,W,idx){
+  return drawBand(ctx,L,start,end,xOf,idx,CH.ind.rsi6,CH.ind.rsi,"#e8c34a","#4d9fff",
+    [[70,"rgba(255,77,79,0.22)"],[50,"rgba(255,255,255,0.1)"],[30,"rgba(34,197,94,0.22)"]],"RSI 6(黃)/14(藍)",CH.ind.rsi,"#4d9fff");
+}
+function drawKD(ctx,L,start,end,xOf,bw,W,idx){
+  return drawBand(ctx,L,start,end,xOf,idx,CH.ind.kd.k,CH.ind.kd.d,"#e8c34a","#4d9fff",
+    [[80,"rgba(255,77,79,0.22)"],[50,"rgba(255,255,255,0.1)"],[20,"rgba(34,197,94,0.22)"]],"KD 9,3,3（K黃/D藍）",CH.ind.kd.k,"#e8c34a");
 }
 function drawChart(){
   const cv=document.getElementById("chartCanvas"), box=cv.parentElement, W=box.clientWidth, H=box.clientHeight, dpr=window.devicePixelRatio||1;
@@ -1434,59 +1552,37 @@ function drawChart(){
   PRICE_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.ma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=pY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
   const N=CH.bars.length;
   PRICE_MAS.forEach(m=>{ const ki=(N-1)-(m-1); if(ki<start||ki>=end)return; const x=xOf(ki), y=L.price.y1-3; ctx.fillStyle=MACOLOR[m]; ctx.beginPath(); ctx.moveTo(x,y-7); ctx.lineTo(x-4,y); ctx.lineTo(x+4,y); ctx.closePath(); ctx.fill(); });
-  if(CH.volMode==="vol"){
-    let vmax=0; for(let i=start;i<end;i++){ vmax=Math.max(vmax,CH.bars[i].v); VOL_MAS.forEach(m=>{const v=CH.ind.vma[m][i]; if(v!=null)vmax=Math.max(vmax,v);}); }
-    vmax=vmax||1; const vY=(v)=> L.vol.y1 - v/vmax*(L.vol.y1-L.vol.y0-4);
-    ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText(Math.round(vmax)+"張",PADL-6,L.vol.y0+8);
-    for(let i=start;i<end;i++){ const b=CH.bars[i], x=xOf(i), up=b.c>=b.o; ctx.fillStyle=up?"rgba(255,77,79,.75)":"rgba(34,197,94,.75)"; const bodyW=Math.max(bw*0.6,1), y=vY(b.v); ctx.fillRect(x-bodyW/2,y,bodyW,L.vol.y1-y); }
-    ctx.lineWidth=1.3; VOL_MAS.forEach(m=>{ ctx.strokeStyle=MACOLOR[m]; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.ind.vma[m][i]; if(v==null){st=false;continue;} const x=xOf(i),y=vY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); });
-    ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("成交量",PADL+2,L.vol.y0+2);
-  } else {
-    // 投信買賣超 bars（紅買綠賣）+ 投信庫存(累計)線
-    const y0=L.vol.y0, y1=L.vol.y1, hh=y1-y0-4, midY=Math.round((y0+y1)/2);
-    let any=false, nmax=1e-9; for(let i=start;i<end;i++){ const v=CH.tnet[i]; if(v!=null){any=true; nmax=Math.max(nmax,Math.abs(v));} }
-    ctx.strokeStyle="rgba(255,255,255,0.1)"; ctx.beginPath(); ctx.moveTo(PADL,midY); ctx.lineTo(W-PADR,midY); ctx.stroke();
-    if(!any){ ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("此區間無投信資料（投信約近一年）",(PADL+W-PADR)/2,midY); }
-    else{
-      const nbY=(v)=> midY - v/nmax*(hh/2);
-      ctx.fillStyle="#5e6f86"; ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("±"+Math.round(nmax)+"張",PADL-6,y0+8);
-      for(let i=start;i<end;i++){ const v=CH.tnet[i]; if(v==null||v===0)continue; const x=xOf(i), y=nbY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.85)":"rgba(34,197,94,.85)"; const bodyW=Math.max(bw*0.6,1); ctx.fillRect(x-bodyW/2,Math.min(y,midY),bodyW,Math.abs(y-midY)||1); }
-      let cmin=Infinity,cmax=-Infinity; for(let i=start;i<end;i++){ const v=CH.tcum[i]; if(v!=null){cmin=Math.min(cmin,v);cmax=Math.max(cmax,v);} }
-      if(cmin<cmax){ const cY=(v)=> y1-2 - (v-cmin)/(cmax-cmin)*(hh); ctx.strokeStyle="#f5c518"; ctx.lineWidth=1.6; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=CH.tcum[i]; if(v==null){st=false;continue;} const x=xOf(i),y=cY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); }
-      ctx.fillStyle="#f5c518"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText("投信買賣超 ▏庫存(黃線)",PADL+2,y0+2);
-    }
-  }
-  if(CH.macdMode==="mforce"){ drawMForce(ctx,L,start,end,xOf,bw,W); }
-  else {
-  const {dif,dea,osc}=CH.ind.macd; let mmax=1e-9; for(let i=start;i<end;i++){ [dif[i],dea[i],osc[i]].forEach(v=>{if(v!=null)mmax=Math.max(mmax,Math.abs(v));}); }
-  const mMid=(L.macd.y0+L.macd.y1)/2, mH=(L.macd.y1-L.macd.y0-4)/2, mY=(v)=> mMid - v/mmax*mH;
-  ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.beginPath(); ctx.moveTo(PADL,mMid); ctx.lineTo(W-PADR,mMid); ctx.stroke();
-  ctx.fillStyle="#5e6f86"; ctx.textAlign="left"; ctx.fillText("MACD(12,26,9)",PADL+2,L.macd.y0+9);
-  for(let i=start;i<end;i++){ const v=osc[i]; if(v==null)continue; const x=xOf(i), y=mY(v); ctx.fillStyle=v>=0?"rgba(255,77,79,.8)":"rgba(34,197,94,.8)"; const bodyW=Math.max(bw*0.5,1); ctx.fillRect(x-bodyW/2,Math.min(y,mMid),bodyW,Math.abs(y-mMid)||1); }
-  const dl=(arr,col)=>{ ctx.strokeStyle=col; ctx.lineWidth=1.3; ctx.beginPath(); let st=false; for(let i=start;i<end;i++){ const v=arr[i]; if(v==null){st=false;continue;} const x=xOf(i),y=mY(v); if(!st){ctx.moveTo(x,y);st=true;} else ctx.lineTo(x,y);} ctx.stroke(); };
-  dl(dif,"#e8c34a"); dl(dea,"#4d9fff");
-  }
+  // ===== 中間副圖：量 / 投信 / 外資 / 400張大戶（上方按鈕切換）=====
+  let crossVol=null;
+  if(CH.volMode==="inst"){ crossVol=drawFlow(ctx,L.vol,start,end,xOf,bw,W,idx,CH.tnet,CH.tcum,"投信買賣超 ▏庫存(黃線)","此區間無投信資料（投信約近一年）","#f5c518"); }
+  else if(CH.volMode==="foreign"){ crossVol=drawFlow(ctx,L.vol,start,end,xOf,bw,W,idx,CH.fnet,CH.fcum,"外資買賣超 ▏庫存(黃線)","此區間無外資資料（外資約近一年）","#f5c518"); }
+  else if(CH.volMode==="big400"){ crossVol=drawBig400(ctx,L,start,end,xOf,bw,W,idx); }
+  else { crossVol=drawVolume(ctx,L,start,end,xOf,bw,W,idx); }
+  // ===== 下圖：MACD / RSI / KD / 主力（上方按鈕切換）=====
+  let crossMacd=null;
+  if(CH.macdMode==="mforce"){ crossMacd=drawMForce(ctx,L,start,end,xOf,bw,W,idx); }
+  else if(CH.macdMode==="rsi"){ crossMacd=drawRSI(ctx,L,start,end,xOf,bw,W,idx); }
+  else if(CH.macdMode==="kd"){ crossMacd=drawKD(ctx,L,start,end,xOf,bw,W,idx); }
+  else { crossMacd=drawMACD(ctx,L,start,end,xOf,bw,W,idx); }
   ctx.fillStyle="#5e6f86"; ctx.textAlign="center"; ctx.textBaseline="top";
   const ticks=Math.min(6,n); for(let t=0;t<ticks;t++){ const i=start+Math.floor((n-1)*t/(ticks-1||1)); ctx.fillText(CH.bars[i].d.slice(2),xOf(i),L.dateY+4); }
+  // ===== 十字線（點擊鎖定 / 懸停）：垂直線貫穿三圖 + 各圖對應水平數值線 =====
   if(idx>=start&&idx<end){
     const x=xOf(idx);
     ctx.font="11px sans-serif";
-    ctx.strokeStyle="rgba(255,255,255,0.32)"; ctx.setLineDash([4,3]); ctx.lineWidth=1;
-    // 垂直索引線：貫穿主圖＋副圖(量)＋下圖(MACD/主力)
+    ctx.strokeStyle="rgba(255,255,255,0.34)"; ctx.setLineDash([4,3]); ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,L.dateY); ctx.stroke();
-    // 水平價格線：滑鼠/手指 Y 落在主圖內就用該 Y(讀任意價)，否則用當天收盤
+    ctx.setLineDash([]);
+    // 主圖水平價格線：滑鼠/手指 Y 落在主圖內就讀該 Y 的價位，否則用選取棒收盤
     let hy, hp;
     if(CH.hoverY!=null && CH.hoverY>=L.price.y0 && CH.hoverY<=L.price.y1){
       hy=CH.hoverY; hp=pmax-(hy-(L.price.y0+4))/((L.price.y1-L.price.y0-8))*(pmax-pmin);
     } else { hp=CH.bars[idx].c; hy=pY(hp); }
-    ctx.beginPath(); ctx.moveTo(PADL,hy); ctx.lineTo(W-PADR,hy); ctx.stroke();
-    ctx.setLineDash([]);
-    // 價格標籤(左軸)
-    const ptxt=hp.toFixed(2), pw=ctx.measureText(ptxt).width+8;
-    ctx.fillStyle="#f5a524"; ctx.fillRect(Math.max(0,PADL-pw-1), hy-8, pw, 16);
-    ctx.fillStyle="#000"; ctx.textAlign="center"; ctx.textBaseline="middle";
-    ctx.fillText(ptxt, Math.max(0,PADL-pw-1)+pw/2, hy);
-    // 日期標籤(底部)
+    hLine(ctx,W,hy); axisTag(ctx,hp.toFixed(2),hy);
+    // 副圖 / 下圖：對應選取棒數值的水平線 + 左軸標籤
+    if(crossVol){ hLine(ctx,W,crossVol.y); axisTag(ctx,crossVol.txt,crossVol.y,crossVol.col); }
+    if(crossMacd){ hLine(ctx,W,crossMacd.y); axisTag(ctx,crossMacd.txt,crossMacd.y,crossMacd.col); }
+    // 底部日期標籤
     const dtxt=CH.bars[idx].d, dw=ctx.measureText(dtxt).width+10;
     const dx=Math.max(PADL, Math.min(W-PADR-dw, x-dw/2));
     ctx.fillStyle="#f5a524"; ctx.fillRect(dx, L.dateY+2, dw, 15);
@@ -1513,11 +1609,27 @@ function updateReadout(i){
     const tn=CH.tnet[i], tc=CH.tcum[i];
     if(tn!=null) h+=it("投信", sgn(tn)+" 張", tn>=0?UP:DOWN, 1);
     if(tc!=null) h+=it("投信庫存", Math.round(tc)+" 張", "#f5c518", 1);
+  } else if(CH.volMode==="foreign"){
+    const fn=CH.fnet[i], fc=CH.fcum[i];
+    if(fn!=null) h+=it("外資", sgn(fn)+" 張", fn>=0?UP:DOWN, 1);
+    if(fc!=null) h+=it("外資庫存", Math.round(fc)+" 張", "#f5c518", 1);
+  } else if(CH.volMode==="big400"){
+    const gv=CH.big[i];
+    if(gv!=null) h+=it("400張大戶", gv.toFixed(2)+"%", "#c084fc", 1);
   }
   if(CH.macdMode==="mforce"){
     const mn=CH.mnet[i], mc=CH.mcum[i];
     if(mn!=null) h+=it("主力", sgn(mn)+" 張", mn>=0?UP:DOWN, 1);
     if(mc!=null) h+=it("主力累計", sgn(mc)+" 張", mc>=0?UP:DOWN, 1);
+  } else if(CH.macdMode==="rsi"){
+    const r6=CH.ind.rsi6[i], r14=CH.ind.rsi[i];
+    if(r6!=null) h+=it("RSI6", r6.toFixed(1), "#e8c34a", 1);
+    if(r14!=null) h+=it("RSI14", r14.toFixed(1), "#4d9fff", 1);
+  } else if(CH.macdMode==="kd"){
+    const kk=CH.ind.kd.k[i], dd=CH.ind.kd.d[i];
+    if(kk!=null) h+=it("K", kk.toFixed(1), "#e8c34a", 1);
+    if(dd!=null) h+=it("D", dd.toFixed(1), "#4d9fff", 1);
+    if(kk!=null&&dd!=null) h+=it("K-D", (kk-dd).toFixed(1), (kk-dd)>=0?UP:DOWN, 1);
   } else if(CH.ind.macd){
     const dif=CH.ind.macd.dif[i], dea=CH.ind.macd.dea[i], osc=CH.ind.macd.osc[i];
     if(dif!=null) h+=it("DIF", dif.toFixed(2), "#e8c34a", 1);
@@ -1533,30 +1645,30 @@ function toggleReadout(){
 }
 const canvas=document.getElementById("chartCanvas");
 function cx(clientX){ const r=canvas.getBoundingClientRect(); return clientX-r.left; }
-function scrubAt(x,y){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; CH.hoverY=(y==null?null:y); drawChart(); }
-canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX, e.offsetY); });
-canvas.addEventListener("mouseleave",()=>{ CH.hover=null; CH.hoverY=null; drawChart(); });
-canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; drawChart(); },{passive:false});
+// hover=即時顯示位置；lock=點擊/點按鎖定的位置（滑鼠移開後仍保留）。scrubAt(...,true) 會同時鎖定。
+function scrubAt(x,y,lock){ const {start,end}=visRange(), n=end-start, bw=(canvas.parentElement.clientWidth-PADL-PADR)/n; let i=start+Math.floor((x-PADL)/bw); i=Math.max(start,Math.min(end-1,i)); CH.hover=i; CH.hoverY=(y==null?null:y); if(lock){ CH.lock=i; CH.lockY=CH.hoverY; } drawChart(); }
+canvas.addEventListener("mousemove",e=>{ if(!CH.bars.length)return; scrubAt(e.offsetX, e.offsetY, false); });
+canvas.addEventListener("mouseleave",()=>{ CH.hover=CH.lock; CH.hoverY=CH.lockY; drawChart(); });   // 移開→回到鎖定棒（未鎖定則回最新棒）
+canvas.addEventListener("wheel",e=>{ if(!CH.bars.length)return; e.preventDefault(); const N=CH.bars.length, step=Math.max(2,Math.round(CH.count*0.12)); CH.count=Math.max(20,Math.min(N, CH.count+(e.deltaY>0?step:-step))); if(CH.offset>N-CH.count)CH.offset=Math.max(0,N-CH.count); CH.hover=null; CH.lock=null; CH.lockY=null; drawChart(); },{passive:false});
 let drag=null, suppressClick=false;
 canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,off:CH.offset}; });
 window.addEventListener("mouseup",()=>{ drag=null; });
-window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; suppressClick=true; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
-canvas.addEventListener("click",e=>{ if(suppressClick){suppressClick=false;return;} if(!CH.bars.length)return; const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(e.offsetY>=L.vol.y0&&e.offsetY<=L.vol.y1) toggleVol(); else if(e.offsetY>=L.macd.y0&&e.offsetY<=L.macd.y1) toggleMacd(); });
+window.addEventListener("mousemove",e=>{ if(!drag||!CH.bars.length)return; if(Math.abs(e.clientX-drag.x)>4)suppressClick=true; const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,CH.bars.length), dB=Math.round((e.clientX-drag.x)/bw), N=CH.bars.length; CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), drag.off+dB)); drawChart(); });
+// 點擊＝在該日期鎖定十字線（副圖/下圖切換改用上方按鈕）
+canvas.addEventListener("click",e=>{ if(suppressClick){suppressClick=false;return;} if(!CH.bars.length)return; scrubAt(e.offsetX, e.offsetY, true); });
 let pinch=null, tap=null;
 function tdist(t){ return Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY); }
 function tmid(t){ return cx((t[0].clientX+t[1].clientX)/2); }
 canvas.addEventListener("touchstart",e=>{ if(!CH.bars.length)return;
-  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); pinch=null; }
+  if(e.touches.length===1){ const r=canvas.getBoundingClientRect(); tap={x:e.touches[0].clientX, y:e.touches[0].clientY-r.top, t:Date.now(), moved:false}; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top, true); pinch=null; }
   else if(e.touches.length>=2){ tap=null; pinch={d:tdist(e.touches),off:CH.offset,cnt:CH.count,mid:tmid(e.touches)}; CH.hover=null; CH.hoverY=null; } },{passive:false});
 canvas.addEventListener("touchmove",e=>{ if(!CH.bars.length)return; e.preventDefault();
-  if(e.touches.length===1&&!pinch){ const r=canvas.getBoundingClientRect(); if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top); }
+  if(e.touches.length===1&&!pinch){ const r=canvas.getBoundingClientRect(); if(tap&&Math.abs(e.touches[0].clientX-tap.x)>8) tap.moved=true; scrubAt(cx(e.touches[0].clientX), e.touches[0].clientY-r.top, true); }
   else if(e.touches.length>=2&&pinch){ const nd=tdist(e.touches), ratio=pinch.d/(nd||1), N=CH.bars.length;
     CH.count=Math.max(20,Math.min(N,Math.round(pinch.cnt*ratio)));
     const bw=(canvas.parentElement.clientWidth-PADL-PADR)/Math.min(CH.count,N), dB=Math.round((tmid(e.touches)-pinch.mid)/bw);
     CH.offset=Math.max(0,Math.min(N-Math.min(CH.count,N), pinch.off+dB)); drawChart(); } },{passive:false});
-canvas.addEventListener("touchend",e=>{ if(e.touches.length===0){ pinch=null;
-  if(tap&&!tap.moved&&(Date.now()-tap.t)<300){ const box=canvas.parentElement, L=layout(box.clientWidth,box.clientHeight); if(tap.y>=L.vol.y0&&tap.y<=L.vol.y1) toggleVol(); else if(tap.y>=L.macd.y0&&tap.y<=L.macd.y1) toggleMacd(); }
-  tap=null; } },{passive:false});
+canvas.addEventListener("touchend",e=>{ if(e.touches.length===0){ pinch=null; tap=null; } },{passive:false});
 window.addEventListener("resize",()=>{ if(document.getElementById("cv").classList.contains("open"))drawChart(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
 
@@ -1568,7 +1680,7 @@ function renderSug(q){
   const idx=STKIDX||[], ql=q.toLowerCase(), hit=[];
   for(const e of idx){ if(e[0].toLowerCase().includes(ql)||(e[1]||"").toLowerCase().includes(ql)){ hit.push(e); if(hit.length>=14)break; } }
   if(!hit.length){ box.innerHTML='<div class="sugitem dim">查無此股（資料更新後才會出現新上市股）</div>'; box.classList.add("on"); return; }
-  box.innerHTML=hit.map(e=>`<div class="sugitem" onclick="pickStock('${e[0]}')"><span class="sc">${e[0]}</span><span class="sn">${e[1]||""}${indTag(e[0])}</span><span class="sm">${e[2]||""}</span></div>`).join("");
+  box.innerHTML=hit.map(e=>`<div class="sugitem" onclick="pickStock('${e[0]}')"><span class="sc">${e[0]}</span><span class="sn">${e[1]||""}${indTag(e[0])}${conceptInline(e[0])}</span><span class="sm">${e[2]||""}</span></div>`).join("");
   box.classList.add("on");
 }
 function pickStock(sid){ const box=document.getElementById("sugbox"); box.innerHTML=""; box.classList.remove("on"); const q=document.getElementById("stkq"); if(q)q.value=""; openChart(sid); }
