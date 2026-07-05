@@ -776,45 +776,63 @@ def update_shareholding(con, token):
 
 
 def update_issued_shares(con, token):
-    """發行張數（供個股K線表頭『發行 / 流通張數』）。
-    來源：FinMind TaiwanStockShareholding 的 NumberOfSharesIssued（發行股數）。
-    只需最新一筆：抓最近一段全市場、每檔取最新日，存入 stockmeta 表。
-    1~2 次請求，失敗不影響主流程。流通張數 = 發行 ×(1−400張大戶%) 於網頁端計算。"""
+    """發行張數（表頭『發行 / 流通張數』）。
+    來源＝『集保股權分散 TaiwanStockHoldingSharesPer』各級距股數：取 'total'(合計) 列的 unit，
+    無 total 列則加總各級距(排除 total/差異)＝集保總股數 ≈ 發行股數。與 400張大戶% 同源同分母，
+    流通張數計算最一致；此 dataset 全市場抓取已驗證可用（400大戶即由它產生）。
+    只取最新一週、每檔一次。★刻意在深度回補『之前』呼叫，確保 FinMind 額度尚足（回補會大量用量、
+    易把後面的請求擠到限流而失敗）。1~2 次請求、失敗不影響主流程；發行數近乎不變，存 DB 快取後長期有效。
+    流通張數 = 發行 ×(1−400張大戶%) 於網頁端計算。"""
     con.execute("CREATE TABLE IF NOT EXISTS stockmeta("
                 "stock_id TEXT PRIMARY KEY, issued_lots REAL, updated TEXT)")
     con.commit()
     if not token:
         print("發行張數：無 FinMind token，略過。")
         return
-    latest = con.execute("SELECT MAX(date) FROM price").fetchone()[0]
-    base = dt.date.fromisoformat(latest) if latest else dt.date.today()
-    start = (base - dt.timedelta(days=20)).isoformat()
+    # 探測最新可用週（用 2330，1 call）
     try:
-        df = finmind_get("TaiwanStockShareholding", token, max_retry=3, start_date=start)
+        probe = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3,
+                            data_id="2330", start_date=HISTORY_START)
+    except Exception as e:
+        print(f"發行張數：探測失敗，略過（{e}）。")
+        return
+    if probe is None or probe.empty or "date" not in probe.columns:
+        print("發行張數：探測無資料，略過。")
+        return
+    d = sorted(str(x) for x in probe["date"].unique())[-1]
+    # 全市場最新一週（1 call）
+    try:
+        df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2,
+                         start_date=d, end_date=d)
     except Exception as e:
         print(f"發行張數：抓取失敗，略過（{e}）。")
         return
-    if (df is None or df.empty or "NumberOfSharesIssued" not in df.columns
-            or "stock_id" not in df.columns or "date" not in df.columns):
+    if (df is None or df.empty or "unit" not in df.columns
+            or "stock_id" not in df.columns or "HoldingSharesLevel" not in df.columns):
         print("發行張數：無資料或缺欄位，略過。")
         return
     df = df.copy()
     df["_sid"] = df["stock_id"].astype(str)
-    df["_iss"] = pd.to_numeric(df["NumberOfSharesIssued"], errors="coerce")
-    df = df.dropna(subset=["_iss"]).sort_values("date")   # 全域按日排序 → 每檔取最新
+    df["_lvl"] = df["HoldingSharesLevel"].astype(str)
+    df["_unit"] = pd.to_numeric(df["unit"], errors="coerce").fillna(0)
     rows = []
     for sid, g in df.groupby("_sid"):
         if len(sid) != 4 or not sid.isdigit():   # 普通股 + 00xx ETF；排除權證等
             continue
-        iss = float(g["_iss"].iloc[-1])
-        d = str(g["date"].iloc[-1])
-        if iss > 0:
-            rows.append((sid, round(iss / 1000.0), d))
+        low = g["_lvl"].str.lower()
+        is_total = low.str.contains("total") | g["_lvl"].str.contains("合計")
+        if is_total.any():
+            shares = float(g.loc[is_total, "_unit"].max())
+        else:   # 無 total 列：加總各級距（排除 total/合計/差異）
+            keep = ~(is_total | g["_lvl"].str.contains("差異"))
+            shares = float(g.loc[keep, "_unit"].sum())
+        if shares > 0:
+            rows.append((sid, round(shares / 1000.0), d))
     if rows:
         con.executemany(
             "INSERT OR REPLACE INTO stockmeta(stock_id,issued_lots,updated) VALUES (?,?,?)", rows)
         con.commit()
-    print(f"發行張數更新完成：{len(rows)} 檔。")
+    print(f"發行張數更新完成：{len(rows)} 檔（集保總股數，週 {d}）。")
 
 
 def build_trust_candidates(con):
@@ -1182,6 +1200,13 @@ def main():
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
 
+    # 發行張數（表頭發行/流通張數）：★放在深度回補『之前』，確保 FinMind 額度尚足（回補會大量用量、
+    # 易把後面的請求擠到限流失敗，先前 deep_backfill 就因此讓表頭發行/流通張數空白）；失敗不影響主流程
+    try:
+        update_issued_shares(con, CONFIG["FINMIND_TOKEN"])
+    except Exception as e:
+        print(f"發行張數資料失敗（不影響主流程）：{e}")
+
     # 主力/外資/投信『深度歷史』回補到 HISTORY_START（FinMind，分批；失敗不影響主流程）
     try:
         backfill_inst_history(con, CONFIG["FINMIND_TOKEN"])
@@ -1193,12 +1218,6 @@ def main():
         update_shareholding(con, CONFIG["FINMIND_TOKEN"])
     except Exception as e:
         print(f"集保大戶資料失敗（不影響主流程）：{e}")
-
-    # 發行張數（供個股K線表頭發行/流通張數；失敗不影響主流程）
-    try:
-        update_issued_shares(con, CONFIG["FINMIND_TOKEN"])
-    except Exception as e:
-        print(f"發行張數資料失敗（不影響主流程）：{e}")
 
     # 資金流向 TOP10（大戶=三大法人合計 / 投信；當日 + 近5/20/60日）
     try:
