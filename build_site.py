@@ -881,6 +881,9 @@ const EXTRAS  = /*__EXTRAS__*/null;
 const FLOWS   = /*__FLOWS__*/null;
 const INDUSTRY= /*__INDUSTRY__*/null;
 const CONCEPTS= /*__CONCEPTS__*/null;   // {sid: ["ABF載板","被動元件",...]}（概念股標籤）
+// 建置版本：每次重建都變（來自產生時間），給逐檔資料檔加 ?v= 版本參數，
+// 避免瀏覽器/CDN 送出舊的快取 JSON（否則重新部署後主力/發行等新資料看不到，需手動強制重整）。
+const BUILD_V=("__GENTIME__").replace(/[^0-9]/g,"")||"0";
 const DB_OK   = /*__DBOK__*/false;
 /* 產業類型標籤：股名下方小字。indLabel 回字串，indTag 回 HTML(含樣式)。 */
 function indLabel(sid){ try{ return (INDUSTRY&&INDUSTRY[sid])?INDUSTRY[sid]:""; }catch(e){ return ""; } }
@@ -994,7 +997,7 @@ async function loadIndustry(){
   if(INDDATA){ renderHeatmap(); return; }
   if(INDLOAD) return; INDLOAD=true;
   try{
-    const r=await fetch("data/industry.json",{cache:"default"});
+    const r=await fetch(`data/industry.json?v=${BUILD_V}`,{cache:"default"});
     if(r.ok) INDDATA=await r.json();
   }catch(e){}
   INDLOAD=false;
@@ -1383,7 +1386,7 @@ function computeInd(bars){
 async function fetchStock(sid){
   if(HISTORY[sid]) return HISTORY[sid];
   try{
-    const res=await fetch(`data/${sid}.json`,{cache:"default"});
+    const res=await fetch(`data/${sid}.json?v=${BUILD_V}`,{cache:"default"});
     if(!res.ok) return null;
     const j=await res.json();
     const n=j.d.length, bars=new Array(n);
@@ -1701,7 +1704,7 @@ document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeChart(); });
 
 /* ⑥ 首頁搜尋任意股 → 抓逐檔資料 → 開 K 線 */
 let STKIDX=null;
-async function loadIndex(){ if(STKIDX)return STKIDX; try{ const r=await fetch("data/_index.json",{cache:"default"}); if(r.ok) STKIDX=await r.json(); }catch(e){} return STKIDX||[]; }
+async function loadIndex(){ if(STKIDX)return STKIDX; try{ const r=await fetch(`data/_index.json?v=${BUILD_V}`,{cache:"default"}); if(r.ok) STKIDX=await r.json(); }catch(e){} return STKIDX||[]; }
 function renderSug(q){
   const box=document.getElementById("sugbox"); if(!q){ box.innerHTML=""; box.classList.remove("on"); return; }
   const idx=STKIDX||[], ql=q.toLowerCase(), hit=[];
