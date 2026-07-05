@@ -23,8 +23,8 @@ r"""
 資料來源：
   台股：twstock.db（price/inst/stock/industry，由 FinMind Sponsor 方案每日更新，與其他分頁同源）、
         output/extras_*.json（官方三大法人 BFI82U、融資融券 MI_MARGN、期交所外資未平倉）。
-  美股/總經/全球：Stooq 免金鑰 CSV 為主來源（對雲端 IP 穩定，不易被限流），
-        yfinance 作缺漏備援；加權指數亦走此雙來源（Stooq ^twse / yfinance ^TWII）。
+  美股/總經/全球：yfinance 為主來源（實測於 GitHub Actions 覆蓋完整、可用），
+        Stooq 免金鑰 CSV 作缺漏備援（供 yfinance 被限流時頂替）；加權指數同此雙來源。
 
 只『讀』DB、只『寫』site/market.html；任何一段資料失敗都以「暫無資料」呈現，
 不會讓整個 pipeline 掛掉。
@@ -436,7 +436,7 @@ def load_extras():
 
 
 # ============================================================
-#  美股 / 總經：Stooq 優先（免金鑰、雲端 IP 穩定）＋ yfinance 備援
+#  美股 / 總經：yfinance 主來源（GH Actions 實測可用）＋ Stooq 備援
 # ============================================================
 US_INDICES = [("^GSPC", "S&P 500"), ("^IXIC", "那斯達克"), ("^DJI", "道瓊工業"),
               ("^SOX", "費城半導體"), ("^RUT", "羅素2000")]
@@ -572,35 +572,44 @@ def _fetch_yf(symbols):
     return out
 
 
-def _normalize_tnx(data, from_stooq):
-    """把 ^TNX 統一成百分比：Stooq(10usy.b) 已是 %；yfinance(^TNX) 為 ×10 需除 10。"""
+def _normalize_tnx(data):
+    """把 ^TNX 統一成百分比。不同來源量級不一（Yahoo 歷來為殖利率×10＝約 44，
+    近期部分回傳已是 4.4；Stooq 10usy.b 為 4.4）。以量級判定：整段序列最大值 >20
+    視為 ×10 型態、統一除以 10；否則已是百分比、原樣保留。"""
     s = data.get("^TNX")
-    if not s or from_stooq:
+    if not s:
         return
-    for k in ("closes", "highs", "lows"):
-        s[k] = [None if v is None else v / 10.0 for v in s[k]]
+    vals = [v for v in s["closes"] if v is not None]
+    if vals and max(vals) > 20:
+        for k in ("closes", "highs", "lows"):
+            s[k] = [None if v is None else v / 10.0 for v in s[k]]
 
 
 def fetch_us(symbols, start_yyyymmdd=None):
-    """美股/總經日線：Stooq 主，yfinance 補缺。回傳 {yahoo_sym: {dates,closes,highs,lows}}。"""
+    """美股/總經日線。主來源 yfinance（實測於 GitHub Actions 可用、覆蓋完整），
+    Stooq 作為缺漏備援（免金鑰、供 yfinance 被限流時頂替）。
+    回傳 {yahoo_sym: {dates,closes,highs,lows}}。"""
     if start_yyyymmdd is None:
         start_yyyymmdd = "20240101"
     out = {}
-    tnx_from_stooq = False
     try:
-        out = _fetch_stooq(symbols, start_yyyymmdd)
-        tnx_from_stooq = "^TNX" in out
+        out = _fetch_yf(symbols)
+        print(f"  [yfinance] 主來源取得 {len(out)} 檔")
     except Exception as e:
-        print(f"Stooq 抓取失敗（改用 yfinance）：{e}")
+        print(f"yfinance 主來源失敗（改用 Stooq）：{e}")
     missing = [s for s in symbols if s not in out]
     if missing:
         try:
-            yout = _fetch_yf(missing)
-            print(f"  [yfinance] 補回 {len(yout)} 檔")
-            out.update(yout)
+            sout = _fetch_stooq(missing, start_yyyymmdd)
+            if sout:
+                print(f"  [stooq] 備援補回 {len(sout)} 檔")
+                out.update(sout)
         except Exception as e:
-            print(f"yfinance 備援失敗：{e}")
-    _normalize_tnx(out, tnx_from_stooq)
+            print(f"Stooq 備援失敗：{e}")
+        still = [s for s in symbols if s not in out]
+        if still:
+            print(f"  兩來源皆未取得：{still}")
+    _normalize_tnx(out)
     return out
 
 
