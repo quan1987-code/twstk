@@ -666,6 +666,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .tags{text-align:left; white-space:nowrap;}
   .tag{display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:500; margin:1px 3px 1px 0; border:1px solid;}
   .foot{text-align:center; color:var(--dim); font-size:11px; margin-top:16px;}
+  .srclink{color:var(--amber); text-decoration:none;} .srclink:hover{text-decoration:underline;}
 
   #cv{position:fixed; inset:0; background:#070b14; z-index:50; display:none; flex-direction:column; padding-top:env(safe-area-inset-top);}
   #cv.open{display:flex;}
@@ -849,7 +850,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="foot">資料：證交所/櫃買 + FinMind + Yahoo ・ 僅供研究，非投資建議</div>
+  <div class="foot">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" class="srclink">FinMind</a>、證交所／櫃買、Yahoo Finance ・ 僅供研究，非投資建議</div>
 </div>
 
 <div id="cv">
@@ -868,6 +869,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <span><i style="background:var(--ma20)"></i>MA20</span><span><i style="background:var(--ma60)"></i>MA60</span>
     <span><i style="background:var(--ma240)"></i>MA240</span><span><i style="background:#8aa0b6"></i>布林20</span>
     <span style="color:var(--dim)">點K棒鎖定十字線（日期／價位＋副圖同步）・ 單指拖移掃描 ・ 雙指縮放 ・ 上方按鈕切換 副圖(量/投信/外資/400張大戶)、下圖(MACD/RSI/KD/主力)</span>
+    <span style="color:var(--dim)">籌碼資料（三大法人／400張大戶／發行張數）資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" class="srclink">FinMind</a></span>
   </div>
   <div class="chartbox"><canvas id="chartCanvas"></canvas></div>
 </div>

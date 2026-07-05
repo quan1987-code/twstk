@@ -904,6 +904,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（處置／分點籌碼／價量・法人）、台灣證交所／櫃買中心 ・ 僅供研究，非投資建議</footer>
 
 <script>
 const $ = id => document.getElementById(id);

@@ -1523,7 +1523,7 @@ TEMPLATE = r"""<!doctype html>
   </section>
 
   <footer>
-    產生時間 <span class="num" id="ftGen">—</span>（台北）・資料來源：FinMind（台股價量/法人/處置）、台灣證交所、期交所、Yahoo Finance（美股/總經）。<br>
+    產生時間 <span class="num" id="ftGen">—</span>（台北）・資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline">FinMind</a>（台股價量/法人/處置）、台灣證交所、期交所、Yahoo Finance（美股/總經）。<br>
     本頁為程式化統計與規則式研判，僅供研究參考，非投資建議；數據可能因來源延遲或缺漏而不完整。
   </footer>
 </div>
