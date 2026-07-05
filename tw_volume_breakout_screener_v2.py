@@ -640,9 +640,10 @@ def update_shareholding(con, token):
     logged_levels = False
     for d in todo:
         try:
-            # 每檔查詢較重、FinMind 限流較兇：max_retry=2 讓被限流的週約 30s 內快速放棄，
-            # 留待下一次 run 補回，避免長時間退避拖住整個 daily 流程。
-            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2, date=d)
+            # 注意：本 dataset 需要 start_date（用 date= 會被 FinMind 回 400「start_date missing」）；
+            # 以 start_date=end_date=d 取「該週全市場」快照。max_retry=2 讓失敗週約 30s 內放棄、下次補。
+            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2,
+                             start_date=d, end_date=d)
         except Exception as e:
             print(f"  集保 {d} 失敗：{e}")
             continue
