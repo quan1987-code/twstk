@@ -2,33 +2,22 @@
 r"""
 輝哥選股（tw_hui_picks.py）
 ================================================================
-兩個「以最近一個交易日」為準的量化濾網，讀共用的 twstock.db（純價量，不需 FinMind token），
+「以最近一個交易日」為準的量化濾網，讀共用的 twstock.db（純價量，不需 FinMind token），
 輸出 site/data/hui.json 與『單一自包含 HTML』site/hui.html。個股列表依「處置股專區」相同的
 概念股分類方式分群排列（概念群在前、無概念退回產業別、未分類最後），並附一頁「公式說明」。
 
-演算法（依使用者提供之專業量化公式實作，強調「持續整理 → 帶量突破 → K棒強度」以濾假突破）：
+共 4 個濾網 ＝ 兩種型態 × 兩個版本：
+  ┌ 均線突破四海遊龍（精簡版，使用者定義）
+  │   1. 收盤站上 5/10/20 三線　2. 當日量 ≥ 前一日 ×1.5　3. 5/10/20 均線糾結滿 10 個交易日
+  ├ 均線突破四海遊龍 AI建議版（研究強化版）
+  │   4 條均線(5/10/20/60)＋時間濾網＋突破最上層均線＋ATR 強勢紅K/跳空＋量以20日均量為基準
+  ├ 盤整突破（精簡版，使用者定義）
+  │   1. 前 20 日區間盤整　2. 當日帶量（≥前一日 ×1.5）突破 20 日箱頂
+  └ 盤整突破 AI建議版（研究強化版）
+      唐奇安箱體(取昨日箱頂)＋時間濾網＋ATR 強勢收高(收盤位置)＋量以20日均量為基準
 
-濾網一：均線突破四海遊龍（MA5/10/20/60 糾結後帶量突破）
-  1. 量化糾結（最大最小相對價差法）：
-       MA_Spread = (max(MA5,MA10,MA20,MA60) − min(...)) / Close ×100%
-  2. 時間濾網（避免只是均線交叉的瞬間）：近 MA_CONV_LOOKBACK 根 K 棒中，
-       至少 MA_CONV_MIN 根滿足 MA_Spread ≤ MA_SPREAD_PCT。
-  3. 突破訊號：收盤站上並突破最上層均線 Close > max(MA5,MA10,MA20,MA60)。
-  4. K棒強度濾網（避免被巴）：實體紅K（Close−Open > ATR×ATR_BODY_MULT）或跳空（Open > 昨高）。
-  5. 量能濾網：Volume > MA(Volume,20) × VOL_MULT。
-
-濾網二：盤整突破（唐奇安箱體 + 帶量突破箱頂）
-  1. 箱體量化：Box_High = Highest(High,N)[1]、Box_Low = Lowest(Low,N)[1]；
-       Box_Width = (Box_High − Box_Low) / Close ×100%。
-  2. 時間濾網：近 BOX_CONSOLI_BARS 根 K 棒中，至少 BOX_CONSOLI_MIN 根之 N 日 Box_Width ≤ BOX_WIDTH_PCT
-       （確保長時間橫盤、而非剛從大波動平復）。
-  3. 突破訊號：Close > Box_High[1]（用昨日箱頂，否則當日新高會同步墊高箱頂而永遠無法突破）。
-  4. K棒強度：實體 Close−Open > ATR×ATR_BODY_MULT 且收盤位置 (Close−Low)/(High−Low) ≥ CLOSE_POS_MIN
-       （收盤貼近當日高、避免長上影線假突破）。
-  5. 量能濾網：Volume > MA(Volume,20) × VOL_MULT。
-
-門檻皆以環境變數可調；公式整理自具公信力之台股量化資料（鉅亨、MoneyDJ、財訊、永豐豐雲學堂、
-QuantPass 等）之「均線糾結突破」「箱型／唐奇安盤整突破」通則。本頁僅供研究，非投資建議。
+公式整理自具公信力之台股量化資料（鉅亨、MoneyDJ、財訊、永豐豐雲學堂、玉山證券、XQ、
+QuantPass 等）之「均線糾結突破」「箱型／唐奇安盤整突破」通則。門檻皆環境變數可調；本頁僅供研究，非投資建議。
 
 用法：
   python tw_hui_picks.py            # 正常（需 twstock.db）
@@ -55,23 +44,34 @@ DB_PATH = "twstock.db"
 OUT_DIR = "site"
 OUT_NAME = "hui.html"
 
-# ---- 可調門檻（環境變數）----
+# ---- AI建議版門檻 ----
 MA_SET = (5, 10, 20, 60)
-MA_SPREAD_PCT = float(os.environ.get("HUI_MA_SPREAD", "0.025") or "0.025")       # 四線價差 ÷ 收盤 ≤ 2.5%
-MA_CONV_LOOKBACK = int(os.environ.get("HUI_MA_CONV_LOOKBACK", "10") or "10")     # 糾結時間濾網回看根數
-MA_CONV_MIN = int(os.environ.get("HUI_MA_CONV_MIN", "8") or "8")                 # 至少幾根達糾結（8/10）
-BOX_LOOKBACK = int(os.environ.get("HUI_BOX_DAYS", "20") or "20")                 # 唐奇安箱體週期 N
-BOX_WIDTH_PCT = float(os.environ.get("HUI_BOX_WIDTH", "0.06") or "0.06")         # 箱幅 ÷ 收盤 ≤ 6%
-BOX_CONSOLI_BARS = int(os.environ.get("HUI_BOX_CONSOLI_BARS", "15") or "15")     # 盤整時間濾網回看根數
-BOX_CONSOLI_MIN = int(os.environ.get("HUI_BOX_CONSOLI_MIN", "13") or "13")       # 至少幾根箱幅達標（13/15）
-VOL_MULT = float(os.environ.get("HUI_VOL_MULT", "1.5") or "1.5")                 # 帶量：今量 ≥ 20日均量 ×1.5
+MA_SPREAD_PCT = float(os.environ.get("HUI_MA_SPREAD", "0.025") or "0.025")
+MA_CONV_LOOKBACK = int(os.environ.get("HUI_MA_CONV_LOOKBACK", "10") or "10")
+MA_CONV_MIN = int(os.environ.get("HUI_MA_CONV_MIN", "8") or "8")
+BOX_LOOKBACK = int(os.environ.get("HUI_BOX_DAYS", "20") or "20")
+BOX_WIDTH_PCT = float(os.environ.get("HUI_BOX_WIDTH", "0.06") or "0.06")
+BOX_CONSOLI_BARS = int(os.environ.get("HUI_BOX_CONSOLI_BARS", "15") or "15")
+BOX_CONSOLI_MIN = int(os.environ.get("HUI_BOX_CONSOLI_MIN", "13") or "13")
+VOL_MULT = float(os.environ.get("HUI_VOL_MULT", "1.5") or "1.5")               # AI版：今量 ≥ 20日均量 ×1.5
 VOL_AVG_DAYS = int(os.environ.get("HUI_VOL_AVG_DAYS", "20") or "20")
 ATR_PERIOD = int(os.environ.get("HUI_ATR_PERIOD", "14") or "14")
-ATR_BODY_MULT = float(os.environ.get("HUI_ATR_BODY_MULT", "1.0") or "1.0")       # 突破實體 ≥ ATR ×1.0
-CLOSE_POS_MIN = float(os.environ.get("HUI_CLOSE_POS_MIN", "0.7") or "0.7")       # 收盤位置（盤整用）
-MIN_PRICE = float(os.environ.get("HUI_MIN_PRICE", "8") or "8")                   # 最低價（濾流動性差）
-MIN_AVG_AMT = float(os.environ.get("HUI_MIN_AVG_AMT", "20000000") or "20000000")  # 20日均額 ≥ 2000萬元
-LOOKBACK_DAYS = 130                                                              # 讀取交易日數（足夠 MA60＋濾網）
+ATR_BODY_MULT = float(os.environ.get("HUI_ATR_BODY_MULT", "1.0") or "1.0")
+CLOSE_POS_MIN = float(os.environ.get("HUI_CLOSE_POS_MIN", "0.7") or "0.7")
+
+# ---- 精簡版(使用者定義)門檻 ----
+MA_SET_U = (5, 10, 20)
+MA_SPREAD_U = float(os.environ.get("HUI_U_MA_SPREAD", "0.02") or "0.02")        # 三線價差 ÷ 收盤 ≤ 2%
+MA_CONV_LB_U = int(os.environ.get("HUI_U_MA_CONV_LOOKBACK", "10") or "10")      # 均線糾結 10 個交易日
+MA_CONV_MIN_U = int(os.environ.get("HUI_U_MA_CONV_MIN", "8") or "8")            # 近10根至少幾根糾結
+BOX_LB_U = int(os.environ.get("HUI_U_BOX_DAYS", "20") or "20")                  # 20 天區間
+BOX_WIDTH_U = float(os.environ.get("HUI_U_BOX_WIDTH", "0.15") or "0.15")        # 區間盤整箱幅 ≤ 15%
+VOL_MULT_U = float(os.environ.get("HUI_U_VOL_MULT", "1.5") or "1.5")            # 精簡版：今量 ≥ 前一日 ×1.5
+
+# ---- 共用流動性 ----
+MIN_PRICE = float(os.environ.get("HUI_MIN_PRICE", "8") or "8")
+MIN_AVG_AMT = float(os.environ.get("HUI_MIN_AVG_AMT", "20000000") or "20000000")
+LOOKBACK_DAYS = 130
 
 TPE_TZ = dt.timezone(dt.timedelta(hours=8))
 WEEK_ZH = "一二三四五六日"
@@ -104,7 +104,6 @@ def _is_common_stock(sid):
 
 
 def _ma_at(closes, n, end):
-    """MA_n（收盤簡單平均），結束於索引 end（含）。資料不足或含 None 回 None。"""
     if end + 1 < n:
         return None
     seg = closes[end - n + 1:end + 1]
@@ -113,19 +112,17 @@ def _ma_at(closes, n, end):
     return sum(seg) / n
 
 
-def _spread_at(closes, end):
-    """四線最大最小相對價差（÷該根收盤）。任一均線缺值回 None。"""
+def _spread_at(closes, end, ma_set):
     c = closes[end]
     if c is None or c <= 0:
         return None
-    vals = [_ma_at(closes, p, end) for p in MA_SET]
+    vals = [_ma_at(closes, p, end) for p in ma_set]
     if any(v is None for v in vals):
         return None
     return (max(vals) - min(vals)) / c
 
 
 def _atr(highs, lows, closes, n, end):
-    """ATR（近 n 根真實波幅平均），結束於索引 end。不足回 None。"""
     trs = []
     for i in range(max(1, end - n + 1), end + 1):
         h, l, pc = highs[i], lows[i], closes[i - 1]
@@ -137,8 +134,12 @@ def _atr(highs, lows, closes, n, end):
     return sum(trs) / len(trs)
 
 
+def _clamp01(x):
+    return min(max(x, 0.0), 1.0)
+
+
 # ============================================================
-#  篩選：讀 DB → 逐檔算兩個濾網（以最近一個交易日為準）
+#  篩選：讀 DB → 逐檔算 4 個濾網（以最近一個交易日為準）
 # ============================================================
 def screen(con):
     diag = {"notes": []}
@@ -146,7 +147,7 @@ def screen(con):
         "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (LOOKBACK_DAYS,)).fetchall()][::-1]
     if not dates:
         diag["notes"].append("price 無資料")
-        return None, [], [], diag
+        return None, {"ma_user": [], "ma_ai": [], "box_user": [], "box_ai": []}, diag
     latest, d0 = dates[-1], dates[0]
 
     rows = con.execute(
@@ -157,13 +158,13 @@ def screen(con):
             continue
         ser.setdefault(sid, []).append((d, o, h, l, c, v, a))
 
-    ma_list, box_list = [], []
+    out = {"ma_user": [], "ma_ai": [], "box_user": [], "box_ai": []}
     n_scan = 0
     for sid, arr in ser.items():
         if not _is_common_stock(sid):
             continue
         arr.sort(key=lambda x: x[0])
-        if arr[-1][0] != latest:            # 最近一日沒交易 → 不列入當日篩選
+        if arr[-1][0] != latest:
             continue
         n_scan += 1
         opens = [x[1] for x in arr]; highs = [x[2] for x in arr]
@@ -172,25 +173,23 @@ def screen(con):
         n = len(closes)
         if n < 2:
             continue
-        i = n - 1                            # 今日索引
+        i = n - 1
         close, openp = closes[i], opens[i]
         high, low, vtoday, prevc = highs[i], lows[i], vols[i], closes[i - 1]
-        prevh = highs[i - 1]
+        prevh, prevv = highs[i - 1], vols[i - 1]
         if close is None or vtoday is None:
             continue
 
-        # 流動性 / 價格門檻
         a20 = [a for a in amts[-20:] if a is not None]
         avg20amt = (sum(a20) / len(a20)) if a20 else 0.0
         if close < MIN_PRICE or avg20amt < MIN_AVG_AMT:
             continue
 
-        # 量能：今量 ÷ 近 VOL_AVG_DAYS 日均量（不含今日）
+        # 量能：兩種基準（AI版=20日均量、精簡版=前一日）
         vwin = [v for v in vols[i - VOL_AVG_DAYS:i] if v is not None]
         avgvol = (sum(vwin) / len(vwin)) if vwin else 0.0
-        volr = (vtoday / avgvol) if avgvol > 0 else None
-        if not (volr is not None and volr >= VOL_MULT):
-            continue                          # 兩濾網皆要求帶量
+        volr_ai = (vtoday / avgvol) if avgvol > 0 else None
+        volr_u = (vtoday / prevv) if (prevv and prevv > 0) else None
 
         chg = ((close / prevc - 1) * 100) if prevc else None
         atr = _atr(highs, lows, closes, ATR_PERIOD, i)
@@ -201,34 +200,64 @@ def screen(con):
         close_pos = ((close - low) / day_rng) if (day_rng and day_rng > 0) else None
         body_atr = (body / atr) if (body is not None and atr and atr > 0) else None
 
-        # ---- 濾網一：均線突破四海遊龍 ----
-        if n >= MA_CONV_LOOKBACK + max(MA_SET) + 1:
+        # ---- 精簡版：均線突破四海遊龍（5/10/20）----
+        if volr_u is not None and volr_u >= VOL_MULT_U and n >= MA_CONV_LB_U + max(MA_SET_U) + 1:
+            m3 = {p: _ma_at(closes, p, i) for p in MA_SET_U}
+            if all(v is not None for v in m3.values()):
+                mx, mn = max(m3.values()), min(m3.values())
+                above = all(close >= m3[p] for p in MA_SET_U)
+                conv = sum(1 for end in range(i - MA_CONV_LB_U, i)
+                           if (_spread_at(closes, end, MA_SET_U) or 9) <= MA_SPREAD_U)
+                if above and conv >= MA_CONV_MIN_U:
+                    spread_now = (mx - mn) / close
+                    score = round(100 * (0.45 * _clamp01(1 - spread_now / MA_SPREAD_U)
+                                         + 0.30 * (conv / MA_CONV_LB_U)
+                                         + 0.25 * _clamp01((volr_u - VOL_MULT_U) / VOL_MULT_U)))
+                    out["ma_user"].append({
+                        "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr_u),
+                        "spread": _r(spread_now * 100, 2), "conv": conv, "convN": MA_CONV_LB_U,
+                        "bias20": _r((close / m3[20] - 1) * 100, 1), "score": score})
+
+        # ---- AI建議版：均線突破四海遊龍（5/10/20/60）----
+        if volr_ai is not None and volr_ai >= VOL_MULT and n >= MA_CONV_LOOKBACK + max(MA_SET) + 1:
             ma_now = {p: _ma_at(closes, p, i) for p in MA_SET}
             if all(v is not None for v in ma_now.values()):
                 maxma, minma = max(ma_now.values()), min(ma_now.values())
                 spread_now = (maxma - minma) / close
-                conv = 0
-                for end in range(i - MA_CONV_LOOKBACK, i):     # 今日之前 MA_CONV_LOOKBACK 根
-                    sp = _spread_at(closes, end)
-                    if sp is not None and sp <= MA_SPREAD_PCT:
-                        conv += 1
-                breakout = close > maxma
-                candle_ok = strong_body or gap_up
-                if breakout and conv >= MA_CONV_MIN and candle_ok:
-                    tight = max(0.0, 1 - spread_now / MA_SPREAD_PCT)
-                    convsc = conv / MA_CONV_LOOKBACK
-                    volsc = min(max((volr - VOL_MULT) / VOL_MULT, 0.0), 1.0)
-                    bodysc = min((body_atr or 0) / 2.0, 1.0)
-                    score = round(100 * (0.35 * tight + 0.25 * convsc + 0.25 * volsc + 0.15 * bodysc))
-                    ma_list.append({
-                        "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr),
+                conv = sum(1 for end in range(i - MA_CONV_LOOKBACK, i)
+                           if (_spread_at(closes, end, MA_SET) or 9) <= MA_SPREAD_PCT)
+                if close > maxma and conv >= MA_CONV_MIN and (strong_body or gap_up):
+                    score = round(100 * (0.35 * _clamp01(1 - spread_now / MA_SPREAD_PCT)
+                                         + 0.25 * (conv / MA_CONV_LOOKBACK)
+                                         + 0.25 * _clamp01((volr_ai - VOL_MULT) / VOL_MULT)
+                                         + 0.15 * _clamp01((body_atr or 0) / 2.0)))
+                    out["ma_ai"].append({
+                        "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr_ai),
                         "spread": _r(spread_now * 100, 2), "conv": conv, "convN": MA_CONV_LOOKBACK,
                         "bias60": _r((close / ma_now[60] - 1) * 100, 1),
                         "bodyatr": _r(body_atr, 2), "gap": bool(gap_up), "score": score})
 
-        # ---- 濾網二：盤整突破（唐奇安箱體）----
-        if n >= BOX_LOOKBACK + BOX_CONSOLI_BARS + 1:
-            bh = [h for h in highs[i - BOX_LOOKBACK:i] if h is not None]   # 昨日為止的箱頂/箱底
+        # ---- 精簡版：盤整突破（20 日區間突破）----
+        if volr_u is not None and volr_u >= VOL_MULT_U and n >= BOX_LB_U + 1:
+            bh = [h for h in highs[i - BOX_LB_U:i] if h is not None]
+            bl = [l for l in lows[i - BOX_LB_U:i] if l is not None]
+            if bh and bl:
+                box_high, box_low = max(bh), min(bl)
+                if box_high > box_low > 0:
+                    rng = (box_high - box_low) / close
+                    if rng <= BOX_WIDTH_U and close > box_high:
+                        brk = (close / box_high - 1) * 100
+                        score = round(100 * (0.45 * _clamp01(1 - rng / BOX_WIDTH_U)
+                                             + 0.30 * _clamp01((volr_u - VOL_MULT_U) / VOL_MULT_U)
+                                             + 0.25 * _clamp01(brk / 5.0)))
+                        out["box_user"].append({
+                            "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr_u),
+                            "boxHigh": _r(box_high), "boxLow": _r(box_low),
+                            "boxWidth": _r(rng * 100, 1), "brk": _r(brk, 1), "score": score})
+
+        # ---- AI建議版：盤整突破（唐奇安箱體）----
+        if volr_ai is not None and volr_ai >= VOL_MULT and n >= BOX_LOOKBACK + BOX_CONSOLI_BARS + 1:
+            bh = [h for h in highs[i - BOX_LOOKBACK:i] if h is not None]
             bl = [l for l in lows[i - BOX_LOOKBACK:i] if l is not None]
             if bh and bl:
                 box_high, box_low = max(bh), min(bl)
@@ -239,35 +268,31 @@ def screen(con):
                         hw = [h for h in highs[end - BOX_LOOKBACK + 1:end + 1] if h is not None]
                         lw = [l for l in lows[end - BOX_LOOKBACK + 1:end + 1] if l is not None]
                         ce = closes[end]
-                        if not hw or not lw or not ce:
-                            continue
-                        if (max(hw) - min(lw)) / ce <= BOX_WIDTH_PCT:
+                        if hw and lw and ce and (max(hw) - min(lw)) / ce <= BOX_WIDTH_PCT:
                             cons += 1
-                    breakout = close > box_high
-                    candle_ok = strong_body and (close_pos is not None and close_pos >= CLOSE_POS_MIN)
-                    if breakout and cons >= BOX_CONSOLI_MIN and candle_ok:
+                    ok_candle = strong_body and (close_pos is not None and close_pos >= CLOSE_POS_MIN)
+                    if close > box_high and cons >= BOX_CONSOLI_MIN and ok_candle:
                         brk = (close / box_high - 1) * 100
-                        tight = max(0.0, 1 - box_width / BOX_WIDTH_PCT)
-                        conssc = cons / BOX_CONSOLI_BARS
-                        volsc = min(max((volr - VOL_MULT) / VOL_MULT, 0.0), 1.0)
-                        brksc = min(brk / 5.0, 1.0)
-                        score = round(100 * (0.3 * tight + 0.2 * conssc + 0.25 * volsc
-                                             + 0.15 * brksc + 0.1 * (close_pos or 0)))
-                        box_list.append({
-                            "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr),
+                        score = round(100 * (0.3 * _clamp01(1 - box_width / BOX_WIDTH_PCT)
+                                             + 0.2 * (cons / BOX_CONSOLI_BARS)
+                                             + 0.25 * _clamp01((volr_ai - VOL_MULT) / VOL_MULT)
+                                             + 0.15 * _clamp01(brk / 5.0) + 0.1 * (close_pos or 0)))
+                        out["box_ai"].append({
+                            "sid": sid, "close": _r(close), "chg": _r(chg), "volr": _r(volr_ai),
                             "boxHigh": _r(box_high), "boxLow": _r(box_low),
                             "boxWidth": _r(box_width * 100, 1), "brk": _r(brk, 1),
                             "cons": cons, "consN": BOX_CONSOLI_BARS,
                             "closePos": _r(close_pos, 2), "score": score})
 
-    ma_list.sort(key=lambda x: -(x["score"] or 0))
-    box_list.sort(key=lambda x: -(x["score"] or 0))
+    for k in out:
+        out[k].sort(key=lambda x: -(x["score"] or 0))
     diag["notes"].append(f"篩選基準日 {latest}・掃描 {n_scan} 檔・"
-                         f"均線突破 {len(ma_list)}・盤整突破 {len(box_list)}")
-    return latest, ma_list, box_list, diag
+                         f"均線(精簡){len(out['ma_user'])}/AI {len(out['ma_ai'])}・"
+                         f"盤整(精簡){len(out['box_user'])}/AI {len(out['box_ai'])}")
+    return latest, out, diag
 
 
-def attach_meta(con, *lists):
+def attach_meta(con, out):
     names = dict(con.execute("SELECT stock_id,name FROM stock"))
     mkts = dict(con.execute("SELECT stock_id,market FROM stock"))
     lab = tw_industry.label_map(con) if tw_industry else {}
@@ -275,7 +300,7 @@ def attach_meta(con, *lists):
         cmap = tw_concepts.concept_map() if tw_concepts else {}
     except Exception:
         cmap = {}
-    for L in lists:
+    for L in out.values():
         for r in L:
             sid = r["sid"]
             r["name"] = names.get(sid, sid)
@@ -287,7 +312,7 @@ def attach_meta(con, *lists):
 # ============================================================
 #  組裝 / 輸出
 # ============================================================
-def build_payload(latest, ma_list, box_list, diag):
+def build_payload(latest, out, diag):
     return {
         "gentime": now_taipei(), "today": latest,
         "params": {
@@ -297,10 +322,15 @@ def build_payload(latest, ma_list, box_list, diag):
             "box_days": BOX_LOOKBACK, "box_width_pct": round(BOX_WIDTH_PCT * 100, 1),
             "box_consoli_bars": BOX_CONSOLI_BARS, "box_consoli_min": BOX_CONSOLI_MIN,
             "atr_period": ATR_PERIOD, "atr_body_mult": ATR_BODY_MULT, "close_pos_min": CLOSE_POS_MIN,
+            "u_ma_spread_pct": round(MA_SPREAD_U * 100, 1),
+            "u_ma_conv_lookback": MA_CONV_LB_U, "u_ma_conv_min": MA_CONV_MIN_U,
+            "u_box_days": BOX_LB_U, "u_box_width_pct": round(BOX_WIDTH_U * 100, 1),
+            "u_vol_mult": VOL_MULT_U,
             "min_price": MIN_PRICE, "min_avg_amt": MIN_AVG_AMT,
         },
-        "counts": {"ma": len(ma_list), "box": len(box_list)},
-        "ma": ma_list, "box": box_list, "diag": diag,
+        "counts": {k: len(v) for k, v in out.items()},
+        "ma_user": out["ma_user"], "ma_ai": out["ma_ai"],
+        "box_user": out["box_user"], "box_ai": out["box_ai"], "diag": diag,
     }
 
 
@@ -309,44 +339,63 @@ def write_outputs(out_dir, payload):
     with open(os.path.join(out_dir, "data", "hui.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
     build_v = "".join(ch for ch in (payload.get("gentime") or "") if ch.isdigit()) or "0"
-    html = HUI_HTML.replace("__BUILDV__", build_v)
     with open(os.path.join(out_dir, OUT_NAME), "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(HUI_HTML.replace("__BUILDV__", build_v))
     c = payload["counts"]
-    print(f"已寫出 {out_dir}/{OUT_NAME} 與 data/hui.json"
-          f"（基準日 {payload.get('today')}・均線突破 {c['ma']}・盤整突破 {c['box']}）")
+    print(f"已寫出 {out_dir}/{OUT_NAME} 與 data/hui.json（基準日 {payload.get('today')}・"
+          f"均線精簡 {c['ma_user']}/AI {c['ma_ai']}・盤整精簡 {c['box_user']}/AI {c['box_ai']}）")
 
 
 # ============================================================
 #  示範資料
 # ============================================================
 def make_demo():
-    def ma(sid, name, mkt, close, chg, volr, spread, conv, b60, score, ind="", cpt=None):
+    def mu(sid, name, mkt, close, chg, volr, spread, conv, b20, score, ind="", cpt=None):
+        return {"sid": sid, "name": name, "mkt": mkt, "close": close, "chg": chg, "volr": volr,
+                "spread": spread, "conv": conv, "convN": MA_CONV_LB_U, "bias20": b20,
+                "score": score, "ind": ind, "cpt": cpt or []}
+
+    def mai(sid, name, mkt, close, chg, volr, spread, conv, b60, score, ind="", cpt=None):
         return {"sid": sid, "name": name, "mkt": mkt, "close": close, "chg": chg, "volr": volr,
                 "spread": spread, "conv": conv, "convN": MA_CONV_LOOKBACK, "bias60": b60,
                 "bodyatr": 1.8, "gap": False, "score": score, "ind": ind, "cpt": cpt or []}
 
-    def bx(sid, name, mkt, close, chg, volr, bh, bl, brk, bw, cons, score, ind="", cpt=None):
+    def bu(sid, name, mkt, close, chg, volr, bh, bl, brk, bw, score, ind="", cpt=None):
+        return {"sid": sid, "name": name, "mkt": mkt, "close": close, "chg": chg, "volr": volr,
+                "boxHigh": bh, "boxLow": bl, "brk": brk, "boxWidth": bw, "score": score,
+                "ind": ind, "cpt": cpt or []}
+
+    def bai(sid, name, mkt, close, chg, volr, bh, bl, brk, bw, cons, score, ind="", cpt=None):
         return {"sid": sid, "name": name, "mkt": mkt, "close": close, "chg": chg, "volr": volr,
                 "boxHigh": bh, "boxLow": bl, "brk": brk, "boxWidth": bw, "cons": cons,
                 "consN": BOX_CONSOLI_BARS, "closePos": 0.9, "score": score, "ind": ind, "cpt": cpt or []}
 
-    ma_list = [
-        ma("3037", "欣興", "上市", 205.0, 6.2, 2.4, 1.6, 10, 4.5, 92, cpt=["ABF載板", "PCB"]),
-        ma("8046", "南電", "上市", 158.0, 5.1, 2.1, 2.0, 9, 3.9, 84, cpt=["ABF載板"]),
-        ma("2330", "台積電", "上市", 940.0, 3.4, 1.9, 2.2, 9, 3.0, 78, cpt=["CoWoS/先進封裝"]),
-        ma("1519", "華城", "上市", 620.0, 5.6, 2.6, 1.8, 10, 5.1, 88, cpt=["重電"]),
-        ma("1234", "黑松", "上市", 43.2, 3.6, 1.9, 2.3, 8, 3.5, 58, ind="食品"),
-    ]
-    box_list = [
-        bx("3231", "緯創", "上市", 128.5, 4.8, 2.3, 122.0, 116.0, 5.3, 4.9, 15, 90, cpt=["AI伺服器"]),
-        bx("2382", "廣達", "上市", 305.0, 3.9, 2.0, 296.0, 282.0, 3.0, 4.7, 14, 80, cpt=["AI伺服器"]),
-        bx("6533", "晶心科", "上櫃", 512.0, 6.1, 2.5, 486.0, 462.0, 5.3, 5.0, 15, 86, cpt=["IP矽智財", "IC設計"]),
-        bx("2603", "長榮", "上市", 235.0, 4.4, 2.2, 224.0, 213.0, 4.9, 4.9, 13, 79, cpt=["航運(貨櫃/散裝)"]),
-        bx("9917", "中保科", "上市", 118.0, 3.7, 1.7, 114.0, 108.5, 3.5, 5.0, 14, 55, ind="其他"),
-    ]
+    out = {
+        "ma_user": [
+            mu("3037", "欣興", "上市", 205.0, 6.2, 1.9, 1.4, 10, 3.1, 90, cpt=["ABF載板", "PCB"]),
+            mu("8046", "南電", "上市", 158.0, 5.1, 1.7, 1.7, 9, 2.7, 82, cpt=["ABF載板"]),
+            mu("2603", "長榮", "上市", 235.0, 4.4, 2.1, 1.8, 8, 2.5, 76, cpt=["航運(貨櫃/散裝)"]),
+            mu("2049", "上銀", "上市", 245.0, 3.6, 1.6, 1.9, 9, 2.2, 66, cpt=["工具機", "機器人/自動化"]),
+            mu("1234", "黑松", "上市", 43.2, 3.1, 1.6, 1.8, 8, 2.0, 55, ind="食品"),
+        ],
+        "ma_ai": [
+            mai("3037", "欣興", "上市", 205.0, 6.2, 2.4, 1.6, 10, 4.5, 92, cpt=["ABF載板", "PCB"]),
+            mai("2330", "台積電", "上市", 940.0, 3.4, 1.9, 2.2, 9, 3.0, 78, cpt=["CoWoS/先進封裝"]),
+            mai("1519", "華城", "上市", 620.0, 5.6, 2.6, 1.8, 10, 5.1, 88, cpt=["重電"]),
+        ],
+        "box_user": [
+            bu("3231", "緯創", "上市", 128.5, 4.8, 2.0, 122.0, 108.0, 5.3, 10.9, 84, cpt=["AI伺服器"]),
+            bu("2382", "廣達", "上市", 305.0, 3.9, 1.8, 296.0, 268.0, 3.0, 9.2, 76, cpt=["AI伺服器"]),
+            bu("6533", "晶心科", "上櫃", 512.0, 6.1, 2.2, 486.0, 452.0, 5.3, 6.6, 80, cpt=["IP矽智財", "IC設計"]),
+            bu("9917", "中保科", "上市", 118.0, 3.4, 1.7, 114.0, 104.0, 3.5, 8.5, 58, ind="其他"),
+        ],
+        "box_ai": [
+            bai("3231", "緯創", "上市", 128.5, 4.8, 2.3, 122.0, 116.0, 5.3, 4.9, 15, 90, cpt=["AI伺服器"]),
+            bai("6533", "晶心科", "上櫃", 512.0, 6.1, 2.5, 486.0, 462.0, 5.3, 5.0, 15, 86, cpt=["IP矽智財", "IC設計"]),
+        ],
+    }
     diag = {"notes": ["[示範模式] 合成資料，非真實行情"]}
-    return build_payload("2026-07-03", ma_list, box_list, diag)
+    return build_payload("2026-07-03", out, diag)
 
 
 # ============================================================
@@ -366,14 +415,14 @@ def main():
 
     con = sqlite3.connect(DB_PATH)
     try:
-        latest, ma_list, box_list, diag = screen(con)
+        latest, out, diag = screen(con)
         if latest is None:
             print("price 無資料，改寫示範資料。")
             write_outputs(args.out, make_demo()); return
-        attach_meta(con, ma_list, box_list)
+        attach_meta(con, out)
     finally:
         con.close()
-    write_outputs(args.out, build_payload(latest, ma_list, box_list, diag))
+    write_outputs(args.out, build_payload(latest, out, diag))
 
 
 # ============================================================
@@ -408,22 +457,25 @@ HUI_HTML = r"""<!DOCTYPE html>
   .sub{font-size:12px; color:var(--muted); margin-top:5px; line-height:1.6;}
   .hidden{display:none !important;}
 
-  .cztabs{display:flex; gap:8px; margin:13px 0; padding:2px 0; border-bottom:1px solid var(--border);
+  .cztabs{display:flex; gap:7px; margin:13px 0; padding:2px 0; border-bottom:1px solid var(--border);
     overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none;}
   .cztabs::-webkit-scrollbar{display:none;}
   .czt{flex:0 0 auto; background:transparent; color:var(--muted); border:none; border-radius:99px;
-    padding:8px 15px; font-size:13.5px; font-weight:700; cursor:pointer; white-space:nowrap;}
+    padding:8px 14px; font-size:13px; font-weight:700; cursor:pointer; white-space:nowrap;}
   .czt.on{background:var(--amber); color:#000;}
+  .czt .ai{font-size:9px; font-weight:800; background:rgba(90,169,255,.2); color:#8fd0ff; border-radius:4px; padding:0 4px; margin-left:4px; vertical-align:middle;}
+  .czt.on .ai{background:rgba(0,0,0,.18); color:#0a3d78;}
   .pane{animation:fade .2s ease;}
   @keyframes fade{from{opacity:0; transform:translateY(4px);}to{opacity:1; transform:none;}}
 
   .intro{font-size:12.5px; color:var(--muted); line-height:1.6; background:var(--card);
     border:1px solid var(--border); border-radius:11px; padding:12px 14px; margin-bottom:12px;}
   .intro b{color:var(--text);} .intro .k{color:var(--amber); font-weight:700;}
+  .intro .tagai{display:inline-block; font-size:10px; font-weight:800; background:var(--blue-s); color:#8fd0ff; border:1px solid rgba(90,169,255,.3); border-radius:5px; padding:0 6px; margin-left:4px;}
+  .intro .tagu{display:inline-block; font-size:10px; font-weight:800; background:rgba(94,111,134,.18); color:#9fb0c4; border:1px solid rgba(94,111,134,.3); border-radius:5px; padding:0 6px; margin-left:4px;}
   .cnt{font-size:12px; color:var(--dim); margin:2px 2px 9px;}
   .cnt b{color:var(--amber); font-size:14px;}
 
-  /* 緊湊表格：凍結首欄、可左右滑動、點欄位標題排序 */
   .dtbl-wrap{overflow:auto; max-height:76vh; -webkit-overflow-scrolling:touch; border:1px solid var(--border);
     border-radius:11px; background:var(--card); overscroll-behavior:contain;}
   .dtbl{border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-variant-numeric:tabular-nums;}
@@ -445,7 +497,6 @@ HUI_HTML = r"""<!DOCTYPE html>
   .dtbl .nmcell .cind{font-size:10px; color:#7c8aa0; font-weight:600; margin-top:1px;}
   .dtbl .cv{font-weight:800; font-size:13px;}
   .dtbl .mkt{font-size:10px; color:var(--dim); border:1px solid var(--border); border-radius:5px; padding:0 5px; margin-left:5px;}
-  /* 概念分群：切換鈕 + 群組標題列（文字固定在最左） */
   .gtog{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; font-weight:700; vertical-align:middle;}
   .gtog.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
   .dtbl tr.grouphdr td{text-align:left; background:var(--card2); border-top:2px solid var(--border); padding:6px 11px; font-weight:800; font-size:13px; color:var(--text);}
@@ -466,14 +517,14 @@ HUI_HTML = r"""<!DOCTYPE html>
   .doc .lead{color:var(--muted); font-size:13.5px;}
   .doc ul{margin:8px 0; padding-left:20px;} .doc li{margin:6px 0;}
   .doc .k{color:var(--amber); font-weight:700;}
-  .doc .step{display:flex; gap:11px; margin:10px 0;}
-  .doc .step .no{flex:0 0 26px; height:26px; border-radius:99px; background:var(--amber-s); color:var(--amber); font-weight:800; font-size:13px; display:flex; align-items:center; justify-content:center;}
   .doc .fml{background:var(--card2); border:1px solid var(--border); border-radius:9px; padding:11px 13px; margin:10px 0; font-size:12.5px; color:var(--muted); line-height:1.7; overflow-x:auto;}
   .doc .fml b{color:var(--text);} .doc .fml code{color:#8fd0ff; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
   .doc .warn{background:rgba(251,59,65,.14); border:1px solid rgba(255,77,79,.3); border-radius:9px; padding:11px 13px; margin:12px 0; font-size:13px; color:#ffd9da;}
   .doc table{width:100%; border-collapse:collapse; margin:12px 0; font-size:12.5px;}
   .doc th,.doc td{border:1px solid var(--border); padding:8px 9px; text-align:left; vertical-align:top;}
   .doc th{background:var(--card2); color:var(--muted); font-weight:700;}
+  .doc .badge{display:inline-block; font-size:10px; font-weight:800; border-radius:5px; padding:1px 6px; margin-right:5px;}
+  .doc .badge.u{background:rgba(94,111,134,.18); color:#9fb0c4;} .doc .badge.ai{background:var(--blue-s); color:#8fd0ff;}
   .discl{font-size:11.5px; color:var(--dim); margin-top:16px; line-height:1.6;}
 </style>
 </head>
@@ -486,29 +537,34 @@ HUI_HTML = r"""<!DOCTYPE html>
   </header>
 
   <div class="cztabs" id="cztabs">
-    <button class="czt on" data-p="ma">均線突破四海遊龍</button>
-    <button class="czt" data-p="box">盤整突破</button>
+    <button class="czt on" data-p="ma_user">均線突破四海遊龍</button>
+    <button class="czt" data-p="ma_ai">均線突破四海遊龍<span class="ai">AI建議版</span></button>
+    <button class="czt" data-p="box_user">盤整突破</button>
+    <button class="czt" data-p="box_ai">盤整突破<span class="ai">AI建議版</span></button>
     <button class="czt" data-p="doc">公式說明</button>
   </div>
 
-  <div class="pane" id="p-ma">
-    <div class="intro"><b>均線突破四海遊龍</b>：<span class="k">5/10/20/60 日均線糾結</span>（近 <span id="malb-i">10</span> 根多數 K 棒四線價差 ≤ <span id="masp-i">2.5</span>%）後，
-      收盤<span class="k">突破最上層均線</span>、<span class="k">帶量</span>（量 ≥ 20 日均量 ×<span id="vm-i">1.5</span>）且為<span class="k">強勢紅K</span>（實體 ＞ ATR 或跳空）。糾結度越小＝四線越黏。</div>
-    <div class="cnt">符合 <b id="cnt-ma">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
-    <div id="list-ma"></div>
+  <div class="pane" id="p-ma_user">
+    <div class="intro"><b>均線突破四海遊龍</b><span class="tagu">精簡版</span>：收盤<span class="k">站上 5/10/20 三線</span>、當日量 <span class="k">≥ 前一日 ×<span id="uvm1">1.5</span></span>、且 <span class="k">5/10/20 均線糾結滿 <span id="umlb1">10</span> 個交易日</span>（近 <span id="umlb2">10</span> 根多數三線價差 ≤ <span id="usp1">2</span>%）。</div>
+    <div class="cnt">符合 <b id="cnt-ma_user">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
+    <div id="list-ma_user"></div>
   </div>
-
-  <div class="pane hidden" id="p-box">
-    <div class="intro"><b>盤整突破</b>：前 <span class="k" id="boxdays-i">20</span> 日<span class="k">唐奇安箱體</span>長時間收窄
-      （近 <span id="bcb-i">15</span> 根多數 K 棒箱幅 ≤ <span id="bw-i">6</span>%），今日收盤<span class="k">帶量突破昨日箱頂</span>、
-      且為<span class="k">強勢紅K收高</span>（實體 ＞ ATR 且收盤貼近當日高）。箱幅％越小＝盤整越緊。</div>
-    <div class="cnt">符合 <b id="cnt-box">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
-    <div id="list-box"></div>
+  <div class="pane hidden" id="p-ma_ai">
+    <div class="intro"><b>均線突破四海遊龍</b><span class="tagai">AI建議版</span>：在精簡版上加嚴——<span class="k">4 條均線(含季線60)</span>、突破<span class="k">最上層均線</span>、<span class="k">ATR 強勢紅K或跳空</span>、量以 <span id="vad1">20</span> 日均量為基準。糾結度 ≤ <span id="asp1">2.5</span>%、近 <span id="amlb1">10</span> 根至少 <span id="amin1">8</span> 根。</div>
+    <div class="cnt">符合 <b id="cnt-ma_ai">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
+    <div id="list-ma_ai"></div>
   </div>
-
-  <div class="pane hidden" id="p-doc">
-    <div class="doc" id="docbody"></div>
+  <div class="pane hidden" id="p-box_user">
+    <div class="intro"><b>盤整突破</b><span class="tagu">精簡版</span>：前 <span id="ubd1">20</span> 日<span class="k">區間盤整</span>（箱幅 ≤ <span id="ubw1">15</span>%），當日<span class="k">帶量（≥ 前一日 ×<span id="uvm2">1.5</span>）突破 <span id="ubd2">20</span> 日箱頂</span>。</div>
+    <div class="cnt">符合 <b id="cnt-box_user">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
+    <div id="list-box_user"></div>
   </div>
+  <div class="pane hidden" id="p-box_ai">
+    <div class="intro"><b>盤整突破</b><span class="tagai">AI建議版</span>：唐奇安箱體（取<span class="k">昨日箱頂</span>）＋<span class="k">近 <span id="bcb1">15</span> 根多數箱幅 ≤ <span id="bw1">6</span>%</span>時間濾網＋<span class="k">ATR 強勢收高</span>（收盤位置 ≥ <span id="cp1">0.7</span>）＋量以 20 日均量為基準。</div>
+    <div class="cnt">符合 <b id="cnt-box_ai">—</b> 檔（依概念族群分群；點列看 K 線・點欄位標題排序）</div>
+    <div id="list-box_ai"></div>
+  </div>
+  <div class="pane hidden" id="p-doc"><div class="doc" id="docbody"></div></div>
 </div>
 <footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（價量）、台灣證交所／櫃買中心 ・ 篩選為本站機械式初篩・僅供研究，非投資建議</footer>
 
@@ -522,8 +578,8 @@ function signCls(v){ return !isNum(v)?"flat":(Number(v)>0?"up":(Number(v)<0?"dow
 function pctSigned(v,d){ d=d==null?1:d; if(!isNum(v)) return '<span class="flat">—</span>';
   const n=Number(v); return `<span class="${signCls(n)}">${n>0?"+":""}${n.toFixed(d)}%</span>`; }
 
-/* 概念分群：概念(cpt 主概念)優先，退回產業(ind)，再退回未分類；概念群在前、產業次之、未分類最後，同層依檔數多寡 */
 let huiGroup = true;
+const TABS = ["ma_user","ma_ai","box_user","box_ai"];
 function groupBy(rows){
   const gm={};
   rows.forEach(r=>{
@@ -538,7 +594,6 @@ function groupBy(rows){
 }
 function groupHdr(g,cols){ return `<tr class="grouphdr ${g.isConcept?'gc':'gi'}"><td colspan="${cols}"><span class="ghlbl"><span class="gchip">${g.isConcept?'概念':'產業'}</span>${esc(g.name)}<span class="gcount">${g.rows.length}檔</span></span></td></tr>`; }
 
-/* 欄位定義：[label, key, formatter] */
 const FMT = {
   price:  v=>`<span class="cv">${price(v)}</span>`,
   pct:    v=>pctSigned(v,2),
@@ -552,13 +607,20 @@ const FMT = {
   score:  v=>isNum(v)?`<span class="cv amb">${Math.round(v)}</span>`:"—",
 };
 const COLS = {
-  ma: [["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量倍","volr",FMT.volr],
-       ["糾結度%","spread",FMT.sqz],["糾結K","conv",FMT.cnt],["距季線%","bias60",FMT.pct1],["分數","score",FMT.score]],
-  box:[["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量倍","volr",FMT.volr],
-       ["箱頂","boxHigh",FMT.plain],["突破幅%","brk",FMT.brk],["箱幅%","boxWidth",FMT.rng],["盤整K","cons",FMT.cnt],["分數","score",FMT.score]],
+  ma_user: [["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量比","volr",FMT.volr],
+            ["糾結度%","spread",FMT.sqz],["糾結K","conv",FMT.cnt],["距20MA%","bias20",FMT.pct1],["分數","score",FMT.score]],
+  ma_ai:   [["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量倍","volr",FMT.volr],
+            ["糾結度%","spread",FMT.sqz],["糾結K","conv",FMT.cnt],["距季線%","bias60",FMT.pct1],["分數","score",FMT.score]],
+  box_user:[["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量比","volr",FMT.volr],
+            ["箱頂","boxHigh",FMT.plain],["突破幅%","brk",FMT.brk],["箱幅%","boxWidth",FMT.rng],["分數","score",FMT.score]],
+  box_ai:  [["收盤","close",FMT.price],["漲跌%","chg",FMT.pct],["量倍","volr",FMT.volr],
+            ["箱頂","boxHigh",FMT.plain],["突破幅%","brk",FMT.brk],["箱幅%","boxWidth",FMT.rng],["盤整K","cons",FMT.cnt],["分數","score",FMT.score]],
 };
-const DATA = {ma:[], box:[]};
-const sortState = {ma:{key:"score",asc:false}, box:{key:"score",asc:false}};
+const LABEL = {ma_user:"均線突破四海遊龍（精簡版）", ma_ai:"均線突破四海遊龍 AI建議版",
+               box_user:"盤整突破（精簡版）", box_ai:"盤整突破 AI建議版"};
+const DATA = {ma_user:[], ma_ai:[], box_user:[], box_ai:[]};
+const sortState = {ma_user:{key:"score",asc:false}, ma_ai:{key:"score",asc:false},
+                   box_user:{key:"score",asc:false}, box_ai:{key:"score",asc:false}};
 
 function sortRows(name){
   const s=sortState[name], arr=(DATA[name]||[]).slice();
@@ -567,8 +629,7 @@ function sortRows(name){
   return arr;
 }
 function rowHtml(r,cols){
-  let tds="";
-  cols.forEach(([lab,key,fmt])=>{ tds+="<td>"+fmt(r[key])+"</td>"; });
+  let tds=""; cols.forEach(([lab,key,fmt])=>{ tds+="<td>"+fmt(r[key])+"</td>"; });
   return `<tr onclick="goChart('${esc(r.sid)}')">
     <td class="frz nmcell">
       <div class="nm">${esc(r.name||"")}${r.mkt?`<span class="mkt">${esc(r.mkt)}</span>`:""}</div>
@@ -579,7 +640,7 @@ function rowHtml(r,cols){
 function renderTbl(name){
   const el=$("list-"+name); if(!el) return;
   const cols=COLS[name], data=DATA[name]||[];
-  if(!data.length){ el.innerHTML=`<div class="empty">最近一個交易日沒有符合「${name==="ma"?"均線突破四海遊龍":"盤整突破"}」條件的個股。<br><span class="dim">這兩個是嚴格濾網（持續糾結／盤整＋帶量＋強勢突破），清淡或多數股尚未突破時掛零屬正常；換交易日再看。</span></div>`; return; }
+  if(!data.length){ el.innerHTML=`<div class="empty">最近一個交易日沒有符合「${LABEL[name]}」條件的個股。<br><span class="dim">屬「整理→帶量→突破」型濾網，清淡或多數股尚未突破時掛零屬正常；換交易日再看。</span></div>`; return; }
   const s=sortState[name], rows=sortRows(name);
   const arrow=k=> s.key===k?(s.asc?"▲":"▼"):"";
   let thead=`<th class="frz">名稱<br><span class="sub" style="color:var(--dim)">代號 / 產業</span></th>`;
@@ -590,72 +651,74 @@ function renderTbl(name){
   else { tb=rows.map(r=>rowHtml(r,cols)).join(""); }
   el.innerHTML=`<div class="dtbl-wrap"><table class="dtbl"><thead><tr>${thead}</tr></thead><tbody>${tb}</tbody></table></div>`;
   el.querySelectorAll(".sortlbl").forEach(b=>b.addEventListener("click",ev=>{ ev.stopPropagation();
-    const n=b.dataset.n,k=b.dataset.k,st=sortState[n]; if(st.key===k)st.asc=!st.asc; else{st.key=k;st.asc=false;} renderTbl(n); }));
+    const nm=b.dataset.n,k=b.dataset.k,st=sortState[nm]; if(st.key===k)st.asc=!st.asc; else{st.key=k;st.asc=false;} renderTbl(nm); }));
 }
 
 function goChart(sid){ location.href = "index.html?stk=" + encodeURIComponent(sid); }
 
 function switchTab(p){
   document.querySelectorAll(".czt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  ["ma","box","doc"].forEach(x=>{ const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p); });
+  TABS.concat(["doc"]).forEach(x=>{ const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p); });
   try{ window.scrollTo({top:0,behavior:"smooth"}); }catch(e){ window.scrollTo(0,0); }
 }
 document.querySelectorAll(".czt").forEach(b=>b.addEventListener("click",()=>switchTab(b.dataset.p)));
-$("huiGtog").addEventListener("click",e=>{ huiGroup=!huiGroup; e.currentTarget.classList.toggle("on",huiGroup); ["ma","box"].forEach(renderTbl); });
+$("huiGtog").addEventListener("click",e=>{ huiGroup=!huiGroup; e.currentTarget.classList.toggle("on",huiGroup); TABS.forEach(renderTbl); });
 
 function docHtml(p){
   p=p||{};
-  const vm=p.vol_mult||1.5, va=p.vol_avg_days||20, sq=p.ma_spread_pct||2.5,
-        mlb=p.ma_conv_lookback||10, mmin=p.ma_conv_min||8,
+  const uvm=p.u_vol_mult||1.5, usp=p.u_ma_spread_pct||2, umlb=p.u_ma_conv_lookback||10, umin=p.u_ma_conv_min||8,
+        ubd=p.u_box_days||20, ubw=p.u_box_width_pct||15,
+        vm=p.vol_mult||1.5, va=p.vol_avg_days||20, sq=p.ma_spread_pct||2.5, mlb=p.ma_conv_lookback||10, mmin=p.ma_conv_min||8,
         bd=p.box_days||20, bw=p.box_width_pct||6, bcb=p.box_consoli_bars||15, bmin=p.box_consoli_min||13,
         ap=p.atr_period||14, am=p.atr_body_mult||1.0, cp=p.close_pos_min||0.7;
   return `
-  <h3>兩種濾網在找什麼？</h3>
-  <p class="lead">兩個都是「<b style="color:var(--text)">先沉澱、再帶量突破</b>」的起漲型態：股價先進入一段「大家看法僵持、量縮盤整」的階段，把浮動籌碼洗乾淨；一旦主力進場帶量往上拉，往往就是一段行情的起點。差別只在「怎麼定義沉澱」——一個看<b>均線黏合</b>，一個看<b>價格箱體</b>。兩者都要求「<span class="k">持續整理 → 帶量突破 → 強勢K棒</span>」三者<b>同時</b>成立，用嚴格條件濾掉沒量、撐不住的假突破。</p>
+  <h3>四個濾網：兩種型態 × 兩個版本</h3>
+  <p class="lead">兩種都是「<b style="color:var(--text)">先沉澱、再帶量突破</b>」的起漲型態。每種型態各做兩個版本，方便你對照：<span class="badge u">精簡版</span>照你給的定義、條件較單純、選出檔數較多；<span class="badge ai">AI建議版</span>是我依專業量化研究加嚴的版本（多了時間濾網、K棒強度、以20日均量為量能基準），選出檔數較少但更嚴謹。兩者<b>用同一份最近交易日資料、同樣依概念族群分群顯示</b>。</p>
 
   <h3>① 均線突破四海遊龍</h3>
-  <p class="lead">「四海遊龍」＝ <b>5、10、20、60 四條均線</b>先「糾結」在一起（像四條龍盤在一起休息），再一根長紅同時衝上四條線、飛龍在天。</p>
-  <h4>白話原理</h4>
-  <p>當短中長期均線都黏在一起，代表這段期間股價幾乎沒漲沒跌、成本墊高得差不多，<b>沒信心的人慢慢退場、籌碼變乾淨</b>。此時只要有一方帶量把股價往上拉，上方套牢賣壓很少，容易一路噴出。</p>
-  <h4>量化條件（需同時成立）</h4>
-  <div class="step"><div class="no">1</div><div class="tx"><b>量化糾結</b>（最大最小相對價差法）：<span class="k">糾結度％ = (四線最高 − 四線最低) ÷ 收盤 ×100</span>，越小＝四線越黏。</div></div>
-  <div class="step"><div class="no">2</div><div class="tx"><b>時間濾網</b>（避免只是均線交叉的瞬間）：近 <span class="k">${mlb}</span> 根 K 棒中，至少 <span class="k">${mmin}</span> 根糾結度 ≤ <span class="k">${sq}%</span>（表中「糾結K」欄）。</div></div>
-  <div class="step"><div class="no">3</div><div class="tx"><b>突破訊號</b>：收盤 <span class="k">站上並突破最上層均線</span>（Close ＞ max(MA5,MA10,MA20,MA60)）。</div></div>
-  <div class="step"><div class="no">4</div><div class="tx"><b>K棒強度</b>（避免被巴）：實體紅K（<span class="k">Close−Open ＞ ATR(${ap}) ×${am}</span>）<b>或</b>跳空（開盤 ＞ 昨高）。</div></div>
-  <div class="step"><div class="no">5</div><div class="tx"><b>量能</b>：當日量 ＞ <span class="k">${va} 日均量 ×${vm}</span>（表中「量倍」欄）。</div></div>
-  <div class="fml"><code>MA_Spread = (max(MA5,MA10,MA20,MA60) − min(...)) / Close × 100%</code><br>
-    糾結：<code>CountIf(MA_Spread ≤ ${sq}%, ${mlb}) ≥ ${mmin}</code>　突破：<code>Close &gt; max(MA5,MA10,MA20,MA60)</code>　量能：<code>Vol &gt; MA(Vol,${va}) × ${vm}</code></div>
+  <p class="lead">「四海遊龍」＝均線先「糾結」黏在一起（籌碼沉澱），再一根長紅帶量衝上均線、飛龍在天。</p>
+  <h4><span class="badge u">精簡版</span>條件（同時成立）</h4>
+  <div class="fml">1. 收盤<b>站上 5/10/20 三線</b>：<code>Close ≥ MA5, MA10, MA20</code><br>
+    2. <b>帶量</b>：<code>今量 ≥ 前一日量 × ${uvm}</code><br>
+    3. <b>均線糾結 ${umlb} 個交易日</b>：近 ${umlb} 根 K 棒至少 ${umin} 根三線價差 <code>(max−min of MA5,10,20)/Close ≤ ${usp}%</code></div>
+  <h4><span class="badge ai">AI建議版</span>加嚴之處</h4>
+  <div class="fml">・均線改 <b>4 條(5/10/20/60)</b>、糾結度 ≤ ${sq}%、近 ${mlb} 根至少 ${mmin} 根<br>
+    ・突破要<b>站上並突破最上層均線</b> <code>Close &gt; max(MA5,10,20,60)</code><br>
+    ・加 <b>K棒強度</b>：實體紅K <code>Close−Open &gt; ATR(${ap})×${am}</code> 或跳空（開&gt;昨高）<br>
+    ・量能改以 <b>${va} 日均量</b> 為基準：<code>今量 &gt; MA(Vol,${va}) × ${vm}</code></div>
 
-  <h3>② 盤整突破（唐奇安箱體）</h3>
-  <p class="lead">股價在一個「<b>箱型區間</b>」（明顯的上下緣）長時間橫盤，直到某天<b>帶量向上突破箱頂</b>。</p>
-  <h4>白話原理</h4>
-  <p>箱頂＝上方壓力、箱底＝下方支撐。價格<b>帶量站上箱頂</b>代表買方一次把壓力吃掉、勝負分曉，往上機率高；沒量的突破常是假突破、會拉回箱內。</p>
-  <h4>量化條件（需同時成立）</h4>
-  <div class="step"><div class="no">1</div><div class="tx"><b>箱體量化</b>：<span class="k">箱頂 = 近 ${bd} 日最高、箱底 = 近 ${bd} 日最低</span>；箱幅％ = (箱頂 − 箱底) ÷ 收盤 ×100。</div></div>
-  <div class="step"><div class="no">2</div><div class="tx"><b>時間濾網</b>：近 <span class="k">${bcb}</span> 根 K 棒中，至少 <span class="k">${bmin}</span> 根之箱幅 ≤ <span class="k">${bw}%</span>（確保長時間橫盤、非剛從大波動平復；表中「盤整K」欄）。</div></div>
-  <div class="step"><div class="no">3</div><div class="tx"><b>突破訊號</b>：收盤 <span class="k">突破昨日箱頂</span>（Close ＞ Box_High[1]；用昨日箱頂，否則當日新高會同步墊高箱頂而永遠突破不了）。</div></div>
-  <div class="step"><div class="no">4</div><div class="tx"><b>K棒強度</b>：實體 <span class="k">Close−Open ＞ ATR(${ap})×${am}</span> <b>且</b> 收盤位置 <span class="k">(Close−Low)/(High−Low) ≥ ${cp}</span>（收盤貼近當日高、避免長上影線假突破）。</div></div>
-  <div class="step"><div class="no">5</div><div class="tx"><b>量能</b>：當日量 ＞ <span class="k">${va} 日均量 ×${vm}</span>。</div></div>
-  <div class="fml"><code>Box_High = Highest(High,${bd})[1]　Box_Low = Lowest(Low,${bd})[1]</code><br>
-    盤整：<code>CountIf(Box_Width ≤ ${bw}%, ${bcb}) ≥ ${bmin}</code>　突破：<code>Close &gt; Box_High[1]</code> 且 <code>(Close−Low)/(High−Low) ≥ ${cp}</code></div>
+  <h3>② 盤整突破</h3>
+  <p class="lead">股價在一個箱型區間橫盤，直到某天帶量向上突破箱頂。</p>
+  <h4><span class="badge u">精簡版</span>條件（同時成立）</h4>
+  <div class="fml">1. <b>前 ${ubd} 日區間盤整</b>：箱幅 <code>(箱頂−箱底)/Close ≤ ${ubw}%</code>（箱頂/底＝近 ${ubd} 日最高/最低）<br>
+    2. <b>突破箱頂</b>：<code>Close &gt; 近${ubd}日最高</code>（創 ${ubd} 日新高）<br>
+    3. <b>帶量</b>：<code>今量 ≥ 前一日量 × ${uvm}</code></div>
+  <h4><span class="badge ai">AI建議版</span>加嚴之處</h4>
+  <div class="fml">・箱頂取<b>昨日值</b> <code>Box_High[1]</code>（避免當日新高墊高箱頂而永遠突破不了）<br>
+    ・加<b>時間濾網</b>：近 ${bcb} 根至少 ${bmin} 根箱幅 ≤ ${bw}%（確保長時間橫盤）<br>
+    ・加 <b>K棒強度</b>：實體 &gt; ATR(${ap})×${am} 且 收盤位置 <code>(Close−Low)/(High−Low) ≥ ${cp}</code>（避免長上影線假突破）<br>
+    ・量能改以 <b>${va} 日均量</b> 為基準</div>
 
-  <h3>怎麼用這兩張表</h3>
-  <ul>
-    <li><b>量倍</b>＝今日量 ÷ ${va} 日均量；<b>糾結度%／箱幅%</b> 越小＝整理越緊；<b>糾結K／盤整K</b>＝時間濾網達標根數（越多＝沉澱越久）。</li>
-    <li><b>分數</b>：綜合「整理越緊、時間越久、量能越大、突破K棒越強」的 0–100 分，只供<b>排序</b>參考，非買賣訊號。</li>
-    <li>清單<b>依概念族群分群</b>：一眼看出今天是哪一類（ABF、AI 伺服器、重電、航運…）在帶量突破；無概念退回<b>產業別</b>。點列直接開 <b>K 線圖</b>再確認籌碼。</li>
-  </ul>
-  <div class="warn"><b>假突破風險</b>：帶量突破後若隔天量縮、收盤跌回均線糾結區或箱頂之下，多半是假突破，應嚴設停損（例如跌破箱頂或 MA20）。這兩個是嚴格濾網，某些交易日可能掛零，屬正常。</div>
+  <h3>兩版本對照</h3>
   <table>
-    <tr><th>門檻</th><th>目前設定</th><th>意義</th></tr>
-    <tr><td>帶量倍數</td><td>× ${vm}（÷${va}日均量）</td><td>今量相對正常量能的最低倍數</td></tr>
-    <tr><td>均線糾結度</td><td>≤ ${sq}%</td><td>四線黏合的鬆緊（越小越嚴）</td></tr>
-    <tr><td>糾結時間濾網</td><td>${mmin}/${mlb} 根</td><td>近${mlb}根至少幾根達糾結</td></tr>
-    <tr><td>箱型幅度</td><td>≤ ${bw}%</td><td>視為「盤整」的最大箱寬</td></tr>
-    <tr><td>盤整時間濾網</td><td>${bmin}/${bcb} 根</td><td>近${bcb}根至少幾根箱幅達標</td></tr>
-    <tr><td>K棒實體</td><td>&gt; ATR(${ap})×${am}</td><td>突破K棒的最小力道</td></tr>
+    <tr><th>項目</th><th><span class="badge u">精簡版</span></th><th><span class="badge ai">AI建議版</span></th></tr>
+    <tr><td>均線條數</td><td>5/10/20（3 條）</td><td>5/10/20/60（4 條）</td></tr>
+    <tr><td>糾結度門檻</td><td>≤ ${usp}%（${umin}/${umlb} 根）</td><td>≤ ${sq}%（${mmin}/${mlb} 根）</td></tr>
+    <tr><td>均線突破定義</td><td>站上三線</td><td>突破最上層均線＋強勢K棒</td></tr>
+    <tr><td>盤整箱幅</td><td>≤ ${ubw}%（單根）</td><td>≤ ${bw}%（${bmin}/${bcb} 根時間濾網）</td></tr>
+    <tr><td>盤整突破強度</td><td>突破 ${ubd} 日高</td><td>突破昨日箱頂＋收高＋實體&gt;ATR</td></tr>
+    <tr><td>量能基準</td><td>前一日量 ×${uvm}</td><td>${va} 日均量 ×${vm}</td></tr>
+    <tr><td>選出檔數</td><td>較多（較寬鬆）</td><td>較少（較嚴、假突破更少）</td></tr>
   </table>
-  <p class="discl">公式整理自具公信力之台股量化資料（鉅亨、MoneyDJ、財訊、永豐豐雲學堂、QuantPass 等）之「均線糾結突破」「箱型／唐奇安盤整突破」通則，並以量化條件實作（糾結度另有標準差法、盤整另有布林頻寬 Squeeze 法可選）。門檻可依個人回測校準；本頁為研究整理，非投資建議。</p>`;
+
+  <h3>怎麼看表</h3>
+  <ul>
+    <li><b>量比／量倍</b>：精簡版＝今量÷前一日；AI版＝今量÷${va}日均量。<b>糾結度%／箱幅%</b> 越小＝整理越緊；<b>糾結K／盤整K</b>＝時間濾網達標根數。</li>
+    <li><b>分數</b>：綜合「整理越緊、量能越大、突破越強」的 0–100 分，只供<b>排序</b>參考，非買賣訊號。</li>
+    <li>清單<b>依概念族群分群</b>；點列直接開 <b>K 線圖</b>再確認籌碼。停損可設在「帶量突破紅K的最低點」，跌破多為假突破。</li>
+  </ul>
+  <div class="warn"><b>假突破風險</b>：帶量突破後若隔天量縮、收盤跌回均線糾結區或箱頂之下，多半是假突破，應嚴設停損。這些是「整理→突破」型濾網，某些交易日可能掛零，屬正常。</div>
+  <p class="discl">公式整理自具公信力之台股量化資料（鉅亨、MoneyDJ、財訊、永豐豐雲學堂、玉山證券、XQ、QuantPass 等）之「均線糾結突破」「箱型／唐奇安盤整突破」通則。門檻皆環境變數可調（精簡版 HUI_U_*、AI建議版 HUI_*）；本頁為研究整理，非投資建議。</p>`;
 }
 
 async function boot(){
@@ -663,21 +726,20 @@ async function boot(){
   try{ const r=await fetch("data/hui.json?v="+BUILD_V,{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
   if(!d){
     $("today").textContent="資料尚未產生";
-    ["ma","box"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/hui.json。</div>`; });
+    TABS.forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/hui.json。</div>`; });
     $("docbody").innerHTML=docHtml({});
     return;
   }
   $("today").textContent=d.today||"—";
   $("gentime").textContent=d.gentime||"—";
-  const c=d.counts||{};
-  $("cnt-ma").textContent=c.ma!=null?c.ma:(d.ma||[]).length;
-  $("cnt-box").textContent=c.box!=null?c.box:(d.box||[]).length;
-  const p=d.params||{};
+  const c=d.counts||{}, p=d.params||{};
+  TABS.forEach(k=>{ const e=$("cnt-"+k); if(e) e.textContent=(c[k]!=null?c[k]:(d[k]||[]).length); DATA[k]=d[k]||[]; });
   const setT=(id,v)=>{const e=$(id); if(e&&v!=null)e.textContent=v;};
-  setT("malb-i",p.ma_conv_lookback); setT("masp-i",p.ma_spread_pct); setT("vm-i",p.vol_mult);
-  setT("boxdays-i",p.box_days); setT("bcb-i",p.box_consoli_bars); setT("bw-i",p.box_width_pct);
-  DATA.ma=d.ma||[]; DATA.box=d.box||[];
-  ["ma","box"].forEach(renderTbl);
+  setT("uvm1",p.u_vol_mult); setT("uvm2",p.u_vol_mult); setT("umlb1",p.u_ma_conv_lookback); setT("umlb2",p.u_ma_conv_lookback); setT("usp1",p.u_ma_spread_pct);
+  setT("ubd1",p.u_box_days); setT("ubd2",p.u_box_days); setT("ubw1",p.u_box_width_pct);
+  setT("vad1",p.vol_avg_days); setT("asp1",p.ma_spread_pct); setT("amlb1",p.ma_conv_lookback); setT("amin1",p.ma_conv_min);
+  setT("bcb1",p.box_consoli_bars); setT("bw1",p.box_width_pct); setT("cp1",p.close_pos_min);
+  TABS.forEach(renderTbl);
   $("docbody").innerHTML=docHtml(p);
 }
 boot();
