@@ -552,6 +552,17 @@ TEMPLATE = r"""<!DOCTYPE html>
   .thrlbl{font-size:12px; color:var(--dim); margin-right:2px;}
   .thrbtn{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:7px 13px; font-size:13px; cursor:pointer; font-weight:700;}
   .thrbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  /* 概念分群：群組標題列 + 分群切換鈕 */
+  .gtog{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:6px 11px; font-size:12px; cursor:pointer; font-weight:700; white-space:nowrap;}
+  .gtog.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  tr.grouphdr td{background:var(--card2); border-top:2px solid var(--border); padding:6px 10px; font-weight:800; font-size:13px; color:var(--text);}
+  tr.grouphdr .ghlbl{position:sticky; left:10px; display:inline-block;}
+  tr.grouphdr .gchip{display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-right:7px;}
+  tr.grouphdr.gc .gchip{background:rgba(77,159,255,.16); color:#6fb0ff;}
+  tr.grouphdr.gi .gchip{background:rgba(94,111,134,.18); color:#93a3b8;}
+  tr.grouphdr .gcount{color:var(--dim); font-weight:600; font-size:11px; margin-left:6px;}
+  .rotseg{display:inline-flex; gap:4px; margin:0 6px; vertical-align:middle;}
+  .rotseg .gtog{padding:4px 10px;}
   .zone{display:inline-block; padding:2px 7px; border-radius:6px; font-size:11px; font-weight:700; border:1px solid; white-space:nowrap;}
   .z-value{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.45);}
   .z-upper{background:var(--blue-s); color:var(--blue); border-color:rgba(77,159,255,.3);}
@@ -759,7 +770,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       <button class="chip on" data-mkt="全部">全部</button>
       <button class="chip" data-mkt="上市">上市</button>
       <button class="chip" data-mkt="上櫃">上櫃</button>
-      <span class="hint">點欄位排序 ・ 點名稱看K線</span>
+      <button class="gtog on" id="screenGtog" title="依概念股/產業族群分組排列">☰ 依概念分群</button>
+      <span class="hint">點欄位排序 ・ 點名稱看K線 ・ 分群時同概念(退回產業)歸一組</span>
     </div>
     <div class="hbar" id="screenHbar"><div></div></div>
     <div class="tablewrap" id="screenWrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
@@ -775,6 +787,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <button class="thrbtn" data-thr="200">200張</button>
       <button class="thrbtn" data-thr="500">500張</button>
       <button class="thrbtn" data-thr="1000">1000張</button>
+      <button class="gtog on" id="trustGtog" title="依概念股/產業族群分組排列" style="margin-left:8px">☰ 依概念分群</button>
     </div>
     <details class="explain">
       <summary>篩選邏輯與指標說明（點開）</summary>
@@ -833,7 +846,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- 120 日產業資金輪動 -->
     <div class="flowsec">
-      <div class="fsec-h">🔄 產業資金輪動<span class="fsec-sub">近 <span id="rotdays">120</span> 交易日 三大法人累計買賣超(億) ・ 紅＝資金流入 綠＝流出 ・ 點族群展開成分股</span></div>
+      <div class="fsec-h">🔄 資金輪動<span class="rotseg"><button class="gtog on" data-rm="ind">產業</button><button class="gtog" data-rm="concept">概念股</button></span><span class="fsec-sub">近 <span id="rotdays">120</span> 交易日 三大法人累計買賣超(億) ・ 紅＝流入 綠＝流出 ・ 點族群展開成分股</span></div>
       <div class="rotbox" id="rotbox"><div class="tpempty">資金輪動資料載入中…</div></div>
       <details class="exp"><summary>說明 / 指標</summary>
         <div class="expbody">
@@ -894,6 +907,30 @@ function indTag(sid){ const s=indLabel(sid); return s?`<span class="indtag">${s}
 function conceptList(sid){ try{ return (CONCEPTS&&CONCEPTS[sid])?CONCEPTS[sid]:[]; }catch(e){ return []; } }
 function conceptChips(sid){ const a=conceptList(sid); return a.length?a.map(c=>`<span class="cchip">${c}</span>`).join(""):""; }
 function conceptInline(sid){ const a=conceptList(sid); return a.length?`<span class="cchip concept-sm">${a[0]}${a.length>1?" +"+(a.length-1):""}</span>`:""; }
+/* 依「概念(優先，取主概念=第一個)／產業別(退回)／未分類」把清單分群；概念群在前、產業次之、未分類最後，
+   同類再依檔數多→少排序。每群內維持傳入清單的既有排序。多概念個股只歸入主概念，不重複出現。 */
+function groupByConcept(rows, sidOf){
+  const gm={};
+  for(const r of rows){
+    const sid=sidOf(r), cs=conceptList(sid);
+    let name, isC;
+    if(cs.length){ name=cs[0]; isC=true; }
+    else { const ind=indLabel(sid); name=ind||"未分類"; isC=false; }
+    (gm[name]||(gm[name]={name, isConcept:isC, rows:[]})).rows.push(r);
+  }
+  const arr=Object.keys(gm).map(k=>gm[k]);
+  arr.sort((a,b)=>{
+    const ap=a.name==="未分類"?2:(a.isConcept?0:1), bp=b.name==="未分類"?2:(b.isConcept?0:1);
+    if(ap!==bp) return ap-bp;
+    if(b.rows.length!==a.rows.length) return b.rows.length-a.rows.length;
+    return a.name.localeCompare(b.name);
+  });
+  return arr;
+}
+/* 群組標題列 HTML（colspan 跨整表）。cols=表格欄數。 */
+function groupHdrRow(g, cols){
+  return `<tr class="grouphdr ${g.isConcept?'gc':'gi'}"><td colspan="${cols}"><span class="ghlbl"><span class="gchip">${g.isConcept?'概念':'產業'}</span>${g.name}<span class="gcount">${g.rows.length}檔</span></span></td></tr>`;
+}
 
 /* ---------- 分頁切換 ---------- */
 const PANES = ["home", "screen", "trust", "flow"];
@@ -1012,6 +1049,12 @@ async function loadIndustry(){
   const rd=document.getElementById("rotdays"); if(rd&&INDDATA.rotation) rd.textContent=INDDATA.rotation.win_days||120;
   renderHeatmap(); renderRotation();
 }
+document.querySelectorAll("[data-rm]").forEach(b=>b.addEventListener("click",()=>{
+  rotMode=b.dataset.rm;
+  document.querySelectorAll("[data-rm]").forEach(x=>x.classList.toggle("on",x.dataset.rm===rotMode));
+  const rd=document.getElementById("rotdays"), rot=curRot(); if(rd&&rot) rd.textContent=(rot.win_days||120);
+  renderRotation();
+}));
 
 /* 漲跌幅 → 紅(漲)/綠(跌) 熱圖色，深淺隨幅度 */
 function heatColor(chg){
@@ -1082,10 +1125,13 @@ window.addEventListener("resize",()=>{ if(!INDDATA) return; clearTimeout(_heatTO
 function fnum(v,d){ return (v==null||isNaN(v))?"—":(Number(v)>0?"+":"")+Number(v).toFixed(d==null?1:d); }
 function gpx(p){ return (p==null||isNaN(p))?"—":Number(p).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function gcls(v){ return (v==null||isNaN(v))?"dim":(Number(v)>0?"up":(Number(v)<0?"down":"")); }
+let rotMode="ind";   // ind=產業鏈輪動 / concept=概念股輪動
+function curRot(){ if(!INDDATA) return null; return rotMode==="concept" ? (INDDATA.rotation_concept||null) : (INDDATA.rotation||null); }
 function renderRotation(){
-  const box=document.getElementById("rotbox"); if(!box||!INDDATA||!INDDATA.rotation) return;
-  const gs=INDDATA.rotation.groups||[];
-  if(!gs.length){ box.innerHTML='<div class="tpempty">無資金輪動資料</div>'; return; }
+  const box=document.getElementById("rotbox"); if(!box||!INDDATA) return;
+  const rot=curRot();
+  const gs=(rot&&rot.groups)||[];
+  if(!gs.length){ box.innerHTML='<div class="tpempty">'+(rotMode==="concept"?"概念股資金輪動資料尚未產生（下次更新後出現）":"無資金輪動資料")+'</div>'; return; }
   const mx=Math.max(1,...gs.map(g=>Math.abs(g.net120||0)));
   box.innerHTML=gs.map((g,i)=>{
     const v=g.net120||0, w=(Math.abs(v)/mx*50).toFixed(2), pos=v>=0;
@@ -1132,7 +1178,7 @@ function toggleGroup(i){
   const open=row.classList.toggle("open");
   const panel=document.getElementById("gpanel-"+i);
   if(open && panel && !panel.dataset.done){
-    const g=(INDDATA.rotation.groups||[])[i]; if(!g){ return; }
+    const g=((curRot()&&curRot().groups)||[])[i]; if(!g){ return; }
     let head=`<th class="frz">名稱<br><span style="font-weight:500;color:var(--dim)">代號·市場</span></th>`;
     // 每欄堆兩個指標，與成分股緊湊表一致
     const pairs=[["股價","漲幅"],["位階","月斜"],["主5","主10"],["法20","量比"],["季乖離",""]];
@@ -1151,6 +1197,7 @@ function toggleGroup(i){
 }
 let trustThr = 50;
 let trustSort = {key:"評分", asc:false};
+let trustGroup = true;
 const SELL_BACK_FRAC = 0.6;   // 連買後若被賣回 ≥ 此比例的累計買超 → 視為投信已落跑，排除
 const TCOLS = [
   ["代號","l",        r=>r.sid],
@@ -1237,8 +1284,12 @@ function renderTrust(){
   if(!rows.length){
     tb.innerHTML=`<tr><td colspan="${nc}" style="text-align:center;color:var(--dim);padding:36px">此門檻下沒有符合「投信連買 ≥3 日且尚未漲上去、且未被賣回」的個股<br>可試試降低每日張數門檻</td></tr>`; return;
   }
-  const pct=(v)=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
-  tb.innerHTML = rows.map(r=>{
+  tb.innerHTML = trustGroup
+    ? groupByConcept(rows, r=>r.sid).map(g=>groupHdrRow(g,nc)+g.rows.map(trustRowHtml).join("")).join("")
+    : rows.map(trustRowHtml).join("");
+}
+function trustRowHtml(r){
+    const pct=(v)=>(v>=0?"+":"")+(v*100).toFixed(1)+"%";
     const domc = r.dominance>=0.25?"var(--amber)":r.dominance>=0.12?"#d98818":"var(--text)";
     const costc = r.costBias<=0?"var(--down)":"var(--up)";
     const sbc = r.soldBack>=0.3?"var(--amber)":"var(--dim)";
@@ -1262,12 +1313,12 @@ function renderTrust(){
       <td class="num">${r.stillBuying?'<span style="color:var(--up)">是</span>':'<span style="color:var(--dim)">—</span>'}</td>
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(r.score,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r.score.toFixed(0)}</span></span></td>
     </tr>`;
-  }).join("");
 }
 document.querySelectorAll(".thrbtn").forEach(b=>b.addEventListener("click",()=>{
   document.querySelectorAll(".thrbtn").forEach(x=>x.classList.remove("on")); b.classList.add("on");
   trustThr=parseInt(b.dataset.thr,10); renderTrust();
 }));
+document.getElementById("trustGtog").addEventListener("click",e=>{ trustGroup=!trustGroup; e.currentTarget.classList.toggle("on",trustGroup); renderTrust();});
 
 /* ---------- 選股表格 ---------- */
 const TAGS = {
@@ -1310,8 +1361,7 @@ function renderHead(){
   document.getElementById("thead").innerHTML=COLS.map(([n,c])=>{const ar=state.sort===n?`<span class="ar">${state.asc?"▲":"▼"}</span>`:""; return `<th class="${c}" data-k="${n}">${n}${ar}</th>`;}).join("");
   document.querySelectorAll("#thead th").forEach(th=>th.onclick=()=>{const k=th.dataset.k; if(state.sort===k)state.asc=!state.asc; else {state.sort=k;state.asc=false;} render();});
 }
-function renderTable(d){
-  document.getElementById("tbody").innerHTML=d.map(r=>{
+function screenRowHtml(r){
     const chg=num(r["漲跌%"]), cc=chg>0?"var(--up)":chg<0?"var(--down)":"var(--muted)";
     const lim=chg>=9.5?`<span class="lim" style="background:var(--up)">漲停</span>`:(chg<=-9.5?`<span class="lim" style="background:var(--down)">跌停</span>`:"");
     const vr=num(r["量比"])||0, vc=vr>=3?"var(--amber)":vr>=2?"#d98818":"var(--text)";
@@ -1327,7 +1377,13 @@ function renderTable(d){
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(sv,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r["評分"]}</span></span></td>
       <td class="num">${r["_zoneLabel"]?`<span class="zone ${r["_zoneCls"]}">${r["_zoneLabel"]}</span><span class="zpos">${r["爆量月位階"]}%</span>`:'<span style="color:var(--dim)">—</span>'}</td>
       <td class="tags">${tags}</td></tr>`;
-  }).join("")||`<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`;
+}
+let screenGroup=true;
+function renderTable(d){
+  const tb=document.getElementById("tbody");
+  if(!d.length){ tb.innerHTML=`<tr><td colspan="13" style="text-align:center;color:var(--dim);padding:36px">今日無符合條件的標的</td></tr>`; return; }
+  if(!screenGroup){ tb.innerHTML=d.map(screenRowHtml).join(""); return; }
+  tb.innerHTML=groupByConcept(d, r=>r["代號"]).map(g=>groupHdrRow(g,13)+g.rows.map(screenRowHtml).join("")).join("");
 }
 function render(){const d=view(); renderCards(d); renderBars(d); renderHead(); renderTable(d);
   document.getElementById("subtitle").textContent=`資料日 __DATE__ ・ 顯示 ${d.length} 檔`; syncTopScroll();}
@@ -1343,6 +1399,7 @@ function syncTopScroll(){
 window.addEventListener("resize",()=>{ try{ syncTopScroll(); }catch(e){} });
 document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value; render();});
 document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{document.querySelectorAll(".chip").forEach(x=>x.classList.remove("on")); c.classList.add("on"); state.mkt=c.dataset.mkt; render();}));
+document.getElementById("screenGtog").addEventListener("click",e=>{ screenGroup=!screenGroup; e.currentTarget.classList.toggle("on",screenGroup); render();});
 
 /* ===== 技術線圖引擎 ===== */
 const MACOLOR={5:"#f5c518",10:"#e23fd0",20:"#27c4dc",60:"#c79a52",240:"#3b6fe0"};

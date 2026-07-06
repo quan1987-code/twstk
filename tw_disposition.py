@@ -456,6 +456,15 @@ def build_notifications(ongoing, today):
 # ===== 組裝/輸出 =====
 def build_payload(today, next_td, watch, confirmed, ongoing, diag):
     notify = build_notifications(ongoing, today)
+    # 附上概念股標籤(cpt)：供處置頁依概念分群（無概念時前端退回產業別 ind）
+    try:
+        import tw_concepts
+        _cmap = tw_concepts.concept_map()
+    except Exception:
+        _cmap = {}
+    for _lst in (watch, confirmed, ongoing, notify):
+        for _r in _lst:
+            _r["cpt"] = _cmap.get(str(_r.get("sid", "")), [])
     return {"gentime": now_taipei(), "today": today, "next_td": next_td,
             "counts": {"watch": len(watch), "confirmed": len(confirmed),
                        "ongoing": len(ongoing), "notify": len(notify)},
@@ -709,6 +718,15 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .dtbl .sortlbl{cursor:pointer; display:inline-block; padding:1px 3px; border-radius:5px;}
   .dtbl .sortlbl.on{color:var(--amber); background:var(--amber-s);}
   .dtbl .sortlbl i{font-style:normal; font-size:9px; margin-left:1px;}
+  /* 概念分群：切換鈕 + 群組標題列 */
+  .gtog{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; font-weight:700; vertical-align:middle;}
+  .gtog.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
+  .dtbl tr.grouphdr td{text-align:left; background:var(--card2); border-top:2px solid var(--border); padding:6px 11px; font-weight:800; font-size:13px; color:var(--text);}
+  .dtbl tr.grouphdr .ghlbl{position:sticky; left:10px; display:inline-block;}
+  .dtbl tr.grouphdr .gchip{display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-right:7px;}
+  .dtbl tr.grouphdr.gc .gchip{background:rgba(77,159,255,.16); color:#6fb0ff;}
+  .dtbl tr.grouphdr.gi .gchip{background:rgba(94,111,134,.18); color:#93a3b8;}
+  .dtbl tr.grouphdr .gcount{color:var(--dim); font-weight:600; font-size:11px; margin-left:6px;}
   .dtbl tbody tr{cursor:pointer;}
   .dtbl tbody tr:active{background:rgba(255,255,255,.05);}
   .dtbl tbody tr:active td.frz{background:#10192b;}
@@ -783,7 +801,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>🚦 處置股專區</h1>
-    <div class="sub">資料日 <span id="today" class="num">—</span> ・ 更新 <span id="gentime" class="num">—</span>（台北）　<a href="index.html">← 回主看板</a>　<a href="market.html">市場分析</a></div>
+    <div class="sub">資料日 <span id="today" class="num">—</span> ・ 更新 <span id="gentime" class="num">—</span>（台北）　<button class="gtog on" id="dispGtog" title="依概念股/產業族群分組排列">☰ 依概念分群</button>　<a href="index.html">← 回主看板</a>　<a href="market.html">市場分析</a></div>
   </header>
 
   <div class="cztabs" id="cztabs">
@@ -1013,6 +1031,36 @@ function sortRows(name){
     if(!an&&!bn)return 0; if(!an)return 1; if(!bn)return -1; return s.asc?(av-bv):(bv-av); }); }
   return arr;
 }
+let dispGroup=true;   // 依概念(退回產業)分群，預設開
+/* 概念分群：概念(r.cpt 主概念)優先，退回產業(r.ind)，再退回未分類；概念群在前、產業次之、未分類最後 */
+function dispGroupBy(rows){
+  const gm={};
+  rows.forEach(r=>{
+    const cs=(r.cpt&&r.cpt.length)?r.cpt:null;
+    let name, isC;
+    if(cs){ name=cs[0]; isC=true; } else { name=r.ind||"未分類"; isC=false; }
+    (gm[name]||(gm[name]={name,isConcept:isC,rows:[]})).rows.push(r);
+  });
+  const arr=Object.keys(gm).map(k=>gm[k]);
+  arr.sort((a,b)=>{ const ap=a.name==="未分類"?2:(a.isConcept?0:1), bp=b.name==="未分類"?2:(b.isConcept?0:1);
+    if(ap!==bp)return ap-bp; if(b.rows.length!==a.rows.length)return b.rows.length-a.rows.length; return a.name.localeCompare(b.name); });
+  return arr;
+}
+function dispGroupHdr(g,cols){ return `<tr class="grouphdr ${g.isConcept?'gc':'gi'}"><td colspan="${cols}"><span class="ghlbl"><span class="gchip">${g.isConcept?'概念':'產業'}</span>${esc(g.name)}<span class="gcount">${g.rows.length}檔</span></span></td></tr>`; }
+function dispRowHtml(r,cols){
+    const sc=isNum(r.chg)?(r.chg>0?"up":(r.chg<0?"down":"")):"";
+    let tds="";
+    cols.forEach(col=>{ tds+="<td>"+col.map(([lab,key])=>{ const f=fmtCell(key,r[key],r); return `<span class="cv ${f.c}">${f.t}</span>`; }).join("<br>")+"</td>"; });
+    const per=(r.start||r.end)?`${esc((r.start||"").slice(5))}~${esc((r.end||"").slice(5))}`:"";
+    return `<tr class="side-${sc}" onclick="goChart('${esc(r.sid)}')">
+      <td class="frz nmcell">
+        <div class="nm">${r.light?dotFor(r.light):""}${esc(r.name||"")}${methodChip(r.method)}${roundChip(r.round)}</div>
+        <div class="sub">${esc(r.sid)}${r.mkt?" "+esc(r.mkt):""}</div>
+        ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
+        ${per?`<div class="per">${per}</div>`:""}
+        ${(r.reasons&&r.reasons.length)?`<div class="nrz">${r.reasons.map(x=>`<span class="ntag">${esc(x)}</span>`).join("")}</div>`:""}
+      </td>${tds}</tr>`;
+}
 function renderTbl(name){
   const el=$("list-"+name); if(!el) return;
   const data=LISTDATA[name]||[];
@@ -1022,21 +1070,10 @@ function renderTbl(name){
   let thead=`<th class="frz">名稱<br><span class="sub">代號 / 處置期</span></th>`;
   cols.forEach(col=>{ thead+="<th>"+col.map(([lab,key])=>
     `<span class="sortlbl${s.key===key?' on':''}" data-n="${name}" data-k="${key}">${lab}<i>${arrow(key)}</i></span>`).join("<br>")+"</th>"; });
+  const ncol=cols.length+1;
   let tb="";
-  rows.forEach(r=>{
-    const sc=isNum(r.chg)?(r.chg>0?"up":(r.chg<0?"down":"")):"";
-    let tds="";
-    cols.forEach(col=>{ tds+="<td>"+col.map(([lab,key])=>{ const f=fmtCell(key,r[key],r); return `<span class="cv ${f.c}">${f.t}</span>`; }).join("<br>")+"</td>"; });
-    const per=(r.start||r.end)?`${esc((r.start||"").slice(5))}~${esc((r.end||"").slice(5))}`:"";
-    tb+=`<tr class="side-${sc}" onclick="goChart('${esc(r.sid)}')">
-      <td class="frz nmcell">
-        <div class="nm">${r.light?dotFor(r.light):""}${esc(r.name||"")}${methodChip(r.method)}${roundChip(r.round)}</div>
-        <div class="sub">${esc(r.sid)}${r.mkt?" "+esc(r.mkt):""}</div>
-        ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
-        ${per?`<div class="per">${per}</div>`:""}
-        ${(r.reasons&&r.reasons.length)?`<div class="nrz">${r.reasons.map(x=>`<span class="ntag">${esc(x)}</span>`).join("")}</div>`:""}
-      </td>${tds}</tr>`;
-  });
+  if(dispGroup){ dispGroupBy(rows).forEach(g=>{ tb+=dispGroupHdr(g,ncol)+g.rows.map(r=>dispRowHtml(r,cols)).join(""); }); }
+  else { tb=rows.map(r=>dispRowHtml(r,cols)).join(""); }
   el.innerHTML=`<div class="dtbl-wrap"><table class="dtbl"><thead><tr>${thead}</tr></thead><tbody>${tb}</tbody></table></div>`;
   el.querySelectorAll(".sortlbl").forEach(b=>b.addEventListener("click",ev=>{ ev.stopPropagation();
     const n=b.dataset.n,k=b.dataset.k,st=sortState[n]; if(st.key===k)st.asc=!st.asc; else{st.key=k;st.asc=false;} renderTbl(n); }));
@@ -1102,6 +1139,8 @@ async function boot(){
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
   }
 }
+const _dgt=document.getElementById("dispGtog");
+if(_dgt) _dgt.addEventListener("click",e=>{ dispGroup=!dispGroup; e.currentTarget.classList.toggle("on",dispGroup); ["notify","watch","ongoing"].forEach(n=>renderTbl(n)); });
 boot();
 </script>
 </body>

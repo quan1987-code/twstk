@@ -231,9 +231,49 @@ def build(con):
     rotation = {"win_days": min(ROT_WINDOW, len(dates_desc)),
                 "date": latest, "groups": rot_groups}
 
+    # ---------- (3) 概念股資金輪動：依概念(一檔可複屬多概念)彙總三大法人淨額 ----------
+    try:
+        import tw_concepts
+        cmap = tw_concepts.concept_map()
+    except Exception:
+        cmap = {}
+    cgroups = {}
+    for sid in stock_ind:
+        if sid not in inst:        # 無三大法人資料者不計入
+            continue
+        for cpt in cmap.get(sid, []):
+            cgroups.setdefault(cpt, []).append(sid)
+    rot_groups_c = []
+    for g, sids in cgroups.items():
+        if len(sids) < GROUP_MIN_STOCKS:
+            continue
+        agg = {"net5": 0.0, "net20": 0.0, "net60": 0.0, "net120": 0.0}
+        rows = []
+        for sid in sids:
+            ind = stock_ind[sid]
+            for k in agg:
+                if ind.get(k) is not None:
+                    agg[k] += ind[k]
+            rows.append({
+                "sid": sid, "name": names.get(sid, sid), "mkt": markets.get(sid, ""),
+                "close": ind.get("close"), "chg": ind.get("chg"),
+                "wj": ind.get("wj"), "yx": ind.get("yx"),
+                "z5": ind.get("z5"), "z10": ind.get("z10"),
+                "net20": ind.get("net20"), "vr": ind.get("vr"), "bias60": ind.get("bias60")})
+        rows.sort(key=lambda r: (r["net20"] if r["net20"] is not None else 0), reverse=True)
+        rot_groups_c.append({
+            "name": g, "sector": "概念股", "n": len(sids),
+            "net5": round(agg["net5"], 1), "net20": round(agg["net20"], 1),
+            "net60": round(agg["net60"], 1), "net120": round(agg["net120"], 1),
+            "stocks": rows[:GROUP_STOCK_CAP]})
+    rot_groups_c.sort(key=lambda g: -g["net120"])
+    rotation_concept = {"win_days": min(ROT_WINDOW, len(dates_desc)),
+                        "date": latest, "groups": rot_groups_c}
+
     gentime = (datetime.datetime.now(datetime.timezone.utc)
                + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
-    return {"date": latest, "gentime": gentime, "heatmap": heatmap, "rotation": rotation}
+    return {"date": latest, "gentime": gentime, "heatmap": heatmap,
+            "rotation": rotation, "rotation_concept": rotation_concept}
 
 
 def output(data):
