@@ -482,6 +482,11 @@ TEMPLATE = r"""<!DOCTYPE html>
   .czentry{display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 14px; background:var(--card); border:1px solid var(--border); border-left:3px solid var(--amber); border-radius:8px; padding:12px 15px; color:var(--text); font-weight:700; font-size:14px; text-decoration:none;}
   .czentry .czt2{font-size:11px; color:var(--muted); font-weight:600; margin-left:2px;}
   .czentry .arr{color:var(--amber); font-weight:800; font-size:16px;}
+  /* 置頂精選：輝哥選股 */
+  .czentry.pin{border:1px solid rgba(245,165,36,.5); border-left:4px solid var(--amber);
+    background:linear-gradient(180deg, rgba(245,165,36,.12), rgba(245,165,36,.03)); font-size:15px;}
+  .czentry.pin .pinbadge{display:inline-block; font-size:10px; font-weight:800; color:#000; background:var(--amber);
+    border-radius:5px; padding:1px 6px; margin-right:7px; vertical-align:middle; letter-spacing:.5px;}
 
   /* 首頁回撤卡 */
   .ddcards{display:grid; grid-template-columns:1fr; gap:12px;}
@@ -555,7 +560,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   /* 概念分群：群組標題列 + 分群切換鈕 */
   .gtog{background:var(--card); color:var(--muted); border:1px solid var(--border); border-radius:8px; padding:6px 11px; font-size:12px; cursor:pointer; font-weight:700; white-space:nowrap;}
   .gtog.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
-  tr.grouphdr td{background:var(--card2); border-top:2px solid var(--border); padding:6px 10px; font-weight:800; font-size:13px; color:var(--text);}
+  tr.grouphdr td{text-align:left; background:var(--card2); border-top:2px solid var(--border); padding:6px 10px; font-weight:800; font-size:13px; color:var(--text);}
   tr.grouphdr .ghlbl{position:sticky; left:10px; display:inline-block;}
   tr.grouphdr .gchip{display:inline-block; font-size:10px; font-weight:700; padding:1px 6px; border-radius:5px; margin-right:7px;}
   tr.grouphdr.gc .gchip{background:rgba(77,159,255,.16); color:#6fb0ff;}
@@ -723,6 +728,10 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="tab" data-tab="flow">資金流向</button>
   </div>
 
+  <a class="czentry pin" href="hui.html">
+    <span><span class="pinbadge">置頂</span>🐉 輝哥選股<span class="czt2">均線突破四海遊龍 ＋ 盤整突破・依概念族群分類・附公式說明</span></span>
+    <span class="arr">→</span>
+  </a>
   <a class="czentry" href="market.html" style="border-left-color:var(--blue)">
     <span>📊 市場分析<span class="czt2">台美股每日盤勢・資金流向・族群雷達・每日監控清單</span></span>
     <span class="arr" style="color:var(--blue)">→</span>

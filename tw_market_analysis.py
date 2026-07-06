@@ -1446,7 +1446,7 @@ TEMPLATE = r"""<!doctype html>
   <header>
     <h1>📊 市場分析</h1>
     <div class="dates num" id="hdrDates">—</div>
-    <nav><a href="index.html">← 主看板</a><a href="chuzhi.html">處置股</a></nav>
+    <nav><a href="index.html">← 主看板</a><a href="hui.html">🐉 輝哥選股</a><a href="chuzhi.html">處置股</a></nav>
   </header>
 
   <div class="strip" id="strip"></div>

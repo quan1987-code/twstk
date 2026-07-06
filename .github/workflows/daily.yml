@@ -66,6 +66,8 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       - name: Build 產業資金流向（熱圖＋120日資金輪動）
         run: python tw_industry_flow.py
+      - name: Build 輝哥選股（均線突破四海遊龍／盤整突破）
+        run: python tw_hui_picks.py
       - name: Build 市場分析（台美股每日盤勢 market.html）
         run: python tw_market_analysis.py
       - name: Save price DB
