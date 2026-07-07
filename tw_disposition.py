@@ -190,6 +190,22 @@ def _ma(xs, n):
     s = [x for x in s if x is not None]
     return sum(s)/len(s) if s else None
 
+def peak60_dist(seq, n=60):
+    """目前收盤價 相對『近 n 日內「最高收盤價」那天的盤中最高價』的距離%。
+    seq: [(date,high,low,close,volume) 由舊到新]。多數為負(收盤低於該峰高)。"""
+    s = seq[-n:] if len(seq) > n else seq
+    rows = [(r[1], r[3]) for r in s if r[3] is not None]   # (high, close)
+    if not rows:
+        return None
+    peak_high, best_close = None, None
+    for h, c in rows:
+        if best_close is None or c > best_close:
+            best_close, peak_high = c, h
+    cur = rows[-1][1]
+    if peak_high is None or peak_high <= 0 or cur is None:
+        return None
+    return round((cur / peak_high - 1) * 100, 1)
+
 def compute_price_metrics(seq, idx6=0.0, disp_start=None):
     """seq: [(date,high,low,close,volume) 由舊到新]。回傳指標 dict。"""
     closes = [r[3] for r in seq if r[3] is not None]
@@ -449,37 +465,47 @@ def build_notifications(ongoing, today):
                     "tier": tier, "touch": touch, "z5": r.get("z5"), "z10": r.get("z10"),
                     "reasons": reasons, "st": r.get("d2r"), "method": r.get("method"),
                     "round": r.get("round"), "day_n": r.get("day_n"), "day_total": r.get("day_total"),
-                    "d2r": r.get("d2r"), "start": r.get("start"), "end": r.get("end")})
+                    "d2r": r.get("d2r"), "start": r.get("start"), "end": r.get("end"),
+                    "pk60": r.get("pk60")})
     out.sort(key=lambda x: (x["tier"] if x["tier"] is not None else 0, -(x.get("yx") or 0)))
     return out
 
 # ===== 組裝/輸出 =====
 def build_payload(today, next_td, watch, confirmed, ongoing, diag):
-    notify = build_notifications(ongoing, today)
+    notify = build_notifications(ongoing, today)   # 通知掃描全部處置中（拆分前）
+    # 依剩餘出關天數拆分：剩天(st/d2r) ≤3 → 即將出關(release_soon)；其餘(>3 或未知) → 處置中
+    def _rem(r):
+        v = r.get("st")
+        return v if v is not None else r.get("d2r")
+    release_soon = [r for r in ongoing if isinstance(_rem(r), (int, float)) and _rem(r) <= 3]
+    ongoing_disp = [r for r in ongoing if not (isinstance(_rem(r), (int, float)) and _rem(r) <= 3)]
     # 附上概念股標籤(cpt)：供處置頁依概念分群（無概念時前端退回產業別 ind）
     try:
         import tw_concepts
         _cmap = tw_concepts.concept_map()
     except Exception:
         _cmap = {}
-    for _lst in (watch, confirmed, ongoing, notify):
+    for _lst in (watch, confirmed, ongoing_disp, release_soon, notify):
         for _r in _lst:
             _r["cpt"] = _cmap.get(str(_r.get("sid", "")), [])
     return {"gentime": now_taipei(), "today": today, "next_td": next_td,
             "counts": {"watch": len(watch), "confirmed": len(confirmed),
-                       "ongoing": len(ongoing), "notify": len(notify)},
+                       "ongoing": len(ongoing_disp), "release_soon": len(release_soon),
+                       "notify": len(notify)},
             "diag": diag, "watch": watch, "confirmed": confirmed,
-            "ongoing": ongoing, "notify": notify}
+            "ongoing": ongoing_disp, "release_soon": release_soon, "notify": notify}
 
 def write_outputs(out_dir, payload):
     os.makedirs(os.path.join(out_dir, "data"), exist_ok=True)
     with open(os.path.join(out_dir, "data", "chuzhi.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
+    build_v = "".join(ch for ch in (payload.get("gentime") or "") if ch.isdigit()) or "0"
     with open(os.path.join(out_dir, "chuzhi.html"), "w", encoding="utf-8") as f:
-        f.write(CHUZHI_HTML)
+        f.write(CHUZHI_HTML.replace("__BUILDV__", build_v))
     c = payload["counts"]
     print(f"已寫出 {out_dir}/chuzhi.html 與 data/chuzhi.json "
-          f"（可能進入處置 {c['watch']}・確定 {c['confirmed']}・處置中 {c['ongoing']}・通知 {c['notify']}）")
+          f"（可能進入處置 {c['watch']}・確定 {c['confirmed']}・處置中 {c['ongoing']}"
+          f"・即將出關 {c.get('release_soon',0)}・通知 {c['notify']}）")
 
 # ===== 示範資料 =====
 def make_demo():
@@ -488,20 +514,22 @@ def make_demo():
     def row(sid,name,mkt,close,chg,**kw):
         d = {"sid":sid,"name":name,"mkt":mkt,"close":close,"chg":chg}; d.update(kw); return d
     watch = [
-        row("4129","聯合","上市",58.9,9.92,ind="生技-醫材",light="red",wj=8,yx=2.1,lf=33.8,vmult=6.4,st=1,z5=11.2,z10=8.4),
-        row("3083","網龍","上櫃",102.0,3.55,ind="電子下游-系統組裝",light="amber",wj=6,yx=1.4,lf=26.1,vmult=3.1,st=None,z5=-3.4,z10=-1.1),
+        row("4129","聯合","上市",58.9,9.92,ind="生技-醫材",light="red",wj=8,yx=2.1,lf=33.8,vmult=6.4,st=1,pk60=-2.5,z5=11.2,z10=8.4),
+        row("3083","網龍","上櫃",102.0,3.55,ind="電子下游-系統組裝",light="amber",wj=6,yx=1.4,lf=26.1,vmult=3.1,st=None,pk60=-8.0,z5=-3.4,z10=-1.1),
     ]
     confirmed = [
         row("2618","長榮航","上市",48.6,9.95,ind="航空",round=1,method="5分盤",start="2026-06-30",end="2026-07-11",
-            wj=5,yx=1.6,lf=-14.0,st=None,z5=-6.4,z10=-5.2),
+            wj=5,yx=1.6,lf=-14.0,st=None,pk60=-5.0,z5=-6.4,z10=-5.2),
     ]
     ongoing = [
-        row("2484","希華","上市",42.55,2.53,ind="電子上游-被動元件",round=1,method="5分盤",start="2026-06-23",end="2026-07-04",
-            day_n=3,day_total=10,release="2026-07-04",d2r=1,wj=0,yx=1.6,lf=-14.0,ma20=44.0,ma20_touch=True,st=1,z5=-6.4,z10=-5.2),
+        # 剩天 >3 → 留在「處置中」
+        row("2484","希華","上市",42.55,2.53,ind="電子上游-被動元件",round=1,method="5分盤",start="2026-06-23",end="2026-07-08",
+            day_n=4,day_total=10,release="2026-07-08",d2r=5,wj=0,yx=1.6,lf=-14.0,ma20=44.0,ma20_touch=True,st=5,pk60=-18.2,z5=-6.4,z10=-5.2),
+        # 剩天 ≤3 → 移到「即將出關」
         row("3339","泰谷","上市",59.8,-0.33,ind="光電-LED",round=1,method="5分盤",start="2026-06-23",end="2026-07-07",
-            day_n=3,day_total=11,release="2026-07-07",d2r=2,wj=2,yx=1.9,lf=-23.0,ma20=61.0,ma20_touch=False,st=2,z5=7.1,z10=1.3),
+            day_n=8,day_total=11,release="2026-07-07",d2r=2,wj=2,yx=1.9,lf=-23.0,ma20=61.0,ma20_touch=False,st=2,pk60=-24.1,z5=7.1,z10=1.3),
         row("8289","泰藝","上市",49.35,5.45,ind="電子上游-被動元件",round=2,method="20分盤",start="2026-06-23",end="2026-07-09",
-            day_n=11,day_total=12,release="2026-07-09",d2r=1,wj=0,yx=1.5,lf=-31.0,ma20=50.2,ma20_touch=True,st=1,z5=-6.2,z10=-7.2),
+            day_n=11,day_total=12,release="2026-07-09",d2r=1,wj=0,yx=1.5,lf=-31.0,ma20=50.2,ma20_touch=True,st=1,pk60=-30.4,z5=-6.2,z10=-7.2),
     ]
     return build_payload(today, next_trading_day(today), watch, confirmed, ongoing, diag)
 
@@ -566,7 +594,7 @@ def main():
                       "ind": ind_map.get(sid,""), "close": round(seq[-1][3],2), "chg": m["chg"],
                       "light": light, "wj": m["wj"], "yx": m["yx"], "lf": m["cum6"],
                       "vmult": vol_multiple(seq), "st": watch_estimate_days(m["cum6"], m["lc"]),
-                      "z5": None, "z10": None})
+                      "pk60": peak60_dist(seq), "z5": None, "z10": None})
     watch.sort(key=lambda x: (0 if x["light"]=="red" else 1, -(x["lf"] or 0)))
 
     # 處置中／明日確定：補價格指標
@@ -577,7 +605,7 @@ def main():
                 m = compute_price_metrics(seq, idx6, disp_start=r.get("start"))
                 r["close"] = round(seq[-1][3], 2)
                 r.update({"chg": m["chg"], "wj": m["wj"], "yx": m["yx"], "lf": m["lf"],
-                          "ma20": m["ma20"], "ma20_touch": m["ma20_touch"]})
+                          "ma20": m["ma20"], "ma20_touch": m["ma20_touch"], "pk60": peak60_dist(seq)})
             r["name"] = names.get(r["sid"], r.get("name","")); r["mkt"] = mkts.get(r["sid"], "")
             r["ind"] = ind_map.get(r["sid"], "")
             r.setdefault("z5", None); r.setdefault("z10", None)
@@ -809,6 +837,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <button class="czt" data-p="notify">🔔 通知</button>
     <button class="czt" data-p="watch">可能進入處置</button>
     <button class="czt" data-p="ongoing">處置中</button>
+    <button class="czt" data-p="release">🔓 即將出關</button>
     <button class="czt" data-p="teach">實戰教學</button>
     <button class="czt" data-p="rule">規則說明</button>
   </div>
@@ -818,6 +847,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
       <div class="stat r"><div class="n num" id="cnt-n">—</div><div class="l">🔔 通知</div></div>
       <div class="stat w"><div class="n num" id="cnt-w">—</div><div class="l">可能進入處置</div></div>
       <div class="stat o"><div class="n num" id="cnt-o">—</div><div class="l">處置中</div></div>
+      <div class="stat"><div class="n num" id="cnt-rs" style="color:var(--down)">—</div><div class="l">🔓 即將出關</div></div>
     </div>
     <div class="note">
       <b>燈號</b>：<span class="dot red"></span>紅＝今日已觸發漲幅型（第1款）　<span class="dot amber"></span>黃＝接近門檻　<span class="dot green"></span>綠＝安全。<br>
@@ -841,10 +871,17 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="pane hidden" id="p-ongoing">
-    <div class="sech">⛓️ 處置中（坐牢） <span class="pill">分盤交易期</span></div>
-    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
+    <div class="sech">⛓️ 處置中（坐牢） <span class="pill">分盤交易期・剩餘 &gt;3 交易日</span></div>
+    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線（剩餘 ≤3 日者見「即將出關」）</div>
     <div id="list-ongoing"></div>
     <div id="expl-ongoing"></div>
+  </div>
+
+  <div class="pane hidden" id="p-release">
+    <div class="sech">🔓 即將出關 <span class="pill">剩餘 ≤3 交易日・分盤即將解除</span></div>
+    <div class="tblhint">由「處置中」自動移入（剩餘出關天數 ≤3 日）・排版與處置中相同・點欄位標題排序・點列看 K 線</div>
+    <div id="list-release"></div>
+    <div id="expl-release"></div>
   </div>
 
   <div class="pane hidden" id="p-teach">
@@ -925,6 +962,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 <footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（處置／分點籌碼／價量・法人）、台灣證交所／櫃買中心 ・ 僅供研究，非投資建議</footer>
 
 <script>
+const BUILD_V = "__BUILDV__" || "0";
 const $ = id => document.getElementById(id);
 const esc = s => String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
 const isNum = v => v!=null && v!=="" && !isNaN(v);
@@ -990,23 +1028,25 @@ function renderList(elId, arr, opt){
 }
 
 /* ---- 緊湊表格（仿處置神器）：凍結首欄、可左右滑動、點欄位標題排序 ---- */
-const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, ongoing:{key:null,asc:false} };
-const LISTDATA = { notify:[], watch:[], ongoing:[] };
+const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, ongoing:{key:null,asc:false}, release:{key:null,asc:false} };
+const LISTDATA = { notify:[], watch:[], ongoing:[], release:[] };
 const LISTOPT = {
   notify:{prog:true, empty:"目前沒有達到通知標準的處置中個股。<br><span style=\"color:var(--dim)\">標準：月斜&gt;1% 且（累計跌幅破 -10/-20/-30%，或當日K棒觸及20MA月線）</span>"},
   watch:{light:true, empty:"目前沒有接近處置門檻的個股。"},
-  ongoing:{prog:true, empty:"目前沒有處置中的個股。"}
+  ongoing:{prog:true, empty:"目前沒有剩餘 &gt;3 交易日的處置中個股。"},
+  release:{prog:true, empty:"目前沒有即將出關（剩餘 ≤3 交易日）的處置中個股。"}
 };
 // 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻、處置中/通知多一欄進度
 function colSpec(name){
   const c=[
     [["股價","close"],["漲幅","chg"]],
+    [["距峰高%","pk60"]],
     [["位階","wj"],["月斜","yx"]],
     [["累幅","lf"],["剩天","st"]],
     [["主5","z5"],["主10","z10"]],
   ];
   if(name==="watch") c.push([["量倍","vmult"],["價門檻","lf"]]);
-  if(name==="ongoing"||name==="notify") c.push([["進度","day_n"],["剩","d2r"]]);
+  if(name==="ongoing"||name==="notify"||name==="release") c.push([["進度","day_n"],["剩","d2r"]]);
   return c;
 }
 function fmtCell(key,v,r){
@@ -1021,6 +1061,7 @@ function fmtCell(key,v,r){
     case "lf":    return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:(r.light!=null&&n>=32)?"up":signCls(n)};
     case "st": case "d2r": return {t:String(Math.round(n)),c:""};
     case "z5": case "z10": return {t:n.toFixed(1)+"%",c:signCls(n)};
+    case "pk60": return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
     case "vmult": return {t:n.toFixed(1)+"x", c:(n>=5?"up":"amb")};
   }
   return {t:String(n),c:""};
@@ -1085,6 +1126,7 @@ const EXPL = `
 <div class="g">
 <span class="k">處置 起~迄</span><span>該股分盤處置的起始與結束日。</span>
 <span class="k">產業</span><span>股名下方小字＝產業鏈分類（主要個股為上中下游＋子類，其餘為大分類）。</span>
+<span class="k">距峰高%</span><span>目前收盤價 相對「近 60 日內『最高收盤價』那天的<b>盤中最高價</b>」的距離%。公式＝(今收 ÷ 該峰日最高價 − 1)×100，多為負值(收盤低於該峰高)；<b>越負代表距近期高點回檔越深</b>，處置中被錯殺時常是低接觀察點。</span>
 <span class="k">位階</span><span>20日布林通道整數級距：<b>+10</b>＝上軌(基期偏高、較適放空)、<b>0</b>＝月線(中線)、<b>-10</b>＝下軌(基期偏低、較適做多)。公式＝round((收盤−MA20)÷(2×20日標準差)×10)，夾在 ±10。</span>
 <span class="k">月斜</span><span>月線(20MA)1日斜率%＝(MA20今−MA20昨)÷MA20昨×100。<b>&gt;1%＝強勢、&gt;3%＝妖股</b>。</span>
 <span class="k">累幅</span><span>處置中＝(今收−處置前一日收)÷處置前一日收×100；可能進入處置＝近6日累積漲幅%。</span>
@@ -1109,7 +1151,7 @@ function goChart(sid){ location.href = "index.html?stk=" + encodeURIComponent(si
 
 function switchTab(p){
   document.querySelectorAll(".czt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  ["ov","notify","watch","ongoing","teach","rule"].forEach(x=>{
+  ["ov","notify","watch","ongoing","release","teach","rule"].forEach(x=>{
     const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p);
   });
   try{ window.scrollTo({top:0,behavior:"smooth"}); }catch(e){ window.scrollTo(0,0); }
@@ -1118,12 +1160,12 @@ document.querySelectorAll(".czt").forEach(b=>b.addEventListener("click",()=>swit
 
 async function boot(){
   let d=null;
-  try{ const r=await fetch("data/chuzhi.json",{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
-  ["watch","ongoing"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
+  try{ const r=await fetch("data/chuzhi.json?v="+BUILD_V,{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
+  ["watch","ongoing","release"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
   const en=$("expl-notify"); if(en) en.innerHTML=NOTIFY_EXPL;
   if(!d){
     $("today").textContent="資料尚未產生";
-    ["notify","watch","ongoing"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
+    ["notify","watch","ongoing","release"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
     return;
   }
   $("today").textContent=d.today||"—";
@@ -1132,8 +1174,9 @@ async function boot(){
   $("cnt-n").textContent=c.notify!=null?c.notify:((d.notify||[]).length);
   $("cnt-w").textContent=c.watch!=null?c.watch:((d.watch||[]).length);
   $("cnt-o").textContent=c.ongoing!=null?c.ongoing:((d.ongoing||[]).length);
-  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.ongoing=d.ongoing||[];
-  ["notify","watch","ongoing"].forEach(renderTbl);
+  const _rs=$("cnt-rs"); if(_rs) _rs.textContent=c.release_soon!=null?c.release_soon:((d.release_soon||[]).length);
+  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.ongoing=d.ongoing||[]; LISTDATA.release=d.release_soon||[];
+  ["notify","watch","ongoing","release"].forEach(renderTbl);
   if(d.diag && (d.diag.notes||[]).length){
     const box=$("diagbox"); box.style.display="block";
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
