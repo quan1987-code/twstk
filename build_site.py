@@ -16,6 +16,7 @@ r"""
 """
 import os
 import sys
+import time
 import glob
 import json
 import sqlite3
@@ -46,6 +47,9 @@ DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
 TRUST_CHART_BARS = 320   # 投信候選嵌入較短歷史以控制檔案大小
 OUT_DIR = "site"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
+TWII_FRESH_LOOKBACK_DAYS = 7   # 用 FinMind 補「最近幾天」加權指數新鮮度（非全歷史，控制配額）
 
 # 首頁三標的：(代碼, yfinance符號, 顯示名, 數值型態 'index'整數 / 'price'兩位小數)
 MARKET_TARGETS = [
@@ -396,17 +400,71 @@ def _merge_series(a, b):
     return ds, [by_date[d][0] for d in ds], [by_date[d][1] for d in ds]
 
 
+def finmind_get(dataset, max_retry=2, **params):
+    """輕量版 FinMind 請求（僅供本檔的加權指數新鮮度補值用；失敗直接放棄不重試太久，
+    不影響本檔其餘資料一律以 yfinance/Stooq 為主）。無 token 或套件缺失回空表。"""
+    if requests is None or not FINMIND_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
+    q = {"dataset": dataset, **params}
+    wait = 10
+    for _ in range(max_retry):
+        try:
+            resp = requests.get(FINMIND_URL, headers=headers, params=q, timeout=20)
+        except Exception as e:
+            print(f"  FinMind 連線錯誤：{e}"); time.sleep(wait); wait *= 2; continue
+        if resp.status_code in (402, 429):
+            print(f"  FinMind 流量上限，等待 {wait}s"); time.sleep(wait); wait *= 2; continue
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("data", [])
+    return None
+
+
+def fetch_finmind_twii_series():
+    """加權指數新鮮度補值：TaiwanStockPrice 不含大盤本身，FinMind 需靠
+    TaiwanVariousIndicators5Seconds（5秒頻加權指數快照，一次只能查一天）才能拿到 TAIEX。
+    只補最近 TWII_FRESH_LOOKBACK_DAYS 個『日曆日』（非全歷史，控制配額），
+    每天：當日最高快照當『高』、最後一筆快照當『收盤』。FinMind 是本站其餘資料的主來源、
+    每天穩定到位，用它來補 yfinance 對 ^TWII 常見的「有資料但少最新一天」最可靠。"""
+    if not FINMIND_TOKEN:
+        return None
+    dates, highs, closes = [], [], []
+    today = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    for i in range(TWII_FRESH_LOOKBACK_DAYS):
+        d = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        rows = finmind_get("TaiwanVariousIndicators5Seconds", start_date=d)
+        if i > 0:
+            time.sleep(0.3)
+        if not rows:
+            continue
+        vals = [r.get("TAIEX") for r in rows if r.get("TAIEX") not in (None, "")]
+        vals = [float(v) for v in vals if v]
+        if not vals:
+            continue
+        dates.append(d); highs.append(max(vals)); closes.append(vals[-1])
+    if len(closes) < 1:
+        return None
+    order = sorted(range(len(dates)), key=lambda i: dates[i])
+    return ([dates[i] for i in order], [highs[i] for i in order], [closes[i] for i in order])
+
+
 def fetch_market_series(yahoo_sym):
-    """yfinance ＋ Stooq 雙來源合併，回傳 ((dates,highs,closes), 來源標記)。"""
+    """yfinance ＋ Stooq ＋（僅 ^TWII 額外用 FinMind 補新鮮度）多來源合併，
+    回傳 ((dates,highs,closes), 來源標記)。"""
     yf_s = fetch_yf_series(yahoo_sym)
     stooq_s = fetch_stooq_series(STOOQ_SYM.get(yahoo_sym))
-    if yf_s and stooq_s:
-        return _merge_series(yf_s, stooq_s), "yfinance+stooq"
-    if yf_s:
-        return yf_s, "yfinance"
-    if stooq_s:
-        return stooq_s, "stooq"
-    return None, None
+    finmind_s = fetch_finmind_twii_series() if yahoo_sym == "^TWII" else None
+    merged = None
+    srcs = []
+    for s, tag in ((yf_s, "yfinance"), (stooq_s, "stooq"), (finmind_s, "finmind")):
+        if not s:
+            continue
+        srcs.append(tag)
+        merged = s if merged is None else _merge_series(merged, s)
+    if merged is None:
+        return None, None
+    return merged, "+".join(srcs)
 
 
 def tsmc_from_db():
