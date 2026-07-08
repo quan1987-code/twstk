@@ -28,6 +28,11 @@ except Exception:
     yf = None
 
 try:
+    import requests
+except Exception:
+    requests = None
+
+try:
     import tw_industry
 except Exception:
     tw_industry = None
@@ -49,6 +54,11 @@ MARKET_TARGETS = [
     ("KOSPI", "^KS11", "韓國 KOSPI", "index"),
     ("TSMC", "2330.TW", "台積電 2330", "price"),
 ]
+
+# Yahoo 代號 → Stooq 代號（雙來源合併用；Stooq 免金鑰 CSV，d1 設極早日期取全歷史）。
+# Yahoo 對 ^TWII／^KS11 這類非美股指數，批次/單檔歷史抓取常「有回傳但少最後一天」──
+# 不是完全失敗，而是悄悄回傳到前一交易日就停了，光靠 try/except 抓不到這種情況。
+STOOQ_SYM = {"^TWII": "^twse", "^SOX": "^sox", "^KS11": "^kospi", "2330.TW": "2330.tw"}
 
 
 def find_latest_csv():
@@ -318,7 +328,8 @@ def _drawdown(dates, highs, closes):
             "dd": round((last / ath - 1) * 100, 2)}
 
 
-def fetch_yf(symbol):
+def fetch_yf_series(symbol):
+    """回傳 (dates,highs,closes)，由舊到新；抓不到回 None。"""
     if yf is None:
         return None
     try:
@@ -331,10 +342,71 @@ def fetch_yf(symbol):
         dates = [d.strftime("%Y-%m-%d") for d in sub.index]
         highs = [float(x) for x in sub["High"].values]
         closes = [float(x) for x in sub["Close"].values]
-        return _drawdown(dates, highs, closes)
+        return dates, highs, closes
     except Exception as e:
         print(f"  yfinance 抓 {symbol} 失敗：{e}")
         return None
+
+
+def fetch_stooq_series(stooq_sym):
+    """Stooq 免金鑰日線 CSV（d1 設極早日期盡量取全歷史）。抓不到／限流／空頁回 None。"""
+    if requests is None or not stooq_sym:
+        return None
+    try:
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d&d1=19900101"
+        r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+        text = (r.text or "").strip()
+        low = text.lower()
+        if not text or low.startswith("<") or "no data" in low or "exceeded" in low or not low.startswith("date"):
+            return None
+        dates, highs, closes = [], [], []
+        for ln in text.splitlines()[1:]:
+            p = ln.split(",")
+            if len(p) < 5:
+                continue
+            try:
+                h, c = float(p[2]), float(p[4])
+            except ValueError:
+                continue
+            dates.append(p[0]); highs.append(h); closes.append(c)
+        return (dates, highs, closes) if len(closes) >= 2 else None
+    except Exception as e:
+        print(f"  Stooq 抓 {stooq_sym} 失敗：{e}")
+        return None
+
+
+def _merge_series(a, b):
+    """依日期聯集合併兩來源序列：同一天最高價取兩者較大值(不低估歷史高點)、
+    收盤取『兩者都有時以後者為準』；缺席的一方對合併結果沒有影響。
+    用意：Yahoo 對部分指數常「有資料但少最新一天」，單純判斷 None／有值 抓不到這種情況，
+    改成兩來源都抓、依日期聯集，任何一邊多出的最新一天都不會被漏掉。"""
+    by_date = {}
+    for s in (a, b):
+        if not s:
+            continue
+        dates, highs, closes = s
+        for d, h, c in zip(dates, highs, closes):
+            if d in by_date:
+                by_date[d] = (max(by_date[d][0], h), c)
+            else:
+                by_date[d] = (h, c)
+    if not by_date:
+        return None
+    ds = sorted(by_date)
+    return ds, [by_date[d][0] for d in ds], [by_date[d][1] for d in ds]
+
+
+def fetch_market_series(yahoo_sym):
+    """yfinance ＋ Stooq 雙來源合併，回傳 ((dates,highs,closes), 來源標記)。"""
+    yf_s = fetch_yf_series(yahoo_sym)
+    stooq_s = fetch_stooq_series(STOOQ_SYM.get(yahoo_sym))
+    if yf_s and stooq_s:
+        return _merge_series(yf_s, stooq_s), "yfinance+stooq"
+    if yf_s:
+        return yf_s, "yfinance"
+    if stooq_s:
+        return stooq_s, "stooq"
+    return None, None
 
 
 def tsmc_from_db():
@@ -359,15 +431,18 @@ def tsmc_from_db():
 def get_market():
     out = {}
     for code, sym, name, kind in MARKET_TARGETS:
-        r = fetch_yf(sym)
+        series, src = fetch_market_series(sym)
+        r = _drawdown(*series) if series else None
         if r is None and code == "TSMC":
             r = tsmc_from_db()
+            src = "db" if r else src
         if r is not None:
             r["name"] = name
             r["kind"] = kind
-            print(f"  市場資料 {name}：最高 {r['ath']}（{r['ath_date']}）/ 最近 {r['last']}（{r['last_date']}）/ 回撤 {r['dd']}%")
+            print(f"  市場資料 {name}：最高 {r['ath']}（{r['ath_date']}）/ 最近 {r['last']}（{r['last_date']}）/ "
+                  f"回撤 {r['dd']}%［{src}］")
         else:
-            print(f"  市場資料 {name}：取得失敗")
+            print(f"  市場資料 {name}：取得失敗（yfinance/Stooq 皆無法取得）")
         out[code] = r
     return out
 

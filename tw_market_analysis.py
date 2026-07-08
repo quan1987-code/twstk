@@ -1215,6 +1215,17 @@ def build_payload(demo=False, no_us=False):
         # 抓 10 個月日線；起始日以今天回推
         start = (dt.datetime.now(TPE_TZ).date() - dt.timedelta(days=320)).strftime("%Y%m%d")
         us_raw = _safe(lambda: fetch_us(all_us_symbols(), start), {}, "fetch_us")
+        # ^TWII 校驗：Yahoo 對此類非美股指數常「批次抓取有回傳、但少最新一天」──不是完全失敗，
+        # fetch_us 的『整檔缺席才退回 Stooq』邏輯抓不到這種悄悄卡在前一天的情況。
+        # 用 twstock.db 的真實最新交易日(tw['date'])核對，落後時專門用 Stooq(^twse) 補到最新。
+        if tw and tw.get("date") and us_raw.get("^TWII"):
+            s = us_raw["^TWII"]
+            last_yf = s["dates"][-1] if s.get("dates") else None
+            if last_yf and last_yf < tw["date"]:
+                fresher = _safe(lambda: _fetch_stooq(["^TWII"], start).get("^TWII"), None, "twii_stooq_refresh")
+                if fresher and fresher.get("dates") and fresher["dates"][-1] > last_yf:
+                    print(f"  [加權指數] yfinance 停在 {last_yf}，改用 Stooq 補到 {fresher['dates'][-1]}")
+                    us_raw["^TWII"] = fresher
     us = _safe(lambda: us_build(us_raw), None, "us_build") if us_raw else None
     flags["us_ok"] = us is not None
 
