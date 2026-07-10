@@ -19,6 +19,7 @@ import sys
 import time
 import glob
 import json
+import math
 import sqlite3
 import datetime
 import pandas as pd
@@ -332,6 +333,43 @@ def _drawdown(dates, highs, closes):
             "dd": round((last / ath - 1) * 100, 2)}
 
 
+def _realized_vol(closes):
+    """由日收盤序列(舊→新)算『年化歷史波動率(%)』＝日對數報酬標準差 × √252。
+    回傳 {hv20, hv60, pct1y}：hv20/hv60＝近 20/60 交易日年化波動率；
+    pct1y＝當前 20 日波動率落在『近一年每日 20 日波動率』的百分位（0=一年最低、100=最高），
+    用來判斷「現在波動相對自己近一年是高是低」。資料不足回 None。"""
+    cs = [c for c in closes if c is not None and c == c and c > 0]
+    if len(cs) < 25:
+        return None
+    rets = [math.log(cs[i] / cs[i - 1]) for i in range(1, len(cs))]
+
+    def ann(win):
+        if len(rets) < win:
+            return None
+        seg = rets[-win:]
+        m = sum(seg) / len(seg)
+        var = sum((x - m) ** 2 for x in seg) / (len(seg) - 1)
+        return math.sqrt(var * 252.0) * 100.0
+
+    hv20, hv60 = ann(20), ann(60)
+    if hv20 is None:
+        return None
+    pct = None
+    if len(rets) >= 40:   # 至少要能算出多個 20 日 HV，百分位才有意義
+        hs = []
+        for end in range(20, len(rets) + 1):
+            seg = rets[end - 20:end]
+            m = sum(seg) / len(seg)
+            var = sum((x - m) ** 2 for x in seg) / (len(seg) - 1)
+            hs.append(math.sqrt(var * 252.0) * 100.0)
+        recent = hs[-252:]
+        cur = hs[-1]
+        pct = round(sum(1 for x in recent if x <= cur) / len(recent) * 100)
+    return {"hv20": round(hv20, 1),
+            "hv60": round(hv60, 1) if hv60 is not None else None,
+            "pct1y": pct}
+
+
 def fetch_yf_series(symbol):
     """回傳 (dates,highs,closes)，由舊到新；抓不到回 None。"""
     if yf is None:
@@ -497,6 +535,12 @@ def get_market():
         if r is not None:
             r["name"] = name
             r["kind"] = kind
+            if code == "TWII" and series:   # 首頁「台股波動率」：用加權指數日收盤算年化歷史波動率
+                vol = _realized_vol(series[2])
+                if vol:
+                    r["vol"] = vol
+                    print(f"  台股波動率（加權指數年化）：20日 {vol['hv20']}% / 60日 {vol['hv60']}% / "
+                          f"近一年位階 {vol['pct1y']}%")
             print(f"  市場資料 {name}：最高 {r['ath']}（{r['ath_date']}）/ 最近 {r['last']}（{r['last_date']}）/ "
                   f"回撤 {r['dd']}%［{src}］")
         else:
@@ -645,6 +689,18 @@ TEMPLATE = r"""<!DOCTYPE html>
   .ddrow .d{font-size:11px; color:var(--muted); margin-left:auto;}
   .ddna{color:var(--dim); font-size:13px; padding:8px 0;}
   .ddnote{font-size:12px; color:var(--dim); line-height:1.6; margin-top:14px; padding:13px 15px; background:var(--card); border:1px solid var(--border); border-radius:11px;}
+  /* 首頁：台股波動率卡 */
+  .volwrap{margin-top:12px;}
+  .volcard{background:var(--card); border:1px solid var(--border); border-radius:11px; padding:14px 16px;}
+  .volcard .vt{font-size:13px; color:var(--muted); font-weight:700; margin-bottom:9px; display:flex; align-items:center; gap:8px;}
+  .volcard .vt .vd{font-size:11px; color:var(--dim); font-weight:500;}
+  .volcard .vmain{display:flex; align-items:center; gap:11px;}
+  .volcard .vbig{font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; letter-spacing:-.5px; line-height:1;}
+  .volcard .vlvl{font-size:12px; font-weight:800; padding:3px 10px; border-radius:99px; border:1px solid currentColor;}
+  .volbar{height:8px; background:#0e1626; border-radius:5px; overflow:hidden; margin:12px 0 3px;}
+  .volbarfill{height:100%; border-radius:5px;}
+  .volcard .vsub{font-size:12.5px; color:var(--muted); margin-top:8px; font-variant-numeric:tabular-nums;}
+  .volcard .vsub b{color:var(--text);}
   .searchwrap{position:relative; margin-bottom:14px;}
   .searchwrap input{width:100%; box-sizing:border-box; background:var(--card); border:1px solid var(--border); border-radius:11px; padding:12px 14px; color:var(--text); font-size:15px; outline:none;}
   .searchwrap input:focus{border-color:rgba(245,165,36,.5);}
@@ -855,7 +911,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   </header>
 
   <div class="tabbar">
-    <button class="tab on" data-tab="home">指數回撤</button>
+    <button class="tab on" data-tab="home">首頁</button>
     <button class="tab" data-tab="screen">爆量起漲</button>
     <button class="tab" data-tab="trust">投信連買</button>
     <button class="tab" data-tab="flow">資金流向</button>
@@ -881,11 +937,14 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="sugbox" id="sugbox"></div>
     </div>
     <div class="ddcards" id="ddcards"></div>
+    <div class="volwrap" id="volwrap"></div>
     <div class="flowwrap" id="flowwrap"></div>
     <div class="ddnote">
       <b style="color:var(--muted)">回撤</b>＝最近一次收盤距「歷史最高價（盤中最高點）」的跌幅。<br>
       數字越大代表離前高越遠。台股加權指數與費城半導體為指數點數，台積電為股價。<br>
-      美股費半依美國收盤，台北下午更新時通常為「前一個美股交易日」。
+      美股費半依美國收盤，台北下午更新時通常為「前一個美股交易日」。<br>
+      <b style="color:var(--muted)">台股波動率</b>＝加權指數近 20 個交易日「日報酬」的年化標準差（%），數字越大＝盤勢越震盪；
+      「近一年位階」為目前波動率在近一年區間的百分位（越高＝相對自己近一年越劇烈）。
     </div>
   </div>
 
@@ -1103,6 +1162,35 @@ function renderDD(){
       <div class="ddrow"><span class="k">最近收盤</span><span class="v">${fmt(m.last)}</span><span class="d">${m.last_date}</span></div>
     </div>`;
   }).join("");
+}
+
+/* ---------- 首頁：台股波動率（加權指數年化歷史波動率）---------- */
+function renderVol(){
+  const box=document.getElementById("volwrap"); if(!box) return;
+  const m=MARKET?MARKET.TWII:null;
+  const v=(m&&m.vol)?m.vol:null;
+  if(!v||v.hv20==null){ box.innerHTML=""; return; }
+  const p=(v.pct1y!=null)?v.pct1y:null;
+  // 波動狀態：優先用「近一年百分位」判定（會隨市場自我校準）；無百分位時退回用絕對值粗分。
+  const basis = p!=null ? p : (v.hv20>=25?85:v.hv20>=18?55:v.hv20>=13?35:15);
+  let lvl,col;
+  if(basis>=80){lvl="高波動";col="var(--up)";}
+  else if(basis>=55){lvl="偏高";col="var(--amber)";}
+  else if(basis>=30){lvl="中性";col="var(--muted)";}
+  else{lvl="低波動";col="var(--down)";}
+  const barW=Math.max(2,Math.min(v.hv20,50)/50*100);
+  const sub=[];
+  if(v.hv60!=null) sub.push(`60日 <b>${v.hv60.toFixed(1)}%</b>`);
+  if(p!=null) sub.push(`近一年位階 <b>${p}%</b>`);
+  box.innerHTML=`<div class="volcard">
+    <div class="vt">台股波動率 <span class="vd">加權指數・年化・${m.last_date||""}</span></div>
+    <div class="vmain">
+      <span class="vbig" style="color:${col}">${v.hv20.toFixed(1)}<span style="font-size:16px;color:var(--dim);font-weight:700"> %</span></span>
+      <span class="vlvl" style="color:${col}">${lvl}</span>
+    </div>
+    <div class="volbar"><div class="volbarfill" style="width:${barW}%;background:${col}"></div></div>
+    <div class="vsub">近20日 年化波動率${sub.length?" ・ "+sub.join(" ・ "):""}</div>
+  </div>`;
 }
 
 /* ⑦ 法人動向：三大法人 / 外資台指期 / 融資融券 */
@@ -1923,6 +2011,7 @@ function pickStock(sid){ const box=document.getElementById("sugbox"); box.innerH
 loadIndex();
 
 renderDD();
+renderVol();
 renderExtras();
 renderFlows();
 renderTrust();
