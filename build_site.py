@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 r"""
-雲端網頁版看板（雙分頁・手機觸控・PWA）
+雲端網頁版看板（手機觸控・PWA）
 ================================================================
-分頁一（首頁）：市場回撤
-  顯示「台股加權指數 / 美股費城半導體 SOX / 台積電 2330」三張卡片，
-  每張含：歷史最高收盤(附日期)、最近收盤(附日期)、距高點回撤%。
-  資料來源：yfinance（Yahoo，完整歷史；台積電抓不到時改用本地 twstock.db）。
+分頁一（首頁）：市場回撤 ＋ 台股波動率
+  ・市場回撤：「台股加權指數 / 美股費城半導體 SOX / 韓國 KOSPI / 台積電 2330」卡片，
+    每張含歷史最高收盤(附日期)、最近收盤(附日期)、距高點回撤%。
+  ・台股波動率：加權指數年化歷史波動率(20/60日)＋近一年位階。
+  資料來源：yfinance/Stooq（＋^TWII 以 FinMind 補新鮮度）。
 
-分頁二（月均量爆量起漲）：選股看板
-  統計卡 + 量比排行 + 可排序/搜尋表格 + 點名稱看K線技術圖。
-  另含「指標說明」面板，解釋 月均量 / 量比 / 5日量÷月量 / 季線乖離 / 評分 等。
+分頁二（資金流向）：大戶/投信買賣超 TOP10 ＋ 120日產業/概念資金輪動。
+
+個股 K 線表頭（點任一股票開圖）：發行/流通張數 ＋ 月線斜率、主5、主10、距高%、20日均量
+  （定義與資金輪動/處置頁一致；由逐檔 JSON 的 K線＋主力即時計算）。
+
+註：原「爆量起漲」「投信連買」兩分頁已移除（其資料管線仍保留，供 K 線名稱對照等使用）。
 
 輸出 site/index.html + site/manifest.json（給 GitHub Pages）。
 需要套件：pandas、yfinance（首頁市場資料用；沒裝也能跑，首頁顯示「資料暫時無法取得」）。
@@ -886,6 +890,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .cvfloat .cvfv{color:var(--text); font-weight:700; font-variant-numeric:tabular-nums;}
   .cvfloat .cvfsep{color:var(--border);}
   .cvfloat .cvfnote{color:var(--dim); font-size:11px;}
+  .cvfloat .cvfbreak{flex-basis:100%; height:2px;}   /* 讓量化指標(月線斜率/主5/主10/距高/均量)換到下一行 */
   .pswitch{display:flex; gap:4px; margin-left:auto;}
   .pbtn{background:var(--card); border:1px solid var(--border); color:var(--muted); border-radius:7px; padding:7px 15px; font-size:14px; cursor:pointer; font-weight:600;}
   .pbtn.on{background:var(--amber-s); color:var(--amber); border-color:rgba(245,165,36,.4);}
@@ -912,8 +917,6 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="tabbar">
     <button class="tab on" data-tab="home">首頁</button>
-    <button class="tab" data-tab="screen">爆量起漲</button>
-    <button class="tab" data-tab="trust">投信連買</button>
     <button class="tab" data-tab="flow">資金流向</button>
   </div>
 
@@ -948,67 +951,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- 分頁二：選股 -->
-  <div class="tabpane hidden" id="tab-screen">
-    <div class="sub" id="subtitle" style="margin:0 0 12px">資料日 __DATE__ ・ 共 __COUNT__ 檔</div>
-    <div class="cards" id="cards"></div>
-    <details class="explain">
-      <summary>指標說明（點開）</summary>
-      <div class="exbody">
-        <div><b>月均量</b>：最近 20 個交易日的平均成交量（張）。代表這檔平常的量能水準。</div>
-        <div><b>量比</b>：今日量 ÷ 月均量。例如 <b>3x</b> 表示今天的量是平常的 3 倍 →「爆量」。本表門檻為 ≥ 2x。</div>
-        <div><b>5日量/月量</b>：最近 5 日均量 ÷ 月均量。&gt;1 代表近期量能持續放大，不是只爆一天。</div>
-        <div><b>季線乖離%</b>：收盤距 60 日均線（季線）的距離。數字太大代表短線漲多、追高風險高（本表上限約 30%）。</div>
-        <div><b>評分</b>：綜合爆量強度、量能持續、突破季高、均線多頭排列等的 0–100 分，僅供「排序」參考，非買賣建議。</div>
-        <div><b>爆量月位階</b>：先找歷史上「成交量最大的那個月份」，取該月 K 的最高、最低價。看現價落在這區間的位置：<b style="color:var(--amber)">近爆量低★</b>＝現價在該月中價~低價之間（最貼近大量低點、相對有買進價值）；<b style="color:var(--blue)">爆量月上半</b>＝中價~高價之間；月量高之上＝已突破該月高點；破爆量低＝已跌破該月低點。百分比＝位置(0%＝月低、100%＝月高)。可點此欄由小到大排序，把最接近大量低點的排在前面。</div>
-        <div><b>強度標記</b>：符合的偏多條件標籤，如 突破季高、月線翻揚、站上季線、季線翻揚、多頭排列、站上年線。</div>
-        <div style="color:var(--dim)">本表為機械式初篩，進場前仍需看籌碼（三大法人／主力）、消息面與基本面。</div>
-      </div>
-    </details>
-    <div class="panel"><div class="ph">量比排行（前 20）</div><div class="bars" id="bars"></div></div>
-    <div class="controls">
-      <input id="q" placeholder="搜尋代號或名稱…" autocomplete="off">
-      <button class="chip on" data-mkt="全部">全部</button>
-      <button class="chip" data-mkt="上市">上市</button>
-      <button class="chip" data-mkt="上櫃">上櫃</button>
-      <button class="gtog on" id="screenGtog" title="依概念股/產業族群分組排列">☰ 依概念分群</button>
-      <span class="hint">點欄位排序 ・ 點名稱看K線 ・ 分群時同概念(退回產業)歸一組</span>
-    </div>
-    <div class="hbar" id="screenHbar"><div></div></div>
-    <div class="tablewrap" id="screenWrap"><table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table></div>
-  </div>
-
-  <!-- 分頁三：投信連買 -->
-  <div class="tabpane hidden" id="tab-trust">
-    <div class="sub" style="margin:0 0 10px">投信連續買超 ・ 籌碼面 ・ 資料日 <span id="trustdate">—</span></div>
-    <div class="thr">
-      <span class="thrlbl">每日門檻</span>
-      <button class="thrbtn on" data-thr="50">50張</button>
-      <button class="thrbtn" data-thr="100">100張</button>
-      <button class="thrbtn" data-thr="200">200張</button>
-      <button class="thrbtn" data-thr="500">500張</button>
-      <button class="thrbtn" data-thr="1000">1000張</button>
-      <button class="gtog on" id="trustGtog" title="依概念股/產業族群分組排列" style="margin-left:8px">☰ 依概念分群</button>
-    </div>
-    <details class="explain">
-      <summary>篩選邏輯與指標說明（點開）</summary>
-      <div class="exbody">
-        <div><b>怎麼篩</b>：最近一個月內，投信「<b>連續 ≥3 個交易日</b>」每日淨買都 <b>≥ 你選的張數</b>；且<b>現價 ≤ 連買期間最高價</b>，或<b>現價 &lt; 投信成本均價</b>（＝投信買了、但股價還沒漲上去 / 甚至跌破投信成本）。</div>
-        <div><b>投信買超佔比</b>：連買期間 投信淨買張數 ÷ 同期總成交張數。<b>越高＝投信主導、籌碼集中</b>（本頁最關鍵指標）。</div>
-        <div><b>連買天數 / 累計張數</b>：投信吃貨的「久」與「重」。</div>
-        <div><b>投信成本均價</b>：連買期間以每日投信淨買量加權的收盤均價（近似投信平均成本）。</div>
-        <div><b>距成本%</b>：現價 ÷ 投信成本 −1。負值（綠）＝現價已跌破投信成本，投信暫時套牢（雙面刃：可能加碼護盤，也可能停損）。</div>
-        <div><b>距高點%</b>：連買最高價 ÷ 現價 −1。越大＝離投信買的高點越遠、潛在補漲空間越大。</div>
-        <div><b>連買漲幅%</b>：連買期間股價漲跌幅。越小＝越「還沒發動」。</div>
-        <div><b>仍在買</b>：投信連買是否延續到最新一天（是＝籌碼仍有支撐）。</div>
-        <div><b>賣回%</b>：連買結束後投信又賣回了多少（佔累計買超）。<b>≥60% 直接從清單剔除</b>（視為投信已落跑）；數字越低越好，0% 最佳。</div>
-        <div><b>評分</b>：以「投信主導性(佔比)」為核心，加吃貨強度、補漲空間、貼近投信成本；已大漲或被部分賣回者扣分。<b>僅供排序，非投資建議</b>。</div>
-        <div style="color:var(--dim)">註：投信買賣超為盤後資料，通常較股價晚約一個交易日；目前涵蓋上市，上櫃稍後補上。</div>
-      </div>
-    </details>
-    <div class="tablewrap"><table><thead><tr id="trusthead"></tr></thead><tbody id="trustbody"></tbody></table></div>
-  </div>
-
   <!-- 分頁四：資金流向 -->
   <div class="tabpane hidden" id="tab-flow">
     <div class="sub" style="margin:0 0 10px">大戶 / 投信資金流向 ・ 買賣超金額 TOP10 ・ 資料日 <span id="flowdate">—</span></div>
@@ -1027,7 +969,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="expbody">
         <div><b>大戶</b>＝<b>三大法人合計</b>（外資＋投信＋自營）買賣超，作為「大戶／主力資金」的免費替代指標（無單獨大戶分點免費來源）。<b>投信</b>＝投信單獨買賣超。</div>
         <div><b>金額(億)</b>＝買賣超張數 × 當日收盤估算；<b>當日</b>＝最近一個交易日，<b>近5/20/60日</b>＝最近 5／20／60 個交易日累計。紅＝買超、綠＝賣超。點名稱可看 K 線。</div>
-        <div style="color:var(--dim)">資料為證交所 T86 盤後（目前涵蓋上市；上櫃稍後補上），通常較股價晚約一個交易日。</div>
+        <div style="color:var(--dim)">資料為三大法人盤後（上市＝證交所 T86／上櫃＝FinMind，均已涵蓋），通常較股價晚約一個交易日。</div>
       </div>
     </details>
 
@@ -1058,7 +1000,7 @@ TEMPLATE = r"""<!DOCTYPE html>
           <div><b>股價／漲幅</b>＝今日收盤與漲跌幅。<b>位階</b>＝20日布林通道級距(+10上軌偏高、0月線、−10下軌偏低)。<b>斜率</b>＝月線(20MA)一日斜率%(&gt;1%強勢)。</div>
           <div><b>主5／主10</b>＝近5/10日三大法人集中度%＝Σ法人買賣超張÷Σ成交量張×100，正(紅)＝法人買超集中、負(綠)＝派發（市場版以三大法人替代分點主力）。</div>
           <div><b>法20(億)</b>＝個股近20日三大法人淨額，看族群裡<b>法人實際在買哪幾檔</b>。<b>量比</b>＝今量÷20日均量(&gt;2爆量)。<b>季乖離%</b>＝距季線(60MA)距離，過大＝短線漲多、追高風險。</div>
-          <div style="color:var(--dim)">三大法人買賣超為證交所 T86 盤後（目前涵蓋上市），通常較股價晚約一個交易日。僅供研究，非投資建議。</div>
+          <div style="color:var(--dim)">三大法人買賣超為盤後資料（上市＝證交所 T86／上櫃＝FinMind，均已涵蓋），通常較股價晚約一個交易日。僅供研究，非投資建議。</div>
         </div>
       </details>
     </div>
@@ -1134,7 +1076,7 @@ function groupHdrRow(g, cols){
 }
 
 /* ---------- 分頁切換 ---------- */
-const PANES = ["home", "screen", "trust", "flow"];
+const PANES = ["home", "flow"];
 document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on")); t.classList.add("on");
   const id=t.dataset.tab;
@@ -1544,11 +1486,7 @@ function trustRowHtml(r){
       <td><span class="scorewrap"><span class="scoretrack"><span class="scorefill" style="width:${Math.min(r.score,100)}%;background:${scC}"></span></span><span class="scoreval" style="color:${scC}">${r.score.toFixed(0)}</span></span></td>
     </tr>`;
 }
-document.querySelectorAll(".thrbtn").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".thrbtn").forEach(x=>x.classList.remove("on")); b.classList.add("on");
-  trustThr=parseInt(b.dataset.thr,10); renderTrust();
-}));
-document.getElementById("trustGtog").addEventListener("click",e=>{ trustGroup=!trustGroup; e.currentTarget.classList.toggle("on",trustGroup); renderTrust();});
+/* 投信連買分頁已移除（不再綁定門檻/分群事件） */
 
 /* ---------- 選股表格 ---------- */
 const TAGS = {
@@ -1627,9 +1565,7 @@ function syncTopScroll(){
   wrap.onscroll=()=>{ if(lock)return; lock=true; bar.scrollLeft=wrap.scrollLeft; lock=false; };
 }
 window.addEventListener("resize",()=>{ try{ syncTopScroll(); }catch(e){} });
-document.getElementById("q").addEventListener("input",e=>{state.q=e.target.value; render();});
-document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{document.querySelectorAll(".chip").forEach(x=>x.classList.remove("on")); c.classList.add("on"); state.mkt=c.dataset.mkt; render();}));
-document.getElementById("screenGtog").addEventListener("click",e=>{ screenGroup=!screenGroup; e.currentTarget.classList.toggle("on",screenGroup); render();});
+/* 爆量起漲分頁已移除（不再綁定搜尋/市場/分群事件） */
 
 /* ===== 技術線圖引擎 ===== */
 const MACOLOR={5:"#f5c518",10:"#e23fd0",20:"#27c4dc",60:"#c79a52",240:"#3b6fe0"};
@@ -1688,16 +1624,53 @@ async function fetchStock(sid){
 }
 /* 表頭『發行 / 流通張數』：流通 = 發行 ×(1−最新400張大戶%)。400張大戶已含董監＋法人大股東。 */
 function fmtLots(n){ if(n==null||!isFinite(n)) return "—"; n=Math.round(n); const s=String(Math.abs(n)); let out=""; for(let i=0;i<s.length;i++){ if(i>0&&(s.length-i)%3===0) out+=","; out+=s[i]; } return (n<0?"-":"")+out; }
+/* 個股表頭量化指標（接在流通張數後）。定義與資金輪動/處置頁一致：
+   月線斜率＝MA20 一日斜率%；主5/主10＝三大法人集中度%(Σ主力張÷Σ成交量張×100)；
+   另加 距高%(距全期間盤中歷史最高之跌幅) 與 20日均量(張)。全由既有 K線 bars ＋ 主力 mf 即時計算。 */
+function quickStats(o){
+  if(!o||!o.bars||!o.bars.length) return null;
+  const bars=o.bars, n=bars.length, mf=o.mf||[];   // mf 對齊末端日期：mf[末]＝bars[末]的主力(三大法人合計)
+  const out={slope:null,z5:null,z10:null,dd:null,vma20:null};
+  // 月線斜率＝MA20 一日斜率%（yx）
+  const sma=(end,w)=>{ if(end+1<w) return null; let s=0; for(let i=end-w+1;i<=end;i++){ const x=bars[i][4]; if(x==null||!isFinite(x)) return null; s+=x; } return s/w; };
+  if(n>=21){ const a=sma(n-1,20), b=sma(n-2,20); if(a!=null&&b!=null&&b>0) out.slope=(a/b-1)*100; }
+  // 20日均量（張）
+  { let s=0,c=0; for(let i=Math.max(0,n-20);i<n;i++){ const v=bars[i][5]; if(v!=null&&isFinite(v)){ s+=v; c++; } } if(c>0) out.vma20=s/c; }
+  // 主5/主10＝三大法人集中度%＝Σ主力張 ÷ Σ成交量張 ×100（z5/z10）；全窗主力皆 0/缺 → 視為無資料回 null
+  const conc=(k)=>{ let sl=0,sv=0,nz=false; for(let j=0;j<k;j++){ const bi=n-1-j; if(bi<0) break; const v=bars[bi][5]; if(v!=null&&isFinite(v)) sv+=v; const mi=mf.length-1-j; if(mi>=0){ const m=mf[mi]; if(m!=null&&isFinite(m)){ sl+=m; if(m!==0) nz=true; } } } return (nz&&sv>0)?(sl/sv*100):null; };
+  out.z5=conc(5); out.z10=conc(10);
+  // 距離高點%（全期間盤中最高）
+  let hi=-Infinity; for(let i=0;i<n;i++){ const x=bars[i][2]; if(x!=null&&isFinite(x)&&x>hi) hi=x; }
+  const lc=bars[n-1][4]; if(hi>0 && lc!=null&&isFinite(lc)) out.dd=(lc/hi-1)*100;
+  return out;
+}
 function renderFloat(o){
   const el=document.getElementById("cvFloat"); if(!el) return;
   const iss=(o&&o.iss!=null&&o.iss>0)?o.iss:null;
-  if(iss==null){ el.innerHTML=""; el.style.display="none"; return; }
   const b4=(o&&o.b4)||[], big=b4.length?b4[b4.length-1][1]:null;   // 最新一週 400張大戶%
-  let h=`<span class="cvfk">發行</span><span class="cvfv">${fmtLots(iss)}張</span>`;
-  if(big!=null&&isFinite(big)){
-    h+=`<span class="cvfsep">·</span><span class="cvfk">流通</span><span class="cvfv">${fmtLots(iss*(1-big/100))}張</span>`
-      +`<span class="cvfnote">(扣董監大戶${big.toFixed(1)}%)</span>`;
+  let h="";
+  if(iss!=null){
+    h+=`<span class="cvfk">發行</span><span class="cvfv">${fmtLots(iss)}張</span>`;
+    if(big!=null&&isFinite(big)){
+      h+=`<span class="cvfsep">·</span><span class="cvfk">流通</span><span class="cvfv">${fmtLots(iss*(1-big/100))}張</span>`
+        +`<span class="cvfnote">(扣董監大戶${big.toFixed(1)}%)</span>`;
+    }
   }
+  const q=quickStats(o);
+  if(q){
+    const sg=(v,dp,unit)=>{ const c=v>0?UP:v<0?DOWN:"var(--muted)"; return `<b style="color:${c}">${v>0?"+":""}${v.toFixed(dp)}${unit||""}</b>`; };
+    const seg=[];
+    if(q.slope!=null) seg.push(`<span class="cvfk">月線斜率</span>${sg(q.slope,2,"%")}`);
+    if(q.z5!=null)    seg.push(`<span class="cvfk">主5</span>${sg(q.z5,1,"%")}`);
+    if(q.z10!=null)   seg.push(`<span class="cvfk">主10</span>${sg(q.z10,1,"%")}`);
+    if(q.dd!=null)    seg.push(`<span class="cvfk">距高</span><span class="cvfv" style="color:var(--muted)">${q.dd.toFixed(1)}%</span>`);
+    if(q.vma20!=null) seg.push(`<span class="cvfk">20日均量</span><span class="cvfv">${fmtLots(q.vma20)}張</span>`);
+    if(seg.length){
+      if(h) h+=`<span class="cvfbreak"></span>`;
+      h+=seg.join(`<span class="cvfsep">·</span>`);
+    }
+  }
+  if(!h){ el.innerHTML=""; el.style.display="none"; return; }
   el.innerHTML=h; el.style.display="";
 }
 async function openChart(sid){
@@ -2014,8 +1987,6 @@ renderDD();
 renderVol();
 renderExtras();
 renderFlows();
-renderTrust();
-render();
 (function(){ try{ const sp=new URLSearchParams(location.search); const sid=sp.get("stk"); if(sid){ CHART_DEEPLINK=true; openChart(sid.trim()); } }catch(e){} })();
 </script>
 </body>
