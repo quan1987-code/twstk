@@ -1626,7 +1626,7 @@ async function fetchStock(sid){
 function fmtLots(n){ if(n==null||!isFinite(n)) return "—"; n=Math.round(n); const s=String(Math.abs(n)); let out=""; for(let i=0;i<s.length;i++){ if(i>0&&(s.length-i)%3===0) out+=","; out+=s[i]; } return (n<0?"-":"")+out; }
 /* 個股表頭量化指標（接在流通張數後）。定義與資金輪動/處置頁一致：
    月線斜率＝MA20 一日斜率%；主5/主10＝三大法人集中度%(Σ主力張÷Σ成交量張×100)；
-   另加 距高%(距全期間盤中歷史最高之跌幅) 與 20日均量(張)。全由既有 K線 bars ＋ 主力 mf 即時計算。 */
+   另加 距高%(距近60日盤中最高之跌幅) 與 20日均量(張)。全由既有 K線 bars ＋ 主力 mf 即時計算。 */
 function quickStats(o){
   if(!o||!o.bars||!o.bars.length) return null;
   const bars=o.bars, n=bars.length, mf=o.mf||[];   // mf 對齊末端日期：mf[末]＝bars[末]的主力(三大法人合計)
@@ -1639,8 +1639,8 @@ function quickStats(o){
   // 主5/主10＝三大法人集中度%＝Σ主力張 ÷ Σ成交量張 ×100（z5/z10）；全窗主力皆 0/缺 → 視為無資料回 null
   const conc=(k)=>{ let sl=0,sv=0,nz=false; for(let j=0;j<k;j++){ const bi=n-1-j; if(bi<0) break; const v=bars[bi][5]; if(v!=null&&isFinite(v)) sv+=v; const mi=mf.length-1-j; if(mi>=0){ const m=mf[mi]; if(m!=null&&isFinite(m)){ sl+=m; if(m!==0) nz=true; } } } return (nz&&sv>0)?(sl/sv*100):null; };
   out.z5=conc(5); out.z10=conc(10);
-  // 距離高點%（全期間盤中最高）
-  let hi=-Infinity; for(let i=0;i<n;i++){ const x=bars[i][2]; if(x!=null&&isFinite(x)&&x>hi) hi=x; }
+  // 距高%＝目前股價 距『近 60 日盤中最高點』的距離%（近60日最高 intraday high vs 現價）
+  let hi=-Infinity; for(let i=Math.max(0,n-60);i<n;i++){ const x=bars[i][2]; if(x!=null&&isFinite(x)&&x>hi) hi=x; }
   const lc=bars[n-1][4]; if(hi>0 && lc!=null&&isFinite(lc)) out.dd=(lc/hi-1)*100;
   return out;
 }
