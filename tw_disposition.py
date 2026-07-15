@@ -16,7 +16,7 @@ r"""
   python tw_disposition.py --demo      # 離線示範
   python tw_disposition.py --no-chips  # 跳過分點(省流量)
 """
-import os, sys, json, time, sqlite3, datetime, argparse
+import os, sys, re, json, time, sqlite3, datetime, argparse
 from statistics import pstdev
 import pandas as pd
 try:
@@ -438,6 +438,138 @@ def finmind_get(dataset, token, max_retry=4, timeout=None, **params):
         return pd.DataFrame(resp.json().get("data", []))
     return pd.DataFrame()
 
+# ===== 官方即時處置公告（TWSE / TPEx）=====
+# 取代「等 FinMind 晚間(約21:00)批次」：官方 OpenAPI 在交易所公告後即到位，讓當日盤後(18:00)
+# 建置就可能抓到「今天公告、明日起處置」的個股（→ 明日確定）。FinMind 仍作 fallback／回補起迄。
+TWSE_PUNISH_URL = "https://openapi.twse.com.tw/v1/announcement/punish"          # 上市 處置有價證券
+TPEX_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"  # 上櫃 處置有價證券
+_OFFICIAL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+# 欄位自適應候選鍵（政府 OpenAPI 中英欄名不一，先試已知鍵、再退回全欄位樣式偵測）
+_SID_KEYS    = ("Code", "證券代號", "股票代號", "SecuritiesCompanyCode", "SecuritiesCode", "stock_id", "StockID")
+_NAME_KEYS   = ("Name", "證券名稱", "股票名稱", "CompanyName", "SecuritiesName")
+_START_KEYS  = ("處置開始時間", "處置起始日期", "處置開始日期", "StartDate", "start_date", "DispositionStartDate")
+_END_KEYS    = ("處置結束時間", "處置結束日期", "EndDate", "end_date", "DispositionEndDate")
+_PERIOD_KEYS = ("處置期間", "DispositionPeriod", "處置起訖", "處置期間及執行處置措施起訖時間", "Period")
+_MEASURE_KEYS= ("處置措施", "處置內容", "DispositionMeasures", "Measure", "措施", "DispositionCondition", "處置條件")
+
+def _iso_or_empty(y, mo, d):
+    """組 ISO 並驗證月/日合理（月 1–12、日 1–31）；不合理回 ''（擋掉誤判成日期的雜訊數字）。"""
+    if 1 <= mo <= 12 and 1 <= d <= 31 and 1990 <= y <= 2100:
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+def roc_any_to_iso(s):
+    """民國/西元各種寫法 → ISO 'YYYY-MM-DD'。支援 '1130716'、'113/07/16'、'113.07.16'、
+    '113年07月16日'、及西元 '2026-07-16'/'2026/07/16'。抓不到或月/日不合理回 ''。"""
+    if s is None: return ""
+    t = str(s).strip()
+    if not t: return ""
+    m = re.search(r"(19|20)(\d{2})[/.\-](\d{1,2})[/.\-](\d{1,2})", t)          # 西元
+    if m:
+        return _iso_or_empty(int(m.group(1)+m.group(2)), int(m.group(3)), int(m.group(4)))
+    m = re.search(r"(\d{2,3})[年/.\-](\d{1,2})[月/.\-](\d{1,2})", t)            # 民國(帶分隔)
+    if m:
+        return _iso_or_empty(int(m.group(1))+1911, int(m.group(2)), int(m.group(3)))
+    if t.isdigit() and len(t) == 7:                                            # 民國 7 碼 1130716
+        return _iso_or_empty(int(t[:3])+1911, int(t[3:5]), int(t[5:7]))
+    return ""
+
+def _extract_two_dates(text):
+    """從一段文字抓出前兩個(民國/西元)日期 → (start_iso, end_iso)；只一個回 (d,'')；無回 ('','')。"""
+    if text is None: return "", ""
+    found = []
+    for m in re.finditer(r"(?:19|20)\d{2}[/.\-]\d{1,2}[/.\-]\d{1,2}"
+                         r"|\d{2,3}[年/.\-]\d{1,2}[月/.\-]\d{1,2}|\b\d{7}\b", str(text)):
+        iso = roc_any_to_iso(m.group(0))
+        if iso and iso not in found:
+            found.append(iso)
+        if len(found) >= 2: break
+    if len(found) >= 2: return found[0], found[1]
+    if len(found) == 1: return found[0], ""
+    return "", ""
+
+def _pick_val(dic, keys):
+    for k in keys:
+        if k in dic and str(dic.get(k) or "").strip():
+            return str(dic[k]).strip()
+    return ""
+
+def _parse_official_records(rows, market, diag, tag):
+    """政府 OpenAPI list[dict] → recs [{sid,start,end,round,method,name,mkt}]。
+    欄位自適應：先試已知鍵名，再退回全欄位樣式偵測；把實際欄位記到 diag 供首跑核對。"""
+    if isinstance(rows, dict):                     # 少數端點外層包一層，取第一個 list
+        rows = next((v for v in rows.values() if isinstance(v, list)), None)
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        diag["notes"].append(f"{tag}：無資料或格式非預期")
+        return []
+    diag.setdefault("official_cols", {})[tag] = list(rows[0].keys())
+    recs, ok = [], 0
+    for d in rows:
+        sid = _pick_val(d, _SID_KEYS)
+        if not re.fullmatch(r"\d{4,6}", sid or ""):        # 退回：任一值為 4~6 碼數字
+            sid = next((str(v).strip() for v in d.values()
+                        if re.fullmatch(r"\d{4,6}", str(v or "").strip())), "")
+        if not re.fullmatch(r"\d{4,6}", sid or ""):
+            continue
+        start = roc_any_to_iso(_pick_val(d, _START_KEYS))
+        end   = roc_any_to_iso(_pick_val(d, _END_KEYS))
+        if not (start and end):                             # 起迄合在「處置期間」文字裡
+            period = _pick_val(d, _PERIOD_KEYS)
+            if not period:                                  # 再退回：掃所有值找含兩個日期者
+                for v in d.values():
+                    s2, e2 = _extract_two_dates(v)
+                    if s2 and e2: period = str(v); break
+            s2, e2 = _extract_two_dates(period)
+            start, end = start or s2, end or e2
+        measure = _pick_val(d, _MEASURE_KEYS)
+        method = "20分盤" if ("20" in measure or "二十" in measure) else ("5分盤" if ("5" in measure or "五" in measure) else "")
+        rnd = 2 if any(k in measure for k in ("第二次", "二次", "第2次")) else (1 if any(k in measure for k in ("第一次", "一次", "第1次")) else "")
+        if start and end: ok += 1
+        recs.append({"sid": sid, "start": start, "end": end, "round": rnd,
+                     "method": method, "name": _pick_val(d, _NAME_KEYS), "mkt": market})
+    diag["notes"].append(f"{tag}：{len(rows)} 列 → 解析 {len(recs)} 檔（起迄可辨識 {ok} 檔）")
+    return recs
+
+def fetch_official_disposition(diag):
+    """TWSE + TPEx 官方處置公告（即時）。回傳合併 recs；任一來源失敗不影響另一個或主流程。"""
+    if requests is None:
+        diag["notes"].append("官方處置：requests 未安裝，略過"); return []
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _OFFICIAL_UA, "Accept": "application/json"})
+    sess.verify = False   # 政府開放資料端點憑證在新版 OpenSSL 下驗證失敗，公開唯讀資料關閉驗證
+    out = []
+    for url, mkt, tag, params in (
+            (TWSE_PUNISH_URL,   "上市", "TWSE處置", None),
+            (TPEX_DISPOSAL_URL, "上櫃", "TPEx處置", {"l": "zh-tw"})):
+        try:
+            r = sess.get(url, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            out += _parse_official_records(r.json(), mkt, diag, tag)
+        except Exception as e:
+            diag["notes"].append(f"{tag} 抓取失敗（改用 FinMind）：{e}")
+    return out
+
+def merge_disposition(finmind_recs, official_recs, diag):
+    """以 FinMind（乾淨起迄）為底，官方即時源補『FinMind 尚無』的當日新公告；
+    同一 sid 若官方 end 較新則更新起迄（處置延長／第二次）。回傳合併 recs。"""
+    by = {r["sid"]: dict(r) for r in finmind_recs}
+    added = updated = 0
+    for r in official_recs:
+        sid = r["sid"]
+        if not (r.get("start") and r.get("end")):
+            continue                      # 官方此筆起迄無法辨識 → 跳過（不污染；FinMind 有的話仍在）
+        if sid not in by:
+            by[sid] = dict(r); added += 1
+        else:
+            if (r.get("end") or "") > (by[sid].get("end") or ""):
+                by[sid]["start"], by[sid]["end"] = r["start"], r["end"]; updated += 1
+            for k in ("method", "round", "name"):
+                if not by[sid].get(k) and r.get(k):
+                    by[sid][k] = r[k]
+    diag["notes"].append(f"官方即時源合併：新增 {added} 檔、更新 {updated} 檔（FinMind {len(finmind_recs)} 檔為底）")
+    return list(by.values())
+
 # ===== 通知：處置中個股達標即進通知 =====
 def build_notifications(ongoing, today):
     """每次更新重新掃描處置中個股。進通知條件：月線斜率 yx > 1%，
@@ -519,7 +651,9 @@ def make_demo():
     ]
     confirmed = [
         row("2618","長榮航","上市",48.6,9.95,ind="航空",round=1,method="5分盤",start="2026-06-30",end="2026-07-11",
-            wj=5,yx=1.6,lf=-14.0,st=None,pk60=-5.0,z5=-6.4,z10=-5.2),
+            wj=5,yx=1.6,lf=0.0,cum6=36.5,st=None,pk60=-5.0,z5=-6.4,z10=-5.2),
+        row("6187","萬潤","上櫃",121.5,6.58,ind="半導體-設備",round=2,method="20分盤",start="2026-06-30",end="2026-07-13",
+            wj=7,yx=2.4,lf=0.0,cum6=41.2,st=None,pk60=-3.1,z5=8.2,z10=5.5),
     ]
     ongoing = [
         # 剩天 >3 → 留在「處置中」
@@ -555,15 +689,21 @@ def main():
     if not today: today = datetime.date.today().isoformat()
     next_td = next_trading_day(today)
 
-    # 處置名單
-    disp_recs = []
+    # 處置名單：官方即時源(TWSE+TPEx punish)為主 + FinMind 為底(乾淨起迄、fallback)。
+    # 官方源讓「今天公告、明日起處置」的個股當日盤後就能抓到；FinMind 晚間批次僅作補漏。
+    finmind_recs = []
     try:
         ds = (datetime.date.fromisoformat(today) - datetime.timedelta(days=45)).isoformat()
         df = finmind_get("TaiwanStockDispositionSecuritiesPeriod", FINMIND_TOKEN, start_date=ds)
-        diag["notes"].append(f"處置名單 {0 if df is None else len(df)} 筆")
-        disp_recs = parse_disposition(df, diag)
+        diag["notes"].append(f"FinMind 處置名單 {0 if df is None else len(df)} 筆")
+        finmind_recs = parse_disposition(df, diag)
     except Exception as e:
-        diag["notes"].append(f"處置名單抓取失敗：{e}")
+        diag["notes"].append(f"FinMind 處置名單抓取失敗：{e}")
+    try:
+        official_recs = fetch_official_disposition(diag)
+    except Exception as e:
+        official_recs = []; diag["notes"].append(f"官方處置源整體失敗（改用 FinMind）：{e}")
+    disp_recs = merge_disposition(finmind_recs, official_recs, diag)
     ongoing, confirmed, released = categorize(disp_recs, today, universe, diag)
     disp_sids = set(r["sid"] for r in disp_recs)
 
@@ -605,7 +745,8 @@ def main():
                 m = compute_price_metrics(seq, idx6, disp_start=r.get("start"))
                 r["close"] = round(seq[-1][3], 2)
                 r.update({"chg": m["chg"], "wj": m["wj"], "yx": m["yx"], "lf": m["lf"],
-                          "ma20": m["ma20"], "ma20_touch": m["ma20_touch"], "pk60": peak60_dist(seq)})
+                          "cum6": m["cum6"], "ma20": m["ma20"], "ma20_touch": m["ma20_touch"],
+                          "pk60": peak60_dist(seq)})
             r["name"] = names.get(r["sid"], r.get("name","")); r["mkt"] = mkts.get(r["sid"], "")
             r["ind"] = ind_map.get(r["sid"], "")
             r.setdefault("z5", None); r.setdefault("z10", None)
@@ -836,6 +977,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <button class="czt on" data-p="ov">總覽</button>
     <button class="czt" data-p="notify">🔔 通知</button>
     <button class="czt" data-p="watch">可能進入處置</button>
+    <button class="czt" data-p="confirmed">📌 明日確定</button>
     <button class="czt" data-p="ongoing">處置中</button>
     <button class="czt" data-p="release">🔓 即將出關</button>
     <button class="czt" data-p="teach">實戰教學</button>
@@ -846,6 +988,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <div class="stats">
       <div class="stat r"><div class="n num" id="cnt-n">—</div><div class="l">🔔 通知</div></div>
       <div class="stat w"><div class="n num" id="cnt-w">—</div><div class="l">可能進入處置</div></div>
+      <div class="stat"><div class="n num" id="cnt-c" style="color:var(--blue)">—</div><div class="l">📌 明日確定</div></div>
       <div class="stat o"><div class="n num" id="cnt-o">—</div><div class="l">處置中</div></div>
       <div class="stat"><div class="n num" id="cnt-rs" style="color:var(--down)">—</div><div class="l">🔓 即將出關</div></div>
     </div>
@@ -868,6 +1011,13 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <div class="tblhint">點欄位標題排序（再點切換升/降冪）・表格可左右滑動看更多指標・點列看 K 線</div>
     <div id="list-watch"></div>
     <div id="expl-watch"></div>
+  </div>
+
+  <div class="pane hidden" id="p-confirmed">
+    <div class="sech">📌 明日確定 <span class="pill">交易所已公告・下一交易日起處置</span></div>
+    <div class="tblhint">已公告、處置尚未開始（隔日起分盤）・點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
+    <div id="list-confirmed"></div>
+    <div id="expl-confirmed"></div>
   </div>
 
   <div class="pane hidden" id="p-ongoing">
@@ -959,7 +1109,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
-<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（處置／分點籌碼／價量・法人）、台灣證交所／櫃買中心 ・ 僅供研究，非投資建議</footer>
+<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：台灣證交所／櫃買中心 OpenAPI（處置公告・即時）、<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（處置起迄回補／分點籌碼／價量・法人） ・ 僅供研究，非投資建議</footer>
 
 <script>
 const BUILD_V = "__BUILDV__" || "0";
@@ -1028,16 +1178,25 @@ function renderList(elId, arr, opt){
 }
 
 /* ---- 緊湊表格（仿處置神器）：凍結首欄、可左右滑動、點欄位標題排序 ---- */
-const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, ongoing:{key:null,asc:false}, release:{key:null,asc:false} };
-const LISTDATA = { notify:[], watch:[], ongoing:[], release:[] };
+const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, confirmed:{key:null,asc:false}, ongoing:{key:null,asc:false}, release:{key:null,asc:false} };
+const LISTDATA = { notify:[], watch:[], confirmed:[], ongoing:[], release:[] };
 const LISTOPT = {
   notify:{prog:true, empty:"目前沒有達到通知標準的處置中個股。<br><span style=\"color:var(--dim)\">標準：月斜&gt;1% 且（累計跌幅破 -10/-20/-30%，或當日K棒觸及20MA月線）</span>"},
   watch:{light:true, empty:"目前沒有接近處置門檻的個股。"},
+  confirmed:{empty:"目前沒有『已公告、明日起處置』的個股。<br><span style=\"color:var(--dim)\">交易所處置公告多在盤後傍晚發布；若今日剛公告，最快本次或次日盤後建置後出現。</span>"},
   ongoing:{prog:true, empty:"目前沒有剩餘 &gt;3 交易日的處置中個股。"},
   release:{prog:true, empty:"目前沒有即將出關（剩餘 ≤3 交易日）的處置中個股。"}
 };
 // 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻、處置中/通知多一欄進度
 function colSpec(name){
+  // 明日確定：處置尚未開始 → 無「進度/剩天/累幅」，改看「近6漲」(近6日累積漲幅，被處置主因)
+  if(name==="confirmed") return [
+    [["股價","close"],["漲幅","chg"]],
+    [["距峰高%","pk60"]],
+    [["位階","wj"],["月斜","yx"]],
+    [["近6漲","cum6"]],
+    [["主5","z5"],["主10","z10"]],
+  ];
   const c=[
     [["股價","close"],["漲幅","chg"]],
     [["距峰高%","pk60"]],
@@ -1061,6 +1220,7 @@ function fmtCell(key,v,r){
     case "lf":    return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:(r.light!=null&&n>=32)?"up":signCls(n)};
     case "st": case "d2r": return {t:String(Math.round(n)),c:""};
     case "z5": case "z10": return {t:n.toFixed(1)+"%",c:signCls(n)};
+    case "cum6": return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
     case "pk60": return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
     case "vmult": return {t:n.toFixed(1)+"x", c:(n>=5?"up":"amb")};
   }
@@ -1151,7 +1311,7 @@ function goChart(sid){ location.href = "index.html?stk=" + encodeURIComponent(si
 
 function switchTab(p){
   document.querySelectorAll(".czt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  ["ov","notify","watch","ongoing","release","teach","rule"].forEach(x=>{
+  ["ov","notify","watch","confirmed","ongoing","release","teach","rule"].forEach(x=>{
     const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p);
   });
   try{ window.scrollTo({top:0,behavior:"smooth"}); }catch(e){ window.scrollTo(0,0); }
@@ -1161,11 +1321,11 @@ document.querySelectorAll(".czt").forEach(b=>b.addEventListener("click",()=>swit
 async function boot(){
   let d=null;
   try{ const r=await fetch("data/chuzhi.json?v="+BUILD_V,{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
-  ["watch","ongoing","release"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
+  ["watch","confirmed","ongoing","release"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
   const en=$("expl-notify"); if(en) en.innerHTML=NOTIFY_EXPL;
   if(!d){
     $("today").textContent="資料尚未產生";
-    ["notify","watch","ongoing","release"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
+    ["notify","watch","confirmed","ongoing","release"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
     return;
   }
   $("today").textContent=d.today||"—";
@@ -1173,17 +1333,18 @@ async function boot(){
   const c=d.counts||{};
   $("cnt-n").textContent=c.notify!=null?c.notify:((d.notify||[]).length);
   $("cnt-w").textContent=c.watch!=null?c.watch:((d.watch||[]).length);
+  const _cc=$("cnt-c"); if(_cc) _cc.textContent=c.confirmed!=null?c.confirmed:((d.confirmed||[]).length);
   $("cnt-o").textContent=c.ongoing!=null?c.ongoing:((d.ongoing||[]).length);
   const _rs=$("cnt-rs"); if(_rs) _rs.textContent=c.release_soon!=null?c.release_soon:((d.release_soon||[]).length);
-  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.ongoing=d.ongoing||[]; LISTDATA.release=d.release_soon||[];
-  ["notify","watch","ongoing","release"].forEach(renderTbl);
+  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.confirmed=d.confirmed||[]; LISTDATA.ongoing=d.ongoing||[]; LISTDATA.release=d.release_soon||[];
+  ["notify","watch","confirmed","ongoing","release"].forEach(renderTbl);
   if(d.diag && (d.diag.notes||[]).length){
     const box=$("diagbox"); box.style.display="block";
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
   }
 }
 const _dgt=document.getElementById("dispGtog");
-if(_dgt) _dgt.addEventListener("click",e=>{ dispGroup=!dispGroup; e.currentTarget.classList.toggle("on",dispGroup); ["notify","watch","ongoing"].forEach(n=>renderTbl(n)); });
+if(_dgt) _dgt.addEventListener("click",e=>{ dispGroup=!dispGroup; e.currentTarget.classList.toggle("on",dispGroup); ["notify","watch","confirmed","ongoing"].forEach(n=>renderTbl(n)); });
 boot();
 </script>
 </body>
