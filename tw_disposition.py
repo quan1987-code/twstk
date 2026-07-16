@@ -113,6 +113,16 @@ def now_taipei():
     return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
 
 # ===== 處置名單 =====
+def _norm_date(x):
+    """處置起迄日正規化成 ISO 'YYYY-MM-DD'：先試 roc_any_to_iso（含民國/西元、各種分隔），
+    失敗再退回前 10 字並把 '/' 轉 '-'（避免 '2026/07/13' 與 today '2026-07-13' 字串比較失準）。
+    與官方源同一套正規化，確保 (sid,start,end) 去重鍵一致。"""
+    iso = roc_any_to_iso(x)
+    if iso:
+        return iso
+    s = str(x if x is not None else "").strip()[:10]
+    return s.replace("/", "-") if s else ""
+
 def parse_disposition(df, diag):
     if df is None or df.empty:
         diag["notes"].append("處置名單為空"); return []
@@ -133,43 +143,58 @@ def parse_disposition(df, diag):
     for _, row in df.iterrows():
         sid = str(row.get(c_sid, "")).strip()
         if not sid: continue
-        start = str(row.get(c_start, "")).strip()[:10] if c_start else ""
-        end = str(row.get(c_end, "")).strip()[:10] if c_end else ""
+        start = _norm_date(row.get(c_start)) if c_start else ""
+        end = _norm_date(row.get(c_end)) if c_end else ""
         measure = str(row.get(c_measure, "")).strip() if c_measure else ""
         method = "20分盤" if ("20" in measure or "二十" in measure) else ("5分盤" if ("5" in measure or "五" in measure) else "")
         rnd = 2 if any(k in measure for k in ("第二次","二次","第2次")) else (1 if any(k in measure for k in ("第一次","一次","第1次")) else "")
         recs.append({"sid": sid, "start": start, "end": end, "round": rnd, "method": method})
-    by = {}
-    for r in recs:
-        k = r["sid"]
-        if k not in by or (r["end"] or "") > (by[k]["end"] or ""): by[k] = r
-    diag["disp_parsed"] = len(by)
-    return list(by.values())
+    # ★保留『每一筆』處置期別（不再逐檔去重只留 end 最晚者）：同一檔可能同時有「進行中的第一次」
+    #   與「未來的第二次」，去重會讓進行中的那次消失、被誤歸「明日確定」→「處置中」漏股（例：華新科）。
+    #   去重與歸類改由 categorize 依現況(處置中>明日確定>剛出關)決定。
+    diag["disp_parsed_rows"] = len(recs)
+    diag["disp_parsed"] = len(set(r["sid"] for r in recs))
+    return recs
 
 def categorize(disp_recs, today, universe, diag):
-    """分成 ongoing/confirmed/released，並濾掉非個股(不在 universe 者，如權證)。"""
-    ongoing, confirmed, released = [], [], []
-    dropped = 0
+    """逐檔（依 sid 分組）取『最能代表現況』的處置期別，分成 ongoing/confirmed/released：
+    優先序 處置中 > 明日確定 > 剛出關（確保進行中的處置一定落在「處置中」，不被同檔未來的第二次蓋掉）。
+    濾掉不在 universe 者（權證/ETF/興櫃/未在當日快照的新股），並把濾除清單記入 diag 供核對。"""
+    by_sid = {}
     for r in disp_recs:
-        sid = r["sid"]
+        by_sid.setdefault(r["sid"], []).append(r)
+    ongoing, confirmed, released = [], [], []
+    dropped = []
+    for sid, recs in by_sid.items():
         if universe and sid not in universe:
-            dropped += 1; continue
-        start, end = r.get("start",""), r.get("end","")
-        if start and end and start <= today <= end:
-            r2 = dict(r); r2["release"] = end; r2["d2r"] = biz_days_between(today, end)
-            r2["day_total"] = biz_days_between(start, end) + 1
-            r2["day_n"] = min(r2["day_total"], biz_days_between(start, today) + 1)
+            dropped.append(sid); continue
+        # 處置中：start≤today≤end；或已開始但 end 不明(缺欄位)也視為處置中，避免整檔漏掉
+        og = [r for r in recs if r.get("start") and r.get("end") and r["start"] <= today <= r["end"]]
+        og += [r for r in recs if r.get("start") and not r.get("end") and r["start"] <= today]
+        cf = [r for r in recs if r.get("start") and r["start"] > today]
+        rl = [r for r in recs if r.get("end") and r["end"] < today]
+        if og:
+            r = max(og, key=lambda x: x.get("end", "")); r2 = dict(r); end = r.get("end", "")
+            r2["release"] = end
+            r2["d2r"] = biz_days_between(today, end) if end else None
+            if end:
+                r2["day_total"] = biz_days_between(r["start"], end) + 1
+                r2["day_n"] = min(r2["day_total"], biz_days_between(r["start"], today) + 1)
             ongoing.append(r2)
-        elif start and start > today:
-            r2 = dict(r); r2["days"] = biz_days_between(start, end) + 1 if end else None
+        elif cf:
+            r = min(cf, key=lambda x: x.get("start", "")); r2 = dict(r)
+            r2["days"] = biz_days_between(r["start"], r["end"]) + 1 if r.get("end") else None
             confirmed.append(r2)
-        elif end and end < today:
-            since = biz_days_between(end, today)
+        elif rl:
+            r = max(rl, key=lambda x: x.get("end", ""))
+            since = biz_days_between(r["end"], today)
             if 0 < since <= RELEASED_WINDOW_TD + 1:
                 r2 = dict(r); r2["since"] = since; released.append(r2)
-    if dropped: diag["notes"].append(f"已濾除非個股 {dropped} 檔")
-    confirmed.sort(key=lambda x: x.get("start",""))
-    ongoing.sort(key=lambda x: x.get("d2r", 999))
+    if dropped:
+        diag["notes"].append(f"已濾除非universe {len(dropped)} 檔：{','.join(sorted(dropped)[:40])}")
+        diag["dropped_sids"] = sorted(dropped)
+    confirmed.sort(key=lambda x: x.get("start", ""))
+    ongoing.sort(key=lambda x: (x.get("d2r") is None, x.get("d2r", 999)))
     released.sort(key=lambda x: x.get("since", 999))
     return ongoing, confirmed, released
 
@@ -551,24 +576,28 @@ def fetch_official_disposition(diag):
     return out
 
 def merge_disposition(finmind_recs, official_recs, diag):
-    """以 FinMind（乾淨起迄）為底，官方即時源補『FinMind 尚無』的當日新公告；
-    同一 sid 若官方 end 較新則更新起迄（處置延長／第二次）。回傳合併 recs。"""
-    by = {r["sid"]: dict(r) for r in finmind_recs}
-    added = updated = 0
+    """合併 FinMind（乾淨起迄為底）與官方即時源的『所有處置期別』：以 (sid,start,end) 為鍵去除
+    完全相同的期別（同一期兩來源都報），但『保留同一檔的不同期別』（第一次/第二次/延長），
+    交由 categorize 依現況決定歸類（避免第二次蓋掉進行中的第一次而漏股）。缺 start/end 的官方筆跳過。"""
+    def key(r):
+        return (r["sid"], r.get("start", ""), r.get("end", ""))
+    by = {}
+    for r in finmind_recs:
+        by.setdefault(key(r), dict(r))
+    added = 0
     for r in official_recs:
-        sid = r["sid"]
         if not (r.get("start") and r.get("end")):
             continue                      # 官方此筆起迄無法辨識 → 跳過（不污染；FinMind 有的話仍在）
-        if sid not in by:
-            by[sid] = dict(r); added += 1
+        k = key(r)
+        if k not in by:
+            by[k] = dict(r); added += 1   # 官方獨有的期別（含 FinMind 尚未收錄的第二次/新公告）
         else:
-            if (r.get("end") or "") > (by[sid].get("end") or ""):
-                by[sid]["start"], by[sid]["end"] = r["start"], r["end"]; updated += 1
-            for k in ("method", "round", "name"):
-                if not by[sid].get(k) and r.get(k):
-                    by[sid][k] = r[k]
-    diag["notes"].append(f"官方即時源合併：新增 {added} 檔、更新 {updated} 檔（FinMind {len(finmind_recs)} 檔為底）")
-    return list(by.values())
+            for f in ("method", "round", "name", "mkt"):   # 同一期別：補齊 FinMind 缺的欄位
+                if not by[k].get(f) and r.get(f):
+                    by[k][f] = r[f]
+    recs = list(by.values())
+    diag["notes"].append(f"官方即時源合併：期別總數 {len(recs)}（官方新增 {added}；FinMind {len(finmind_recs)} 筆為底）")
+    return recs
 
 # ===== 通知：處置中個股達標即進通知 =====
 def build_notifications(ongoing, today):
@@ -693,9 +722,11 @@ def main():
     # 官方源讓「今天公告、明日起處置」的個股當日盤後就能抓到；FinMind 晚間批次僅作補漏。
     finmind_recs = []
     try:
-        ds = (datetime.date.fromisoformat(today) - datetime.timedelta(days=45)).isoformat()
+        # 窗 90 天：處置期最長約 12 個交易日，但『很早公告但仍處置中』或第二次處置需較寬窗才不漏；
+        # released 仍只顯示近 RELEASED_WINDOW_TD 個交易日，寬窗不影響出關清單。
+        ds = (datetime.date.fromisoformat(today) - datetime.timedelta(days=90)).isoformat()
         df = finmind_get("TaiwanStockDispositionSecuritiesPeriod", FINMIND_TOKEN, start_date=ds)
-        diag["notes"].append(f"FinMind 處置名單 {0 if df is None else len(df)} 筆")
+        diag["notes"].append(f"FinMind 處置名單 {0 if df is None else len(df)} 筆（起 {ds}）")
         finmind_recs = parse_disposition(df, diag)
     except Exception as e:
         diag["notes"].append(f"FinMind 處置名單抓取失敗：{e}")
@@ -706,6 +737,19 @@ def main():
     disp_recs = merge_disposition(finmind_recs, official_recs, diag)
     ongoing, confirmed, released = categorize(disp_recs, today, universe, diag)
     disp_sids = set(r["sid"] for r in disp_recs)
+    # 診斷：各市場別分佈（上櫃為 0＝官方 TPEx 源可能失效）＋每檔最終歸類（供核對某檔為何漏/在哪類，如 2492 華新科）
+    _cat_of = {}
+    for _c, _lst in (("處置中", ongoing), ("明日確定", confirmed), ("剛出關", released)):
+        for _r in _lst:
+            _cat_of[_r["sid"]] = _c
+    mk_cnt = {}
+    for _sid in disp_sids:
+        _mk = mkts.get(_sid, "不在DB")
+        mk_cnt[_mk] = mk_cnt.get(_mk, 0) + 1
+    diag["disp_by_market"] = mk_cnt
+    diag["disp_category"] = {s: _cat_of.get(s, "未歸類(窗外/缺起迄)") for s in sorted(disp_sids)}
+    diag["notes"].append("處置檔市場別：" + "、".join(f"{k} {v}" for k, v in sorted(mk_cnt.items()))
+                         + f"｜歸類 處置中{len(ongoing)}/確定{len(confirmed)}/出關{len(released)}")
 
     # 大盤6日差幅
     idx6 = 0.0
