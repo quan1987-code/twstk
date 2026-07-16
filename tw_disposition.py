@@ -744,11 +744,11 @@ def main():
             _cat_of[_r["sid"]] = _c
     mk_cnt = {}
     for _sid in disp_sids:
-        _mk = mkts.get(_sid, "不在DB")
-        mk_cnt[_mk] = mk_cnt.get(_mk, 0) + 1
+        _mk = mkts.get(_sid) or "不在DB"   # market 欄可能為 None（key 存在但值 None）→ 正規化成字串，
+        mk_cnt[_mk] = mk_cnt.get(_mk, 0) + 1   # 否則下方 sorted 會比較 None<str 而 TypeError
     diag["disp_by_market"] = mk_cnt
     diag["disp_category"] = {s: _cat_of.get(s, "未歸類(窗外/缺起迄)") for s in sorted(disp_sids)}
-    diag["notes"].append("處置檔市場別：" + "、".join(f"{k} {v}" for k, v in sorted(mk_cnt.items()))
+    diag["notes"].append("處置檔市場別：" + "、".join(f"{k} {v}" for k, v in sorted(mk_cnt.items(), key=lambda kv: str(kv[0])))
                          + f"｜歸類 處置中{len(ongoing)}/確定{len(confirmed)}/出關{len(released)}")
 
     # 大盤6日差幅
