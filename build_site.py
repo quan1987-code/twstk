@@ -6,7 +6,7 @@ r"""
   ・市場回撤：「台股加權指數 / 美股費城半導體 SOX / 韓國 KOSPI / 台積電 2330」卡片，
     每張含歷史最高收盤(附日期)、最近收盤(附日期)、距高點回撤%。
   ・台股波動率：加權指數年化歷史波動率(20/60日)＋近一年位階。
-  資料來源：yfinance/Stooq（＋^TWII 以 FinMind 補新鮮度）。
+  資料來源：yfinance/Stooq（＋^TWII 以證交所官方加權指數歷史補新鮮度）。
 
 分頁二（資金流向）：大戶/投信買賣超 TOP10 ＋ 120日產業/概念資金輪動。
 
@@ -20,7 +20,6 @@ r"""
 """
 import os
 import sys
-import time
 import glob
 import json
 import math
@@ -48,13 +47,16 @@ try:
 except Exception:
     tw_concepts = None
 
+try:
+    import tw_free_sources as twfree     # 別名避開本檔既有的區域變數 fs（外資副圖起始索引）
+except Exception:
+    twfree = None
+
 DB_PATH = "twstock.db"
 LOOKBACK_BARS = 1000
 TRUST_CHART_BARS = 320   # 投信候選嵌入較短歷史以控制檔案大小
 OUT_DIR = "site"
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
-TWII_FRESH_LOOKBACK_DAYS = 7   # 用 FinMind 補「最近幾天」加權指數新鮮度（非全歷史，控制配額）
+TWII_FRESH_MONTHS = 3    # 用證交所官方指數補「最近幾個月」加權指數新鮮度（非全歷史）
 
 # 首頁三標的：(代碼, yfinance符號, 顯示名, 數值型態 'index'整數 / 'price'兩位小數)
 MARKET_TARGETS = [
@@ -442,64 +444,30 @@ def _merge_series(a, b):
     return ds, [by_date[d][0] for d in ds], [by_date[d][1] for d in ds]
 
 
-def finmind_get(dataset, max_retry=2, **params):
-    """輕量版 FinMind 請求（僅供本檔的加權指數新鮮度補值用；失敗直接放棄不重試太久，
-    不影響本檔其餘資料一律以 yfinance/Stooq 為主）。無 token 或套件缺失回空表。"""
-    if requests is None or not FINMIND_TOKEN:
+def fetch_twse_twii_series():
+    """加權指數新鮮度補值：改用證交所『發行量加權股價指數歷史資料』(MI_5MINS_HIST)。
+    原本靠 FinMind `TaiwanVariousIndicators5Seconds`（5 秒盤中快照）拼出當日高/收，
+    那是 Sponsor 專屬資料表、免費版取不到；證交所這支端點免費免 token，
+    而且直接給每個交易日的『開高低收』，比 5 秒快照更準確。
+    只抓最近 TWII_FRESH_MONTHS 個月（新鮮度補值用，不需全歷史）。"""
+    if twfree is None:
         return None
-    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
-    q = {"dataset": dataset, **params}
-    wait = 10
-    for _ in range(max_retry):
-        try:
-            resp = requests.get(FINMIND_URL, headers=headers, params=q, timeout=20)
-        except Exception as e:
-            print(f"  FinMind 連線錯誤：{e}"); time.sleep(wait); wait *= 2; continue
-        if resp.status_code in (402, 429):
-            print(f"  FinMind 流量上限，等待 {wait}s"); time.sleep(wait); wait *= 2; continue
-        if resp.status_code != 200:
-            return None
-        return resp.json().get("data", [])
-    return None
-
-
-def fetch_finmind_twii_series():
-    """加權指數新鮮度補值：TaiwanStockPrice 不含大盤本身，FinMind 需靠
-    TaiwanVariousIndicators5Seconds（5秒頻加權指數快照，一次只能查一天）才能拿到 TAIEX。
-    只補最近 TWII_FRESH_LOOKBACK_DAYS 個『日曆日』（非全歷史，控制配額），
-    每天：當日最高快照當『高』、最後一筆快照當『收盤』。FinMind 是本站其餘資料的主來源、
-    每天穩定到位，用它來補 yfinance 對 ^TWII 常見的「有資料但少最新一天」最可靠。"""
-    if not FINMIND_TOKEN:
+    try:
+        return twfree.fetch_taiex_series(twfree.make_session(), months=TWII_FRESH_MONTHS)
+    except Exception as e:
+        print(f"  證交所加權指數抓取失敗：{e}")
         return None
-    dates, highs, closes = [], [], []
-    today = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
-    for i in range(TWII_FRESH_LOOKBACK_DAYS):
-        d = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-        rows = finmind_get("TaiwanVariousIndicators5Seconds", start_date=d)
-        if i > 0:
-            time.sleep(0.3)
-        if not rows:
-            continue
-        vals = [r.get("TAIEX") for r in rows if r.get("TAIEX") not in (None, "")]
-        vals = [float(v) for v in vals if v]
-        if not vals:
-            continue
-        dates.append(d); highs.append(max(vals)); closes.append(vals[-1])
-    if len(closes) < 1:
-        return None
-    order = sorted(range(len(dates)), key=lambda i: dates[i])
-    return ([dates[i] for i in order], [highs[i] for i in order], [closes[i] for i in order])
 
 
 def fetch_market_series(yahoo_sym):
-    """yfinance ＋ Stooq ＋（僅 ^TWII 額外用 FinMind 補新鮮度）多來源合併，
+    """yfinance ＋ Stooq ＋（僅 ^TWII 額外用證交所官方指數補新鮮度）多來源合併，
     回傳 ((dates,highs,closes), 來源標記)。"""
     yf_s = fetch_yf_series(yahoo_sym)
     stooq_s = fetch_stooq_series(STOOQ_SYM.get(yahoo_sym))
-    finmind_s = fetch_finmind_twii_series() if yahoo_sym == "^TWII" else None
+    twse_s = fetch_twse_twii_series() if yahoo_sym == "^TWII" else None
     merged = None
     srcs = []
-    for s, tag in ((yf_s, "yfinance"), (stooq_s, "stooq"), (finmind_s, "finmind")):
+    for s, tag in ((yf_s, "yfinance"), (stooq_s, "stooq"), (twse_s, "twse")):
         if not s:
             continue
         srcs.append(tag)
@@ -969,7 +937,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="expbody">
         <div><b>大戶</b>＝<b>三大法人合計</b>（外資＋投信＋自營）買賣超，作為「大戶／主力資金」的免費替代指標（無單獨大戶分點免費來源）。<b>投信</b>＝投信單獨買賣超。</div>
         <div><b>金額(億)</b>＝買賣超張數 × 當日收盤估算；<b>當日</b>＝最近一個交易日，<b>近5/20/60日</b>＝最近 5／20／60 個交易日累計。紅＝買超、綠＝賣超。點名稱可看 K 線。</div>
-        <div style="color:var(--dim)">資料為三大法人盤後（上市＝證交所 T86／上櫃＝FinMind，均已涵蓋），通常較股價晚約一個交易日。</div>
+        <div style="color:var(--dim)">資料為三大法人盤後（上市＝證交所 T86／上櫃＝櫃買中心三大法人日報，均已涵蓋），通常較股價晚約一個交易日。</div>
       </div>
     </details>
 
@@ -993,20 +961,20 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="rotbox" id="rotbox"><div class="tpempty">資金輪動資料載入中…</div></div>
       <details class="exp"><summary>說明 / 指標</summary>
         <div class="expbody">
-          <div><b>族群</b>：把同一產業鏈／概念的個股整合成一群（如「電子上游-IC設計」「航運-貨櫃」）。主要個股用<b>產業鏈概念</b>分群，其餘退回 FinMind 大分類。</div>
+          <div><b>族群</b>：把同一產業鏈／概念的個股整合成一群（如「電子上游-IC設計」「航運-貨櫃」）。主要個股用<b>產業鏈概念</b>分群，其餘退回證交所／櫃買公司基本資料的產業別。</div>
           <div><b>近120日(億)</b>：該族群所有成分股近 120 個交易日<b>三大法人累計買賣超金額</b>加總。<b>正(紅)＝資金淨流入、負(綠)＝淨流出</b>。由大到小排序，一眼看出 120 天內資金<b>從哪些族群流出、轉進哪些族群</b>。</div>
           <div><b>近20日</b>：族群最近 20 日法人淨額，看資金<b>現在</b>還在流入(▲)或已轉為流出(▼)＝輪動方向。</div>
           <div style="margin-top:4px"><b>成分股指標</b>（點族群展開，比照處置中個股）：</div>
           <div><b>股價／漲幅</b>＝今日收盤與漲跌幅。<b>位階</b>＝20日布林通道級距(+10上軌偏高、0月線、−10下軌偏低)。<b>斜率</b>＝月線(20MA)一日斜率%(&gt;1%強勢)。</div>
           <div><b>主5／主10</b>＝近5/10日三大法人集中度%＝Σ法人買賣超張÷Σ成交量張×100，正(紅)＝法人買超集中、負(綠)＝派發（市場版以三大法人替代分點主力）。</div>
           <div><b>法20(億)</b>＝個股近20日三大法人淨額，看族群裡<b>法人實際在買哪幾檔</b>。<b>量比</b>＝今量÷20日均量(&gt;2爆量)。<b>季乖離%</b>＝距季線(60MA)距離，過大＝短線漲多、追高風險。</div>
-          <div style="color:var(--dim)">三大法人買賣超為盤後資料（上市＝證交所 T86／上櫃＝FinMind，均已涵蓋），通常較股價晚約一個交易日。僅供研究，非投資建議。</div>
+          <div style="color:var(--dim)">三大法人買賣超為盤後資料（上市＝證交所 T86／上櫃＝櫃買中心三大法人日報，均已涵蓋），通常較股價晚約一個交易日。僅供研究，非投資建議。</div>
         </div>
       </details>
     </div>
   </div>
 
-  <div class="foot">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" class="srclink">FinMind</a>、證交所／櫃買、Yahoo Finance ・ 僅供研究，非投資建議</div>
+  <div class="foot">資料來源：臺灣證券交易所／櫃買中心／集保結算所 TDCC（公開資料）、Yahoo Finance ・ 僅供研究，非投資建議</div>
 </div>
 
 <div id="cv">
@@ -1025,7 +993,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <span><i style="background:var(--ma20)"></i>MA20</span><span><i style="background:var(--ma60)"></i>MA60</span>
     <span><i style="background:var(--ma240)"></i>MA240</span><span><i style="background:#8aa0b6"></i>布林20</span>
     <span style="color:var(--dim)">點K棒鎖定十字線（日期／價位＋副圖同步）・ 單指拖移掃描 ・ 雙指縮放 ・ 上方按鈕切換 副圖(量/投信/外資/400張大戶)、下圖(MACD/RSI/KD/主力)</span>
-    <span style="color:var(--dim)">籌碼資料（三大法人／400張大戶／發行張數）資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" class="srclink">FinMind</a></span>
+    <span style="color:var(--dim)">籌碼資料來源：三大法人＝證交所 T86／櫃買三大法人日報；400張大戶・發行張數＝集保結算所 TDCC</span>
   </div>
   <div class="chartbox"><canvas id="chartCanvas"></canvas></div>
 </div>

@@ -11,7 +11,7 @@ r"""
 
   2) 120 交易日產業資金輪動（rotation）
      把『概念股/產業鏈個股』整合成一個個族群（group，採 tw_industry 的概念標籤；
-     無概念標籤者退回 FinMind 大分類）。每個族群算近 120 個交易日『三大法人累計買賣超金額(億)』，
+     無概念標籤者退回官方公司基本資料的產業別）。每個族群算近 120 個交易日『三大法人累計買賣超金額(億)』，
      由大到小排序＝資金在這 120 天從哪些族群流出、流向哪些族群。點族群可展開成分股，
      成分股顯示方式比照『處置中個股』：今日股價、漲幅、位階、斜率(月斜)、主5、主10，
      另加（專業建議）法20(近20日法人淨額億)、量比、季乖離%。
@@ -131,7 +131,7 @@ def _sector_of(label):
 
 
 def build(con):
-    # 產業標籤：group_map（概念優先）、sector_map（FinMind 大分類）
+    # 產業標籤：group_map（概念優先）、sector_map（官方產業別大分類）
     group_map = tw_industry.label_map(con) if tw_industry else {}
     sector_map = {}
     if tw_industry:

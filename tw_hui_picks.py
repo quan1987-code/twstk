@@ -2,7 +2,7 @@
 r"""
 輝哥選股（tw_hui_picks.py）
 ================================================================
-「以最近一個交易日」為準的量化濾網，讀共用的 twstock.db（純價量，不需 FinMind token），
+「以最近一個交易日」為準的量化濾網，讀共用的 twstock.db（純價量，不需任何 API token），
 輸出 site/data/hui.json 與『單一自包含 HTML』site/hui.html。個股列表依「處置股專區」相同的
 概念股分類方式分群排列（概念群在前、無概念退回產業別、未分類最後），並附一頁「公式說明」。
 
@@ -566,7 +566,7 @@ HUI_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="pane hidden" id="p-doc"><div class="doc" id="docbody"></div></div>
 </div>
-<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（價量）、台灣證交所／櫃買中心 ・ 篩選為本站機械式初篩・僅供研究，非投資建議</footer>
+<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：臺灣證券交易所／櫃買中心公開資料（價量）・ 篩選為本站機械式初篩・僅供研究，非投資建議</footer>
 
 <script>
 const BUILD_V = "__BUILDV__" || "0";

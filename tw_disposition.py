@@ -1,24 +1,31 @@
 # -*- coding: utf-8 -*-
 r"""
-處置股專區資料產生器（tw_disposition.py）v2
+處置股專區資料產生器（tw_disposition.py）v2（全免費官方資料版）
 ================================================================
 產生 site/data/chuzhi.json 與 site/chuzhi.html。K 線下方「主力買賣超」副圖的基準資料
-已由 build_site.py 用『三大法人合計』為每一檔股票填好（近一年），本程式只在處置相關個股
-累積到足夠的『分點』資料時，把該檔的主力序列升級覆寫成更精準的分點主力（給 K 線副圖切換用）。
-與 build_site.py / tw_volume_breakout_screener_v2.py 共用 twstock.db 與 FinMind 串接。
+已由 build_site.py 用『三大法人合計』為每一檔股票填好（近一年）。
+與 build_site.py / tw_volume_breakout_screener_v2.py 共用 twstock.db。
 
 四狀態：watch(漲幅型估計) / confirmed(明日確定) / ongoing(處置中) / released(剛出關)
 每檔指標（仿處置神器）：連次 連量 位階 月斜 累幅 剩天 主5 主10，主力買賣超日序列。
 
-資料來源：TaiwanStockDispositionSecuritiesPeriod、TaiwanStockTradingDailyReport(分點,Sponsor)、twstock.db
+資料來源（皆免費、官方、免 token）：
+  ● 處置名單：證交所 `announcement/punish` ＋ 櫃買 `tpex_disposal_information`（即時公告）。
+    這兩支只列「現行/近期」公告，故本程式把每次抓到的期別存進 twstock.db 的 `disposition` 表
+    累積成歷史，取代原本 FinMind `TaiwanStockDispositionSecuritiesPeriod` 的 90 天回溯查詢
+    （該資料表為 Sponsor 專屬，免費版取不到）。
+  ● 主5／主10（籌碼集中度）：改用『三大法人合計買賣超 ÷ 區間成交量』。
+    原本用 FinMind `TaiwanStockTradingDailyReport`（券商分點）計算，那是 Sponsor 專屬資料表；
+    券商分點在官方端只有證交所 BSR 網頁（需輸入驗證碼），沒有可自動化的免費 API，
+    因此改用同樣是「大戶動向」但完全免費的三大法人買賣超為基準。
+
 用法：
   python tw_disposition.py             # 正常
   python tw_disposition.py --demo      # 離線示範
-  python tw_disposition.py --no-chips  # 跳過分點(省流量)
+  python tw_disposition.py --no-chips  # 跳過籌碼集中度計算
 """
-import os, sys, re, json, time, sqlite3, datetime, argparse
+import os, sys, re, json, sqlite3, datetime, argparse
 from statistics import pstdev
-import pandas as pd
 try:
     import tw_industry
 except Exception:
@@ -35,56 +42,17 @@ except Exception:
 # ===== CONFIG =====
 DB_PATH = "twstock.db"
 OUT_DIR = "site"
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")
 HTTP_TIMEOUT = 30
-CHIP_MAX_STOCKS = 60          # 分點最多處理幾檔（控制首次回補時間）
-CHIP_SLEEP = 0.25
-CHIP_TIMEOUT = 45             # 分點(單日)請求逾時秒
-MF_HISTORY_DAYS = 60          # 主力(分點)序列最多看回幾個交易日
-MF_BACKFILL_CAP = 12          # 每檔每次最多補抓幾日（首次回補上限；之後每日約+1）
-MF_OVERRIDE_MIN_DAYS = 20     # 分點主力序列至少累積這麼多天才覆寫 build_site 的三大法人主力基準
+CHIP_MAX_STOCKS = 60          # 籌碼集中度最多處理幾檔
+MF_HISTORY_DAYS = 60          # 主力序列最多看回幾個交易日
+DISP_KEEP_DAYS = 400          # `disposition` 快取表保留天數（夠涵蓋「剛出關」與歷史核對）
+DISP_WINDOW_DAYS = 90         # 從快取表載入多久以內的處置期別（與原 FinMind 查詢窗一致）
 RELEASED_WINDOW_TD = 5
 WATCH_CUM6_MIN = 25.0
 K1_THRESHOLD = 32.0           # 注意股『漲幅型(第1款)』：近6日累積漲幅門檻 %（價格門檻）
 VOL_MULT_K = 5.0             # 注意股『量能型』：當日量 ≥ 近60日均量 × 5（量價門檻）
 
-DISP_COLS = {
-    "stock_id": ["stock_id", "StockID", "stock_code"],
-    "start":    ["start_date", "處置開始時間", "處置起日", "begin_date", "处置开始时间", "StartDate"],
-    "end":      ["end_date", "處置結束時間", "處置迄日", "stop_date", "处置结束时间", "EndDate"],
-    "announce": ["date", "Date", "公告日期"],
-    "measure":  ["處置措施", "處置內容", "disposal_measures", "措施", "处置措施", "Disposal"],
-}
-CHIP_COLS = {
-    "trader_id": ["securities_trader_id", "broker_id", "trader_id"],
-    "trader":    ["securities_trader", "broker", "trader_name"],
-    "buy":       ["buy", "buy_volume", "Buy"],
-    "sell":      ["sell", "sell_volume", "Sell"],
-    "date":      ["date", "Date"],
-}
-
 # ===== 小工具 =====
-def pick_col(df, cands):
-    if df is None or df.empty: return None
-    s = set(df.columns)
-    for c in cands:
-        if c in s: return c
-    return None
-
-def looks_like_date(x):
-    try: return bool(x) and len(str(x)) >= 8 and str(x)[4] in "-/"
-    except Exception: return False
-
-def detect_date_cols(df):
-    out = []
-    if df is None or df.empty: return out
-    for c in df.columns:
-        try: sample = df[c].dropna().astype(str).head(5).tolist()
-        except Exception: continue
-        if sample and all(looks_like_date(x) for x in sample): out.append(c)
-    return out
-
 def next_trading_day(today):
     try: d = datetime.date.fromisoformat(today)
     except Exception: d = datetime.date.today()
@@ -112,49 +80,47 @@ def _date_diff(a, b):
 def now_taipei():
     return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
 
-# ===== 處置名單 =====
-def _norm_date(x):
-    """處置起迄日正規化成 ISO 'YYYY-MM-DD'：先試 roc_any_to_iso（含民國/西元、各種分隔），
-    失敗再退回前 10 字並把 '/' 轉 '-'（避免 '2026/07/13' 與 today '2026-07-13' 字串比較失準）。
-    與官方源同一套正規化，確保 (sid,start,end) 去重鍵一致。"""
-    iso = roc_any_to_iso(x)
-    if iso:
-        return iso
-    s = str(x if x is not None else "").strip()[:10]
-    return s.replace("/", "-") if s else ""
+# ===== 處置名單：本地累積快取（取代 FinMind 的 90 天回溯查詢）=====
+def ensure_disp_table(con):
+    """處置期別快取表。官方公告端點只列現行/近期公告，把每天抓到的期別存起來，
+    才能撐起「剛出關」分頁與跨期別比對（原本這段歷史是向 FinMind 查 90 天）。"""
+    con.execute("CREATE TABLE IF NOT EXISTS disposition("
+                "sid TEXT, start TEXT, end TEXT, round TEXT, method TEXT,"
+                " name TEXT, mkt TEXT, seen TEXT, PRIMARY KEY(sid,start,end))")
+    con.commit()
 
-def parse_disposition(df, diag):
-    if df is None or df.empty:
-        diag["notes"].append("處置名單為空"); return []
-    diag["disp_cols"] = list(df.columns)
-    c_sid = pick_col(df, DISP_COLS["stock_id"]); c_start = pick_col(df, DISP_COLS["start"])
-    c_end = pick_col(df, DISP_COLS["end"]); c_ann = pick_col(df, DISP_COLS["announce"])
-    c_measure = pick_col(df, DISP_COLS["measure"])
-    if not c_start or not c_end:
-        dcols = [c for c in detect_date_cols(df) if c != c_ann]
-        if len(dcols) >= 2:
-            c_start = c_start or dcols[0]; c_end = c_end or dcols[1]
-            diag["notes"].append(f"起迄日以樣式偵測：start={c_start}, end={c_end}")
+def save_disposition(con, recs, today):
+    """把本次抓到的官方期別寫進快取表（同 (sid,start,end) 只補欄位、不覆寫成空值）。"""
+    ensure_disp_table(con)
+    n = 0
+    for r in recs:
+        if not (r.get("sid") and r.get("start") and r.get("end")):
+            continue
+        cur = con.execute("SELECT round,method,name,mkt FROM disposition"
+                          " WHERE sid=? AND start=? AND end=?",
+                          (r["sid"], r["start"], r["end"])).fetchone()
+        vals = [r.get("round") or "", r.get("method") or "", r.get("name") or "", r.get("mkt") or ""]
+        if cur:   # 已存在：只補上原本空著的欄位
+            vals = [new or (old or "") for new, old in zip(vals, cur)]
         else:
-            diag["notes"].append("找不到處置起迄日欄位（請看 disp_cols 補 DISP_COLS）")
-    if not c_sid:
-        diag["notes"].append("找不到 stock_id 欄位"); return []
-    recs = []
-    for _, row in df.iterrows():
-        sid = str(row.get(c_sid, "")).strip()
-        if not sid: continue
-        start = _norm_date(row.get(c_start)) if c_start else ""
-        end = _norm_date(row.get(c_end)) if c_end else ""
-        measure = str(row.get(c_measure, "")).strip() if c_measure else ""
-        method = "20分盤" if ("20" in measure or "二十" in measure) else ("5分盤" if ("5" in measure or "五" in measure) else "")
-        rnd = 2 if any(k in measure for k in ("第二次","二次","第2次")) else (1 if any(k in measure for k in ("第一次","一次","第1次")) else "")
-        recs.append({"sid": sid, "start": start, "end": end, "round": rnd, "method": method})
-    # ★保留『每一筆』處置期別（不再逐檔去重只留 end 最晚者）：同一檔可能同時有「進行中的第一次」
-    #   與「未來的第二次」，去重會讓進行中的那次消失、被誤歸「明日確定」→「處置中」漏股（例：華新科）。
-    #   去重與歸類改由 categorize 依現況(處置中>明日確定>剛出關)決定。
-    diag["disp_parsed_rows"] = len(recs)
-    diag["disp_parsed"] = len(set(r["sid"] for r in recs))
-    return recs
+            n += 1
+        con.execute("INSERT OR REPLACE INTO disposition"
+                    "(sid,start,end,round,method,name,mkt,seen) VALUES (?,?,?,?,?,?,?,?)",
+                    (r["sid"], r["start"], r["end"], vals[0], vals[1], vals[2], vals[3], today))
+    # 太舊的期別清掉，避免表無限長大
+    cutoff = (datetime.date.fromisoformat(today) - datetime.timedelta(days=DISP_KEEP_DAYS)).isoformat()
+    con.execute("DELETE FROM disposition WHERE end < ?", (cutoff,))
+    con.commit()
+    return n
+
+def load_disposition(con, today, window_days=DISP_WINDOW_DAYS):
+    """從快取表載入近 window_days 內仍相關的處置期別（含未來起始的『明日確定』）。"""
+    ensure_disp_table(con)
+    since = (datetime.date.fromisoformat(today) - datetime.timedelta(days=window_days)).isoformat()
+    rows = con.execute("SELECT sid,start,end,round,method,name,mkt FROM disposition"
+                       " WHERE end >= ?", (since,)).fetchall()
+    return [{"sid": s, "start": st, "end": en, "round": rd, "method": me, "name": nm, "mkt": mk}
+            for s, st, en, rd, me, nm, mk in rows]
 
 def categorize(disp_recs, today, universe, diag):
     """逐檔（依 sid 分組）取『最能代表現況』的處置期別，分成 ongoing/confirmed/released：
@@ -304,63 +270,22 @@ def vol_multiple(seq, n=60):
     avg = sum(base) / len(base)
     return round(vols[-1] / avg, 1) if avg > 0 else None
 
-# ===== 分點：CC 與每日主力買賣超 =====
-def cc_from_df(df):
-    """對 df(可跨多日多券商) 算 (主力買賣超張, 集中度%)。"""
-    if df is None or df.empty: return None, None
-    cb = pick_col(df, CHIP_COLS["buy"]); cs = pick_col(df, CHIP_COLS["sell"])
-    ct = pick_col(df, CHIP_COLS["trader_id"]) or pick_col(df, CHIP_COLS["trader"])
-    if not cb or not cs: return None, None
-    d = df.copy()
-    d[cb] = pd.to_numeric(d[cb], errors="coerce").fillna(0)
-    d[cs] = pd.to_numeric(d[cs], errors="coerce").fillna(0)
-    g = d.groupby(ct, as_index=False)[[cb, cs]].sum() if ct else d
-    g["net"] = g[cb] - g[cs]
-    tb = g[cb].sum()
-    if tb <= 0: return None, None
-    pos = g[g["net"] > 0].nlargest(15, "net")["net"].sum()
-    neg = g[g["net"] < 0].nsmallest(15, "net")["net"].sum()
-    mf = (pos + neg)/1000.0
-    cc = (pos - abs(neg))/tb*100.0
-    return round(mf, 0), round(cc, 1)
-
-def _date_col(df):
-    return pick_col(df, CHIP_COLS["date"]) or (detect_date_cols(df)[0] if (df is not None and not df.empty) else None)
-
-def daily_main_force(df, cd=None):
-    """回傳 {date: 主力買賣超張}。"""
-    if df is None or df.empty: return {}
-    cd = cd or _date_col(df)
-    if not cd: return {}
-    out = {}
-    for dt, sub in df.groupby(cd):
-        mf, _ = cc_from_df(sub)
-        if mf is not None: out[str(dt)[:10]] = mf
-    return out
-
-def cc_over_dates(df, date_set, cd=None):
-    cd = cd or _date_col(df)
-    if not cd: return None, None
-    sub = df[df[cd].astype(str).str[:10].isin(date_set)]
-    return cc_from_df(sub)
-
+# ===== 籌碼集中度（免費官方版）=====
+# 原本用 FinMind『券商分點日報 TaiwanStockTradingDailyReport』（Sponsor 專屬）算主力買賣超與
+# 集中度；官方端唯一的分點來源是證交所 BSR 網頁，需輸入驗證碼、無法自動化，市面上也沒有
+# 免費 API。改以同樣代表「大戶動向」且完全免費的『三大法人合計買賣超』為基準：
+#     主N ＝ Σ(近 N 日三大法人合計淨買張) ÷ Σ(近 N 日成交量張) × 100
+# 分母同為區間成交量，數值意義與原本的分點集中度一致（正=籌碼往大戶集中、負=大戶調節）。
 def trading_dates(con, n):
     ds = [r[0] for r in con.execute("SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (n,))]
     return sorted(ds)
 
-# 主力買賣超快取表（存進 twstock.db，跨次累積，避免每次重抓）
-def ensure_mf_table(con):
-    con.execute("CREATE TABLE IF NOT EXISTS mainforce(stock_id TEXT, date TEXT, mf REAL, PRIMARY KEY(stock_id,date))")
-    con.commit()
-
-def cached_mf_dates(con, sid):
-    return set(r[0] for r in con.execute("SELECT date FROM mainforce WHERE stock_id=?", (sid,)))
-
-def load_mf_series(con, sid, dates):
+def load_inst_mf_series(con, sid, dates):
+    """{date: 三大法人合計淨買張}（只取窗內日期；缺值不填 0，由呼叫端決定）。"""
     if not dates: return {}
     qm = ",".join("?" * len(dates))
-    rows = con.execute(f"SELECT date,mf FROM mainforce WHERE stock_id=? AND date IN ({qm}) AND mf IS NOT NULL",
-                       [sid] + list(dates)).fetchall()
+    rows = con.execute(f"SELECT date,total_lots FROM inst WHERE stock_id=? AND date IN ({qm}) "
+                       f"AND total_lots IS NOT NULL", [sid] + list(dates)).fetchall()
     return {d: m for d, m in rows}
 
 def window_cc(ser, voln, dates):
@@ -369,103 +294,10 @@ def window_cc(ser, voln, dates):
     den = sum(voln[d] for d in dates if d in ser and d in voln)
     return round(num / den * 100, 1) if den > 0 else None
 
-# 分點『每券商每日淨買張』快取，供主5/主10 以區間彙總後取前15大買/賣方計算
-def ensure_broker_table(con):
-    con.execute("CREATE TABLE IF NOT EXISTS broker_net("
-                "stock_id TEXT, date TEXT, trader TEXT, net REAL, PRIMARY KEY(stock_id,date,trader))")
-    con.commit()
-
-def broker_nets_from_df(df):
-    """回傳 {券商: 當日淨買張}（買-賣，股數→張）。"""
-    if df is None or df.empty:
-        return {}
-    cb = pick_col(df, CHIP_COLS["buy"]); cs = pick_col(df, CHIP_COLS["sell"])
-    ct = pick_col(df, CHIP_COLS["trader_id"]) or pick_col(df, CHIP_COLS["trader"])
-    if not cb or not cs or not ct:
-        return {}
-    d = df.copy()
-    d[cb] = pd.to_numeric(d[cb], errors="coerce").fillna(0)
-    d[cs] = pd.to_numeric(d[cs], errors="coerce").fillna(0)
-    g = d.groupby(ct, as_index=False)[[cb, cs]].sum()
-    out = {}
-    for _, row in g.iterrows():
-        net = (row[cb] - row[cs]) / 1000.0
-        if net:
-            out[str(row[ct])] = round(net, 2)
-    return out
-
-def store_broker_nets(con, sid, date, nets):
-    if nets:
-        con.executemany("INSERT OR REPLACE INTO broker_net VALUES (?,?,?,?)",
-                        [(sid, date, t, n) for t, n in nets.items()])
-
-def prune_broker_net(con, sid, keep_dates):
-    """只保留窗內日期，避免 broker_net 無限長大。"""
-    if not keep_dates:
-        return
-    con.execute("DELETE FROM broker_net WHERE stock_id=? AND date < ?", (sid, min(keep_dates)))
-
-def window_concentration(con, sid, dates, vol_lots):
-    """主N＝(前15大買方券商買超總和 − 前15大賣方券商賣超總和) ÷ 區間成交量(張) ×100。
-    先把區間內各券商『淨買張』跨日彙總，再取前15大正值(買方)與前15大負值(賣方)。"""
-    if not dates or not vol_lots or vol_lots <= 0:
-        return None
-    qm = ",".join("?" * len(dates))
-    rows = con.execute(f"SELECT trader, SUM(net) FROM broker_net WHERE stock_id=? AND date IN ({qm}) "
-                       f"GROUP BY trader", [sid] + list(dates)).fetchall()
-    vals = [n for _, n in rows if n is not None]
-    if not vals:
-        return None
-    pos15 = sum(sorted([n for n in vals if n > 0], reverse=True)[:15])   # 前15大買方買超總和
-    neg15 = sum(sorted([n for n in vals if n < 0])[:15])                 # 前15大賣方賣超總和(負)
-    return round((pos15 + neg15) / vol_lots * 100, 1)
-
-def patch_stock_mf(out_dir, sid, mf_series):
-    """用『分點』主力買賣超日序列覆寫 site/data/{sid}.json 的 mfs/mf。
-    build_site 已先用三大法人合計為每一檔填好主力副圖基準；此處只在分點資料
-    累積到 MF_OVERRIDE_MIN_DAYS 天以上時，才把處置相關個股升級成更精準的分點主力，
-    避免用幾乎空白的分點序列蓋掉較完整的三大法人基準。但若該檔尚無基準
-    （例如上櫃股 T86 尚未涵蓋），則有多少分點就先寫多少，總比沒有好。"""
-    p = os.path.join(out_dir, "data", f"{sid}.json")
-    if not os.path.exists(p) or not mf_series: return False
-    try:
-        with open(p, encoding="utf-8") as f: o = json.load(f)
-    except Exception: return False
-    d = o.get("d", [])
-    if not d: return False
-    base_span = (len(d) - o["mfs"]) if (o.get("mf") and o.get("mfs") is not None) else 0
-    if base_span > 0 and len(mf_series) < MF_OVERRIDE_MIN_DAYS:
-        return False   # 已有較完整的三大法人基準，分點還太少，先別覆寫
-    smin = min(mf_series.keys())
-    mfs = 0
-    while mfs < len(d) and d[mfs] < smin: mfs += 1
-    if mfs >= len(d): return False
-    o["mfs"] = mfs
-    o["mf"] = [round(mf_series.get(d[i], 0.0), 0) for i in range(mfs, len(d))]
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(o, f, ensure_ascii=False, separators=(",", ":"))
-    return True
-
-# ===== FinMind =====
-def finmind_get(dataset, token, max_retry=4, timeout=None, **params):
-    if requests is None: raise RuntimeError("requests 未安裝")
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    q = {"dataset": dataset, **params}; wait = 8
-    for _ in range(max_retry):
-        try:
-            resp = requests.get(FINMIND_URL, headers=headers, params=q, timeout=timeout or HTTP_TIMEOUT)
-        except Exception as e:
-            print(f"    [連線錯誤] {e}"); time.sleep(wait); wait = min(wait*2, 120); continue
-        if resp.status_code in (402, 429):
-            print(f"    [FinMind 流量上限] 等待 {wait}s"); time.sleep(wait); wait = min(wait*2, 120); continue
-        if resp.status_code != 200:
-            print(f"    [HTTP {resp.status_code}] {resp.text[:120]}"); return pd.DataFrame()
-        return pd.DataFrame(resp.json().get("data", []))
-    return pd.DataFrame()
-
 # ===== 官方即時處置公告（TWSE / TPEx）=====
-# 取代「等 FinMind 晚間(約21:00)批次」：官方 OpenAPI 在交易所公告後即到位，讓當日盤後(18:00)
-# 建置就可能抓到「今天公告、明日起處置」的個股（→ 明日確定）。FinMind 仍作 fallback／回補起迄。
+# 唯一的處置名單來源：官方 OpenAPI 在交易所公告後即到位，讓當日盤後(18:00)建置就能抓到
+# 「今天公告、明日起處置」的個股（→ 明日確定）。歷史期別由本地 `disposition` 表累積
+# （取代 FinMind Sponsor 資料表的 90 天回溯）。
 TWSE_PUNISH_URL = "https://openapi.twse.com.tw/v1/announcement/punish"          # 上市 處置有價證券
 TPEX_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"  # 上櫃 處置有價證券
 _OFFICIAL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -572,31 +404,31 @@ def fetch_official_disposition(diag):
             r.raise_for_status()
             out += _parse_official_records(r.json(), mkt, diag, tag)
         except Exception as e:
-            diag["notes"].append(f"{tag} 抓取失敗（改用 FinMind）：{e}")
+            diag["notes"].append(f"{tag} 抓取失敗（本次改用 DB 快取的期別）：{e}")
     return out
 
-def merge_disposition(finmind_recs, official_recs, diag):
-    """合併 FinMind（乾淨起迄為底）與官方即時源的『所有處置期別』：以 (sid,start,end) 為鍵去除
-    完全相同的期別（同一期兩來源都報），但『保留同一檔的不同期別』（第一次/第二次/延長），
+def merge_disposition(cached_recs, official_recs, diag):
+    """合併『DB 快取的舊期別』與『官方即時源』的所有處置期別：以 (sid,start,end) 為鍵去除
+    完全相同的期別（同一期兩邊都有），但『保留同一檔的不同期別』（第一次/第二次/延長），
     交由 categorize 依現況決定歸類（避免第二次蓋掉進行中的第一次而漏股）。缺 start/end 的官方筆跳過。"""
     def key(r):
         return (r["sid"], r.get("start", ""), r.get("end", ""))
     by = {}
-    for r in finmind_recs:
+    for r in cached_recs:
         by.setdefault(key(r), dict(r))
     added = 0
     for r in official_recs:
         if not (r.get("start") and r.get("end")):
-            continue                      # 官方此筆起迄無法辨識 → 跳過（不污染；FinMind 有的話仍在）
+            continue                      # 官方此筆起迄無法辨識 → 跳過（不污染；快取有的話仍在）
         k = key(r)
         if k not in by:
-            by[k] = dict(r); added += 1   # 官方獨有的期別（含 FinMind 尚未收錄的第二次/新公告）
+            by[k] = dict(r); added += 1   # 官方獨有的期別（含快取尚未收錄的第二次/新公告）
         else:
-            for f in ("method", "round", "name", "mkt"):   # 同一期別：補齊 FinMind 缺的欄位
+            for f in ("method", "round", "name", "mkt"):   # 同一期別：補齊快取缺的欄位
                 if not by[k].get(f) and r.get(f):
                     by[k][f] = r[f]
     recs = list(by.values())
-    diag["notes"].append(f"官方即時源合併：期別總數 {len(recs)}（官方新增 {added}；FinMind {len(finmind_recs)} 筆為底）")
+    diag["notes"].append(f"處置期別合併：總數 {len(recs)}（官方即時源新增 {added}；DB 快取 {len(cached_recs)} 筆為底）")
     return recs
 
 # ===== 通知：處置中個股達標即進通知 =====
@@ -718,23 +550,25 @@ def main():
     if not today: today = datetime.date.today().isoformat()
     next_td = next_trading_day(today)
 
-    # 處置名單：官方即時源(TWSE+TPEx punish)為主 + FinMind 為底(乾淨起迄、fallback)。
-    # 官方源讓「今天公告、明日起處置」的個股當日盤後就能抓到；FinMind 晚間批次僅作補漏。
-    finmind_recs = []
-    try:
-        # 窗 90 天：處置期最長約 12 個交易日，但『很早公告但仍處置中』或第二次處置需較寬窗才不漏；
-        # released 仍只顯示近 RELEASED_WINDOW_TD 個交易日，寬窗不影響出關清單。
-        ds = (datetime.date.fromisoformat(today) - datetime.timedelta(days=90)).isoformat()
-        df = finmind_get("TaiwanStockDispositionSecuritiesPeriod", FINMIND_TOKEN, start_date=ds)
-        diag["notes"].append(f"FinMind 處置名單 {0 if df is None else len(df)} 筆（起 {ds}）")
-        finmind_recs = parse_disposition(df, diag)
-    except Exception as e:
-        diag["notes"].append(f"FinMind 處置名單抓取失敗：{e}")
+    # 處置名單：官方即時源(TWSE punish + TPEx disposal)為唯一來源，並存進 DB 累積成歷史。
+    # 官方源讓「今天公告、明日起處置」的個股當日盤後就能抓到；歷史期別（供「剛出關」）
+    # 由 `disposition` 快取表提供，取代原本 FinMind Sponsor 資料表的 90 天回溯查詢。
     try:
         official_recs = fetch_official_disposition(diag)
     except Exception as e:
-        official_recs = []; diag["notes"].append(f"官方處置源整體失敗（改用 FinMind）：{e}")
-    disp_recs = merge_disposition(finmind_recs, official_recs, diag)
+        official_recs = []; diag["notes"].append(f"官方處置源整體失敗（本次只用 DB 快取）：{e}")
+    try:
+        n_new = save_disposition(con, official_recs, today)
+        diag["notes"].append(f"官方處置公告 {len(official_recs)} 筆 → 快取新增 {n_new} 個新期別")
+    except Exception as e:
+        diag["notes"].append(f"處置快取寫入失敗：{e}")
+    # 窗 90 天：處置期最長約 12 個交易日，但『很早公告但仍處置中』或第二次處置需較寬窗才不漏；
+    # released 仍只顯示近 RELEASED_WINDOW_TD 個交易日，寬窗不影響出關清單。
+    try:
+        cached_recs = load_disposition(con, today)
+    except Exception as e:
+        cached_recs = []; diag["notes"].append(f"處置快取讀取失敗：{e}")
+    disp_recs = merge_disposition(cached_recs, official_recs, diag)
     ongoing, confirmed, released = categorize(disp_recs, today, universe, diag)
     disp_sids = set(r["sid"] for r in disp_recs)
     # 診斷：各市場別分佈（上櫃為 0＝官方 TPEx 源可能失效）＋每檔最終歸類（供核對某檔為何漏/在哪類，如 2492 華新科）
@@ -760,7 +594,7 @@ def main():
         except Exception: pass
     if idx6: diag["notes"].append(f"大盤6日差幅 {idx6:.1f}%")
 
-    # 產業標籤（curated + FinMind 大分類快取）
+    # 產業標籤（curated + 官方公司基本資料大分類快取）
     ind_map = {}
     if tw_industry is not None:
         try: ind_map = tw_industry.label_map(con)
@@ -798,53 +632,30 @@ def main():
     for r in ongoing: r["st"] = r.get("d2r")
     for r in confirmed: r["st"] = None
 
-    # 分點：快取每券商每日淨買張(broker_net) 與每日主力淨買(mainforce)；只補抓近幾天(單日抓)。
-    # 主5/主10 改用 broker_net 在 5/10 日窗內彙總後取前15大買/賣方計算。
-    if not args.no_chips and FINMIND_TOKEN:
-        ensure_mf_table(con); ensure_broker_table(con)
+    # 主5／主10（籌碼集中度）：三大法人合計買賣超 ÷ 區間成交量 ×100。
+    # 原本用 FinMind 券商分點（Sponsor 專屬）；免費版取不到，官方也沒有可自動化的分點 API，
+    # 故改用同樣是「大戶動向」的三大法人買賣超（已由 screener 每日抓進 inst 表，上市/上櫃皆有）。
+    if not args.no_chips:
         targets = list(dict.fromkeys([r["sid"] for r in ongoing] + [r["sid"] for r in confirmed]
                                      + [r["sid"] for r in watch]))[:CHIP_MAX_STOCKS]
         mf_dates = trading_dates(con, MF_HISTORY_DAYS)
-        idx_for = {r["sid"]: r for lst in (ongoing,confirmed,watch) for r in lst}
-        fetched = 0; patched = 0; dbg_done = False
+        idx_for = {r["sid"]: r for lst in (ongoing, confirmed, watch) for r in lst}
+        filled = 0
         for sid in targets:
-            have = set(r[0] for r in con.execute(
-                "SELECT DISTINCT date FROM broker_net WHERE stock_id=?", (sid,)))
-            to_fetch = [d for d in mf_dates if d not in have][-MF_BACKFILL_CAP:]
-            for d in to_fetch:
-                try:
-                    df = finmind_get("TaiwanStockTradingDailyReport", FINMIND_TOKEN, timeout=CHIP_TIMEOUT,
-                                     data_id=sid, start_date=d, end_date=d)
-                except Exception:
-                    df = pd.DataFrame()
-                if not dbg_done:
-                    cols = list(df.columns) if (df is not None and not df.empty) else []
-                    diag["notes"].append(f"分點首檔 {sid} {d}: rows={0 if df is None else len(df)} cols={cols}")
-                    dbg_done = True
-                mf, _ = cc_from_df(df)
-                con.execute("INSERT OR REPLACE INTO mainforce VALUES (?,?,?)", (sid, d, mf))
-                store_broker_nets(con, sid, d, broker_nets_from_df(df))
-                fetched += 1
-                time.sleep(CHIP_SLEEP)
-            prune_broker_net(con, sid, mf_dates)
-            con.commit()
-            ser = load_mf_series(con, sid, mf_dates)
-            if patch_stock_mf(args.out, sid, ser): patched += 1
+            ser = load_inst_mf_series(con, sid, mf_dates)
+            if not ser:
+                continue
             seq = win.get(sid, [])
-            voln = {dd: (v/1000.0) for dd,_,_,_,v in seq if v}
+            voln = {dd: (v / 1000.0) for dd, _, _, _, v in seq if v}
             r = idx_for.get(sid)
-            if r is not None:
-                vol5 = sum(voln.get(d, 0) for d in mf_dates[-5:])
-                vol10 = sum(voln.get(d, 0) for d in mf_dates[-10:])
-                # 主5/主10：優先用 broker_net 區間彙總(前15大買-賣方)；broker_net 尚未累積到位時，
-                # 退回用 mainforce 每日主力淨買的量加權(window_cc)，避免顯示「—」。
-                z5 = window_concentration(con, sid, mf_dates[-5:], vol5)
-                z10 = window_concentration(con, sid, mf_dates[-10:], vol10)
-                if z5 is None: z5 = window_cc(ser, voln, mf_dates[-5:])
-                if z10 is None: z10 = window_cc(ser, voln, mf_dates[-10:])
-                r["z5"] = z5; r["z10"] = z10
-        diag["notes"].append(f"分點：本次抓 {fetched} 日，升級為分點主力 {patched}/{len(targets)} 檔"
-                             f"（未達 {MF_OVERRIDE_MIN_DAYS} 天者沿用三大法人主力基準；快取累積中）")
+            if r is None:
+                continue
+            r["z5"] = window_cc(ser, voln, mf_dates[-5:])
+            r["z10"] = window_cc(ser, voln, mf_dates[-10:])
+            if r["z5"] is not None or r["z10"] is not None:
+                filled += 1
+        diag["notes"].append(f"籌碼集中度（三大法人／成交量）：{filled}/{len(targets)} 檔有值"
+                             f"（法人資料通常較股價晚一個交易日）")
     con.close()
     write_outputs(args.out, build_payload(today, next_td, watch, confirmed, ongoing, diag))
 
@@ -1038,7 +849,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="note">
       <b>燈號</b>：<span class="dot red"></span>紅＝今日已觸發漲幅型（第1款）　<span class="dot amber"></span>黃＝接近門檻　<span class="dot green"></span>綠＝安全。<br>
-      點任何個股的<b style="color:var(--blue)">列</b>可跳到該股 K 線圖（K 線下方副圖可切換 MACD／主力買賣超）。清單為<b>緊湊表格</b>：可左右滑動看更多指標、點欄位標題排序。股名下方小字為<b>產業類型</b>。分點資料：FinMind Sponsor（T+1 盤後）。
+      點任何個股的<b style="color:var(--blue)">列</b>可跳到該股 K 線圖（K 線下方副圖可切換 MACD／主力買賣超）。清單為<b>緊湊表格</b>：可左右滑動看更多指標、點欄位標題排序。股名下方小字為<b>產業類型</b>。籌碼資料：證交所／櫃買三大法人買賣超（T+1 盤後）。
     </div>
     <div class="note" id="diagbox" style="display:none"></div>
   </div>
@@ -1093,7 +904,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
       <ul>
         <li><span class="k">位階：低 → 高 排序</span>：點「位階」欄由小到大排，<b>從低位階（−10 附近）開始找</b>低接標的。</li>
         <li><span class="k">月斜：只要正的</span>：月線斜率為正（&gt;1% 強勢）才看；<b>斜率為負的直接跳過</b>。</li>
-        <li><span class="k">主5／主10：要正的</span>：代表主力仍站在買方、沒在倒貨。</li>
+        <li><span class="k">主5／主10：要正的</span>：代表法人／大戶仍站在買方、沒在倒貨。</li>
       </ul>
 
       <h3>主力買盤強度（主5／主10 怎麼看）</h3>
@@ -1111,7 +922,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
       <h3>停損鐵則</h3>
       <div class="warn">
         ① <b>收盤跌破月線(MA20) 超過 3%</b>，或<b>連續 2 個交易日收盤站不回月線</b> → 出。<br>
-        ② <b>主5 或主10（CC）轉為負值</b>，或<b>前 15 大買超券商分點（主力買賣超）出現集體撤退、大舉倒貨</b> → 即使價格還沒跌破月線，也代表支撐虛弱，必須<b>提早甚至立即出清停損</b>。
+        ② <b>主5 或主10（集中度）轉為負值</b>，或<b>K 線下方「主力買賣超」副圖（三大法人合計）出現連續大幅賣超</b> → 即使價格還沒跌破月線，也代表支撐虛弱，必須<b>提早甚至立即出清停損</b>。
       </div>
 
       <h3>操作禁忌</h3>
@@ -1153,7 +964,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
-<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：台灣證交所／櫃買中心 OpenAPI（處置公告・即時）、<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:var(--blue); text-decoration:none">FinMind</a>（處置起迄回補／分點籌碼／價量・法人） ・ 僅供研究，非投資建議</footer>
+<footer style="text-align:center; color:var(--dim); font-size:11px; padding:16px 14px 30px; border-top:1px solid var(--border); line-height:1.6">資料來源：臺灣證券交易所／櫃買中心公開資料（處置公告・即時／價量／三大法人買賣超）、集保結算所 TDCC ・ 僅供研究，非投資建議</footer>
 
 <script>
 const BUILD_V = "__BUILDV__" || "0";
@@ -1335,7 +1146,7 @@ const EXPL = `
 <span class="k">月斜</span><span>月線(20MA)1日斜率%＝(MA20今−MA20昨)÷MA20昨×100。<b>&gt;1%＝強勢、&gt;3%＝妖股</b>。</span>
 <span class="k">累幅</span><span>處置中＝(今收−處置前一日收)÷處置前一日收×100；可能進入處置＝近6日累積漲幅%。</span>
 <span class="k">剩天</span><span>處置中＝距出關交易日數；可能進入處置＝最快可能進入處置的天數。</span>
-<span class="k">主5／主10</span><span>近5/10日集中度%＝(前15大買方券商買超總和 − 前15大賣方券商賣超總和)÷該區間成交量×100。正(紅)＝主力買超集中；負(綠)＝主力派發。</span>
+<span class="k">主5／主10</span><span>近5/10日籌碼集中度%＝該區間<b>三大法人合計淨買超(張)</b>÷同區間成交量(張)×100。正(紅)＝法人買超集中；負(綠)＝法人派發。（券商分點無免費官方 API，改以三大法人買賣超衡量大戶動向。）</span>
 <span class="k">價格門檻</span><span>注意股漲幅型(第1款)：近6日累積漲幅 ≥ <b>32%</b>。值達標轉紅。</span>
 <span class="k">量價門檻</span><span>注意股量能型：當日量 ≥ 近60日均量 × <b>5倍</b>。值達標轉紅。</span>
 </div>
