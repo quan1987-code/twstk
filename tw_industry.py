@@ -7,11 +7,12 @@ r"""
 兩層來源：
   1) CURATED：手工維護的『產業鏈上中下游＋子類』對照表（如「電子上游-被動元件」），
      最貼近看盤習慣，但僅涵蓋主要個股。
-  2) FinMind TaiwanStockInfo 的『大分類 industry_category』（如「半導體業」「電子零組件業」），
+  2) 證交所／櫃買『公司基本資料 t187ap03』的產業別（如「半導體業」「電子零組件業」），
      作為其餘個股的補底；抓一次快取進 twstock.db 的 industry 表，之後免重抓。
+     （原本用 FinMind TaiwanStockInfo，改為免費官方端點，見 tw_free_sources.py。）
 
 對外：
-  fetch_finmind_industry(con, token)  # 在有 token 的步驟(screener)呼叫，補底快取
+  fetch_official_industry(con, sess)  # 在 screener 步驟呼叫，補底快取
   label_map(con)                      # 回傳 {sid: 產業標籤}（curated 優先），給 build_site / disposition
 """
 import sqlite3
@@ -21,9 +22,12 @@ try:
 except Exception:
     requests = None
 
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+try:
+    import tw_free_sources as fs
+except Exception:                       # pragma: no cover
+    fs = None
 
-# ===== 手工『產業鏈上中下游＋子類』對照表（主要個股；其餘以 FinMind 大分類補底） =====
+# ===== 手工『產業鏈上中下游＋子類』對照表（主要個股；其餘以官方大分類補底） =====
 CURATED = {
     # ---- 電子上游：晶圓代工 / 磊晶 ----
     "2330": "電子上游-晶圓代工", "2303": "電子上游-晶圓代工", "5347": "電子上游-晶圓代工",
@@ -118,45 +122,39 @@ _TYPE_MKT = {"twse": "上市", "tpex": "上櫃", "上市": "上市", "上櫃": "
              "TWSE": "上市", "TPEX": "上櫃"}
 
 
-def fetch_finmind_industry(con, token, force=False, min_have=200):
-    """抓 FinMind TaiwanStockInfo（每次跑一次 1 call）：
-    1) industry_category 寫進 industry 表(產業大分類補底)。
-    2) stock_name/market 補進 stock 表 —— 解決部分清單『只有代號、沒有股名』。
+def fetch_official_industry(con, sess=None):
+    """抓證交所／櫃買『公司基本資料 t187ap03』（各 1 call，免費免 token）：
+    1) 產業別寫進 industry 表(產業大分類補底)。
+    2) 公司簡稱/市場別補進 stock 表 —— 解決部分清單『只有代號、沒有股名』。
+    取代原本的 FinMind TaiwanStockInfo（Sponsor 降為免費版後不再穩定可用）。
     回傳本次處理的個股數。"""
     ensure_table(con)
     con.execute("CREATE TABLE IF NOT EXISTS stock(stock_id TEXT PRIMARY KEY, name TEXT, market TEXT)")
-    if requests is None or not token:
+    if fs is None or requests is None:
         return 0
     try:
-        r = requests.get(FINMIND_URL, headers={"Authorization": f"Bearer {token}"},
-                         params={"dataset": "TaiwanStockInfo"}, timeout=60)
-        if r.status_code != 200:
-            return 0
-        data = r.json().get("data", [])
+        meta = fs.fetch_company_meta(sess or fs.make_session())
     except Exception:
         return 0
-    seen = {}
-    for it in data:
-        sid = str(it.get("stock_id", "")).strip()
-        if len(sid) == 4 and sid.isdigit() and sid not in seen:
-            seen[sid] = (str(it.get("industry_category", "")).strip(),
-                         str(it.get("stock_name", "")).strip(),
-                         str(it.get("type", "")).strip())
-    for sid, (cat, nm, typ) in seen.items():
-        con.execute("INSERT INTO industry(stock_id,category) VALUES(?,?) "
-                    "ON CONFLICT(stock_id) DO UPDATE SET category=excluded.category", (sid, cat))
+    seen = {sid: rec for sid, rec in meta.items() if len(sid) == 4 and sid.isdigit()}
+    for sid, rec in seen.items():
+        cat = rec.get("industry") or ""
+        if cat:
+            con.execute("INSERT INTO industry(stock_id,category) VALUES(?,?) "
+                        "ON CONFLICT(stock_id) DO UPDATE SET category=excluded.category", (sid, cat))
+        nm = rec.get("name") or ""
         if nm:   # 補股名（不覆寫既有市場別，只在缺漏時補）
             con.execute("INSERT INTO stock(stock_id,name) VALUES(?,?) "
                         "ON CONFLICT(stock_id) DO UPDATE SET name=excluded.name", (sid, nm))
-            m = _TYPE_MKT.get(typ)
-            if m:
-                con.execute("UPDATE stock SET market=? WHERE stock_id=? AND (market IS NULL OR market='')",
-                            (m, sid))
+        m = _TYPE_MKT.get(rec.get("market") or "")
+        if m:
+            con.execute("UPDATE stock SET market=? WHERE stock_id=? AND (market IS NULL OR market='')",
+                        (m, sid))
     con.commit()
     return len(seen)
 
 
-# FinMind 偶有英文值，做個輕量正規化（對不到就原樣顯示）
+# 官方端點偶有英文值，做個輕量正規化（對不到就原樣顯示）
 _CAT_FIX = {
     "Semiconductor": "半導體業", "Other Electronic": "電子零組件業",
     "Optoelectronic": "光電業", "Communications Technology": "通信網路業",
@@ -170,7 +168,7 @@ def _norm_cat(cat):
 
 
 def label_map(con):
-    """回傳 {sid: 產業標籤}。curated 優先，否則用 FinMind 大分類快取。無資料者不列。"""
+    """回傳 {sid: 產業標籤}。curated 優先，否則用官方大分類快取。無資料者不列。"""
     cat = {}
     try:
         for sid, c in con.execute("SELECT stock_id, category FROM industry"):

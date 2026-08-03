@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-台股「月均量爆量起漲」每日選股程式  v2（免費官方資料版）
+台股「月均量爆量起漲」每日選股程式  v2（全免費官方資料版）
 ================================================================
-與 v1 的差異：資料來源改為「免費、官方」，不再需要 FinMind 付費。
-  ● 每日當日全市場資料 = 證交所 + 櫃買官方 OpenAPI（免費、免 token、各 1 次請求）
+本程式所有資料一律取自「免費、官方、免 token」的端點，不需要 FinMind（含免費版）。
+替代來源集中在 `tw_free_sources.py`，本檔只負責組裝與寫入 twstock.db。
+
+  ● 當日全市場價量 = 證交所 + 櫃買官方 OpenAPI（各 1 次請求）
         上市：https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
         上櫃：https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes
         （兩者都只提供「最新一天」，自帶民國日期，數字乾淨無逗號）
-  ● 歷史回補（只做一次）= FinMind 免費版「逐檔」查詢
-        官方 OpenAPI 不提供歷史，故首次用 FinMind 免費的逐檔 API 補齊每檔歷史。
-        逐檔查詢不是付費鎖的「一次全市場」功能，免費帳號可用，只是有每小時上限。
+  ● 近端補洞／歷史回補 = 證交所 MI_INDEX、櫃買上櫃行情（全市場單日，可查任一交易日）
+        新上市個股的深度回補另用 STOCK_DAY／櫃買個股月線（逐檔單月，一次一整個月）。
+  ● 三大法人買賣超 = 證交所 T86（上市）＋ 櫃買三大法人日報（上櫃），皆為「全市場單日」，
+        一天 2 個請求即涵蓋全市場，上市/上櫃都能每日更新，深度歷史也用同一路徑回補。
+  ● 400 張大戶持股% / 發行股數 = 集保結算所 TDCC 開放資料（全市場、週更新）。
+  ● 產業別／股名／市場別 = 證交所、櫃買公司基本資料 t187ap03（退回 ISIN 服務）。
 
 選股邏輯（與 v1 相同，已驗證）：
   硬性條件：① 爆量(今日量≥N倍月均量20日) ② 站上月線 ③ 價漲量增(收紅)
@@ -17,14 +22,12 @@
   加分排序：爆量強度、量能持續、突破季高、月線翻揚、站上季線、季線翻揚、多頭排列、站上年線
 
 使用方式：
-  1) pip install requests pandas numpy openpyxl     （不需要 finmind 套件）
-  2) 到 https://finmindtrade.com 免費註冊取得 token（僅供「一次性歷史回補」用）
-  3) 設環境變數 FINMIND_TOKEN，或填到下方 CONFIG
-  4) 首次執行：自動抓當日 + 用 FinMind 逐檔回補歷史
+  1) pip install requests pandas numpy openpyxl     （不需要 finmind 套件、不需要任何 token）
+  2) 首次執行：自動抓當日 + 用官方端點逐檔回補歷史
         python tw_volume_breakout_screener_v2.py
-     首次回補約 1500~1600 檔普通股，受 FinMind 每小時 600 次限制，
-     約需 2.5~3.5 小時，可掛著跑；中斷後重跑會自動接續（已補的會跳過）。
-  5) 之後每天執行：只用官方 OpenAPI 抓當日（2 次請求、數秒完成）+ 選股。
+     首次回補受證交所流量限制（約 3 次/5 秒），會分批進行；中斷後重跑會自動接續。
+     想一次補多一點可調高環境變數 PRICE_BACKFILL_PER_RUN。
+  3) 之後每天執行：官方 OpenAPI 抓當日 + 選股（數秒完成）。
 
 免責：僅供技術研究與教育用途，不構成投資建議。
 """
@@ -42,6 +45,8 @@ import urllib3
 import numpy as np
 import pandas as pd
 
+import tw_free_sources as fs   # 免費官方來源（取代 FinMind 各資料表）
+
 # 新版 Python(3.13+)的 OpenSSL 對憑證檢查很嚴格，部分政府網站(如櫃買 tpex.org.tw)
 # 的憑證缺少 Subject Key Identifier 欄位而被拒。對「公開、唯讀」的政府開放資料端點
 # 關閉憑證驗證是安全且常見的作法，這裡先關閉相關警告訊息。
@@ -51,15 +56,19 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #  CONFIG
 # ============================================================
 CONFIG = {
-    "FINMIND_TOKEN": os.environ.get("FINMIND_TOKEN", ""),  # 僅供首次歷史回補
     "DB_PATH": "twstock.db",
     "OUTPUT_DIR": "output",
     "BACKFILL_DAYS": 400,        # （備用）回補日曆天數
     "BACKFILL_START": "2005-01-01",  # 個股歷史深度回補起始日（補到 2005 年初）
     "BACKFILL_MIN_ROWS": 60,     # 個股 DB 內少於此天數就觸發回補（普通是首次）
-    "FINMIND_SLEEP": 6.0,        # 回補時每檔間隔(秒)，配合 600 次/hr 上限（6 秒=600/hr）
     "FRESH_DAYS": 7,             # 選股時：個股最新一筆超過幾天前就視為停牌/已下市，排除
     "HTTP_TIMEOUT": 30,
+    # 逐檔歷史回補（官方端點，受證交所約 3 次/5 秒限流）：每次 run 的個股數與月數上限。
+    # 平時排程用小值逐步補；想一次補完可用 daily.yml 的 deep_backfill 拉高。
+    "PRICE_BACKFILL_PER_RUN": int(os.environ.get("PRICE_BACKFILL_PER_RUN", "8") or "8"),
+    "PRICE_BACKFILL_MAX_MONTHS": int(os.environ.get("PRICE_BACKFILL_MAX_MONTHS", "36") or "36"),
+    # 近端補洞：確認最近 N 個交易日的全市場價量都在 DB 內（官方 OpenAPI 只給最新一天）
+    "RECENT_FILL_DAYS": int(os.environ.get("RECENT_FILL_DAYS", "5") or "5"),
 }
 
 PARAMS = {
@@ -76,7 +85,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 
 # ============================================================
@@ -120,7 +128,7 @@ def _session():
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept": "application/json"})
     # 政府開放資料端點憑證在新版 OpenSSL 下會驗證失敗(缺 Subject Key Identifier)，
-    # 這些是公開唯讀資料，關閉憑證驗證以確保可連線。(不影響 FinMind 連線，那條仍驗證)
+    # 這些是公開唯讀資料，關閉憑證驗證以確保可連線。
     s.verify = False
     return s
 
@@ -196,88 +204,58 @@ def get_today_snapshot(sess, retries=3):
     raise last
 
 
-def _finmind_oneday(token, d):
-    """FinMind TaiwanStockPrice 單日(start=end=d)取全市場，回傳 normalized df 或 None。
-    單日查詢比『不帶 data_id 抓區間』可靠（後者常被截斷成舊資料）。"""
-    try:
-        df = finmind_get("TaiwanStockPrice", token, start_date=d, end_date=d)
-    except Exception as e:
-        print(f"    FinMind {d} 失敗：{e}")
-        return None
-    if df is None or df.empty:
-        return None
-    df = df.rename(columns={"max": "high", "min": "low",
-                            "Trading_Volume": "volume", "Trading_money": "amount"})
-    need = ["stock_id", "date", "open", "high", "low", "close", "volume", "amount"]
-    for c in need:
-        if c not in df.columns:
-            df[c] = None
-    df = df[df["stock_id"].astype(str).map(is_common_stock)].copy()
-    for c in ("open", "high", "low", "close", "volume", "amount"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["date", "close"])
-    df = df[df["close"] > 0]
-    return df[need] if not df.empty else None
-
-
-def fetch_finmind_prices_recent(token, want_days=4, scan=12):
-    """個股日線『以 FinMind 為主』：逐交易日抓最近 want_days 個交易日的全市場日線。
-    從今天往回掃最多 scan 個日曆日(跳週末/休市)，蒐集到足夠交易日即停。
-    回傳合併後的 normalized df；全失敗回 None（呼叫端沿用官方 OpenAPI 快照）。"""
-    if not token:
-        return None
-    frames = []
-    got = 0
+def fill_recent_days(con, sess, want_days=None):
+    """近端補洞：官方 OpenAPI 只提供「最新一天」，若程式某天沒跑（假日排程、Actions 失敗），
+    中間的交易日就會缺。改用證交所 MI_INDEX／櫃買上櫃行情（可查任一交易日的全市場）把
+    最近 want_days 個交易日補齊。原本這件事是靠 FinMind 逐日全市場查詢，免費版已不可行。
+    回傳補進的資料列數。"""
+    want_days = want_days or CONFIG["RECENT_FILL_DAYS"]
+    have = set(r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT 40"))
+    total = 0
     d = dt.date.today()
-    for _ in range(scan):
-        if got >= want_days:
+    checked = 0
+    for _ in range(want_days * 3):               # 往回掃，跳過週末/休市
+        if checked >= want_days:
             break
-        if d.weekday() < 5:                       # 跳週末（國定假日靠『回空就跳過』處理）
-            one = _finmind_oneday(token, d.isoformat())
-            if one is not None and not one.empty:
-                frames.append(one)
-                got += 1
+        if d.weekday() < 5:
+            iso = d.isoformat()
+            checked += 1
+            if iso not in have:
+                try:
+                    rows = fs.fetch_market_day(sess, iso)
+                except Exception as e:
+                    print(f"  近端補洞 {iso} 失敗：{e}")
+                    rows = []
+                rows = [r for r in rows if is_common_stock(r["stock_id"])]
+                if rows:
+                    con.executemany(
+                        "INSERT OR REPLACE INTO price VALUES (?,?,?,?,?,?,?,?)",
+                        [(r["stock_id"], r["date"], r["open"], r["high"], r["low"],
+                          r["close"], r["volume"], r["amount"]) for r in rows])
+                    con.executemany(
+                        "INSERT OR IGNORE INTO stock(stock_id,name,market) VALUES (?,?,?)",
+                        [(r["stock_id"], r["name"], r["market"]) for r in rows if r["name"]])
+                    con.commit()
+                    total += len(rows)
+                    print(f"  近端補洞 {iso}：{len(rows)} 檔")
         d -= dt.timedelta(days=1)
-    if not frames:
-        return None
-    return pd.concat(frames, ignore_index=True)
+    if total:
+        print(f"近端補洞完成：補進 {total} 列（官方全市場單日行情）。")
+    else:
+        print("近端補洞：最近交易日皆已在 DB，無需補抓。")
+    return total
 
 
 # ============================================================
-#  歷史回補：FinMind 免費「逐檔」（只做一次）
+#  歷史回補：官方逐檔單月（證交所 STOCK_DAY / 櫃買個股月線）
 # ============================================================
-def finmind_get(dataset, token, max_retry=5, **params):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    q = {"dataset": dataset, **params}
-    wait = 30
-    for _ in range(max_retry):
-        try:
-            resp = requests.get(FINMIND_URL, headers=headers, params=q,
-                                timeout=CONFIG["HTTP_TIMEOUT"])
-        except requests.RequestException as e:
-            print(f"    [連線錯誤] {e}，{wait}s 後重試…"); time.sleep(wait); wait = min(wait*2, 600); continue
-        if resp.status_code in (402, 429):   # 流量上限
-            print(f"    [FinMind 流量上限] 等待 {wait}s（可中斷，稍後重跑會接續）…")
-            time.sleep(wait); wait = min(wait*2, 600); continue
-        if resp.status_code != 200:
-            print(f"    [HTTP {resp.status_code}] {resp.text[:100]}"); time.sleep(wait); wait = min(wait*2, 600); continue
-        return pd.DataFrame(resp.json().get("data", []))
-    raise RuntimeError(f"FinMind 請求失敗：{dataset} {params}")
-
-
-def backfill_one(token, stock_id, start, end):
-    """用 FinMind 抓單檔歷史，回傳 normalized rows（list of tuples）。"""
-    df = finmind_get("TaiwanStockPrice", token, data_id=stock_id,
-                     start_date=start, end_date=end)
-    if df.empty:
-        return []
-    out = []
-    for _, r in df.iterrows():
-        out.append((stock_id, r["date"],
-                    to_float(r.get("open")), to_float(r.get("max")),
-                    to_float(r.get("min")), to_float(r.get("close")),
-                    to_float(r.get("Trading_Volume")), to_float(r.get("Trading_money"))))
-    return out
+def backfill_one(sess, stock_id, market, start, end, max_months=0, stats=None):
+    """用官方端點抓單檔歷史，回傳 normalized rows（list of tuples）。"""
+    rows = fs.fetch_stock_history(sess, stock_id, market, start, end,
+                                  max_months=max_months, stats=stats)
+    return [(r["stock_id"], r["date"], r["open"], r["high"], r["low"],
+             r["close"], r["volume"], r["amount"]) for r in rows]
 
 
 # ============================================================
@@ -313,39 +291,64 @@ def row_counts(con):
     return dict(con.execute("SELECT stock_id, COUNT(*) FROM price GROUP BY stock_id").fetchall())
 
 
-def run_backfill(con, token, universe, args):
-    """對尚未『深度回補到起始日』的個股做一次性回補（補到 2005）。
-    用 deep_done 表記錄已回補的個股，避免每天重抓；新上市股之後也只會補一次。"""
+def run_backfill(con, sess, universe, args):
+    """對尚未『深度回補到起始日』的個股做一次性回補（補到 BACKFILL_START）。
+    來源＝證交所 STOCK_DAY／櫃買個股月線（免費官方，一次一整個月），取代原本的 FinMind 逐檔。
+    官方端點有流量限制（約 3 次/5 秒），故每次 run 只補 PRICE_BACKFILL_PER_RUN 檔、
+    每檔最多 PRICE_BACKFILL_MAX_MONTHS 個月；deep_done 記錄已補到哪個月，跨次接續。
+    絕大多數個股在 DB 快取中早已補齊，平時只有『新上市股』會走到這裡。"""
     con.execute("CREATE TABLE IF NOT EXISTS deep_done(stock_id TEXT PRIMARY KEY)")
+    con.execute("CREATE TABLE IF NOT EXISTS deep_progress(stock_id TEXT PRIMARY KEY, earliest TEXT)")
     con.commit()
     end = dt.date.today().isoformat()
     start = CONFIG.get("BACKFILL_START") or (dt.date.today() - dt.timedelta(days=CONFIG["BACKFILL_DAYS"])).isoformat()
     done = set(r[0] for r in con.execute("SELECT stock_id FROM deep_done"))
-    todo = sorted(s for s in universe if s not in done)
+    todo = sorted(s for s in universe if s not in done and is_common_stock(s))
     if not todo:
         print(f"個股歷史已深度回補（至 {start}），略過回補。"); return
-    if not token:
-        print("【警告】未設定 FINMIND_TOKEN，無法回補歷史。請先設定 token 後重跑。"); return
 
-    cap = args.max_backfill if args.max_backfill else len(todo)
+    mkt = {r[0]: (r[1] or "") for r in con.execute("SELECT stock_id, market FROM stock")}
+    prog = {r[0]: r[1] for r in con.execute("SELECT stock_id, earliest FROM deep_progress")}
+    cap = args.max_backfill or CONFIG["PRICE_BACKFILL_PER_RUN"]
+    todo_total = len(todo)
     todo = todo[:cap]
-    eta_min = len(todo) * CONFIG["FINMIND_SLEEP"] / 60
-    print(f"需深度回補 {len(todo)} 檔歷史（{start} ~ {end}），預估約 {eta_min:.0f} 分鐘"
-          f"（約 {eta_min/60:.1f} 小時）。\n首次很久、但只做一次；中斷後重跑會自動接續…")
+    months_cap = CONFIG["PRICE_BACKFILL_MAX_MONTHS"]
+    print(f"個股歷史深度回補（官方端點）：待補 {todo_total} 檔，本次 {len(todo)} 檔"
+          f"（目標 {start}，每檔每次最多 {months_cap} 個月；其餘後續 run 逐步補齊）…")
     for i, sid in enumerate(todo, 1):
+        # 已補到的最舊月份 → 這次從它的前一個月往回接續（首次從今天往回）
+        cur_end = prog.get(sid) or end
+        if cur_end <= start:
+            con.execute("INSERT OR IGNORE INTO deep_done VALUES (?)", (sid,)); con.commit(); continue
+        stats = {}
         try:
-            rows = backfill_one(token, sid, start, end)
-        except RuntimeError as e:
-            print(f"  [{i}/{len(todo)}] {sid} 失敗：{e}（稍後重跑接續）"); break
+            rows = backfill_one(sess, sid, mkt.get(sid, ""), start, cur_end,
+                                max_months=months_cap, stats=stats)
+        except Exception as e:
+            print(f"  [{i}/{len(todo)}] {sid} 失敗：{e}（稍後重跑接續）")
+            continue
         if rows:
             con.executemany("INSERT OR REPLACE INTO price VALUES (?,?,?,?,?,?,?,?)", rows)
-        con.execute("INSERT OR IGNORE INTO deep_done VALUES (?)", (sid,))   # 標記此檔已回補
+        got_earliest = min((r[1] for r in rows), default=None)
+        # 這一輪往回掃了 months_cap 個月：把游標推到那個區間的起點，下一輪從那裡再往回
+        cur_dt = dt.date.fromisoformat(cur_end[:10])
+        step_y, step_m = cur_dt.year, cur_dt.month
+        for _ in range(months_cap):
+            step_y, step_m = (step_y - 1, 12) if step_m == 1 else (step_y, step_m - 1)
+        new_cursor = max(start, f"{step_y:04d}-{step_m:02d}-28")
+        if got_earliest:
+            new_cursor = min(new_cursor, got_earliest)
+        con.execute("INSERT OR REPLACE INTO deep_progress VALUES (?,?)", (sid, new_cursor))
+        # 完成條件：補到目標起始日／這一輪整段無資料／已掃到連續數月無資料（＝上市前）
+        finished = (new_cursor <= start) or (not rows) or stats.get("early_stop")
+        if finished:
+            con.execute("INSERT OR IGNORE INTO deep_done VALUES (?)", (sid,))
         con.commit()
-        if i % 25 == 0 or i == len(todo):
-            print(f"  回補進度 [{i}/{len(todo)}]  最新：{sid} 寫入 {len(rows)} 筆")
-        time.sleep(CONFIG["FINMIND_SLEEP"])
-    left = len(set(s for s in universe if s not in set(r[0] for r in con.execute('SELECT stock_id FROM deep_done'))))
-    print(f"本輪回補結束。尚餘 {left} 檔待回補（下次執行續抓）。" if left else "本輪回補結束。全部個股已深度回補完成。")
+        print(f"  回補進度 [{i}/{len(todo)}]  {sid}({mkt.get(sid,'?')}) 寫入 {len(rows)} 筆，"
+              + ("已補齊（掃到上市前）" if finished else f"游標 → {new_cursor}"))
+    left = todo_total - len(set(r[0] for r in con.execute("SELECT stock_id FROM deep_done")) & set(todo))
+    print(f"本輪回補結束。尚餘約 {max(left, 0)} 檔待回補（下次執行續抓）。"
+          if left > 0 else "本輪回補結束。全部個股已深度回補完成。")
 
 
 def load_history(con, universe):
@@ -467,9 +470,9 @@ def output(sel, newest):
 
 
 # ============================================================
-#  投信買賣超（籌碼）：上市 = 證交所 T86（全市場，每日一次）
+#  三大法人買賣超（籌碼）：上市 = 證交所 T86、上櫃 = 櫃買三大法人日報
+#  兩者都是「全市場單日」端點，一天 2 個請求涵蓋全市場，近端更新與深度回補共用同一路徑。
 # ============================================================
-T86_URL = "https://www.twse.com.tw/fund/T86"
 # ⑦ 法人動向：三大法人金額(BFI82U) / 融資融券(MI_MARGN) / 外資台指期(TAIFEX OpenAPI)
 BFI82U_URL = "https://www.twse.com.tw/fund/BFI82U"
 MI_MARGN_URL = "https://www.twse.com.tw/exchangeReport/MI_MARGN"
@@ -477,84 +480,22 @@ TAIFEX_FUT_URL = ("https://openapi.taifex.com.tw/v1/"
                   "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate")
 TAIFEX_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 TRUST_LOOKBACK = 30      # 連買候選觀察窗（最近約一個月）
-INST_LOOKBACK = 250      # 每日 T86 前向更新的交易日數（近端；更深的歷史另由 FinMind 回補，見下）
+INST_LOOKBACK = 250      # 每日前向更新的交易日數（近端；更深的歷史另由 backfill_inst_history 補）
 TRUST_BASE_THR = 50      # 候選基準門檻(張)，網頁端可往上切換到 100/200/500/1000
 TRUST_MIN_STREAK = 3     # 連續買超天數門檻
 
 # 個股K線副圖「深度歷史」目標起始日。以「快取 DB＋每次 run 上限」分批補齊，不影響每日主流程；
 # 上限可用環境變數調高做一次性長跑（見 daily.yml 的 deep_backfill）。
-# 主力(三大法人)＝逐檔抓(data_id)避免全市場單次列數上限截斷漏股，涵蓋上市＋上櫃；400大戶＝全市場週抓。
+# 主力(三大法人)＝T86(上市)＋櫃買日報(上櫃)『全市場單日』逐日補；400大戶＝TDCC 全市場週抓。
 HISTORY_START = os.environ.get("HISTORY_START", "2019-01-01") or "2019-01-01"           # 400張大戶回補起點
 INST_HISTORY_START = os.environ.get("INST_HISTORY_START", "2020-01-01") or "2020-01-01"  # 主力(三大法人)回補起點
-INST_HIST_DATASET = "TaiwanStockInstitutionalInvestorsBuySell"  # 三大法人個股表（含 2005 以來）
-INST_BACKFILL_PER_RUN = int(os.environ.get("INST_BACKFILL_PER_RUN", "150") or "150")  # 每次 run 逐檔回補的『個股數』上限
+# 每次 run 逐日回補的『交易日數』上限（1 日 = 上市+上櫃各 1 個請求，涵蓋全市場所有個股）
+INST_BACKFILL_PER_RUN = int(os.environ.get("INST_BACKFILL_PER_RUN", "150") or "150")
 SHAREHOLD_MAX_PER_RUN = int(os.environ.get("SHAREHOLD_MAX_PER_RUN", "12") or "12")     # 每次 run 回補週數上限
-# 上櫃(OTC)主力近端更新：證交所 T86 只含上市，上櫃改用 FinMind 逐檔補近端，讓上櫃個股主力每天更新。
-OTC_INST_LOOKBACK = int(os.environ.get("OTC_INST_LOOKBACK", "60") or "60")            # 從未有主力資料之上櫃股，近端先補的交易日窗（深史仍由 backfill 補）
-OTC_INST_MAX_PER_RUN = int(os.environ.get("OTC_INST_MAX_PER_RUN", "2000") or "2000")  # 每次 run 逐檔補的上櫃股數上限（保護 API 額度/時間）
 
 
-def _t86_indices(fields):
-    def find(*cands):
-        for c in cands:
-            if c in fields:
-                return fields.index(c)
-        for i, f in enumerate(fields):
-            if any(c in f for c in cands):
-                return i
-        return None
-    return {
-        "code": find("證券代號"),
-        "fmain": find("外陸資買賣超股數(不含外資自營商)", "外資及陸資買賣超股數(不含外資自營商)"),
-        "fdeal": find("外資自營商買賣超股數"),
-        "trust": find("投信買賣超股數"),
-        "dealer": find("自營商買賣超股數"),
-        "total": find("三大法人買賣超股數"),
-    }
-
-
-def fetch_twse_t86(sess, ymd):
-    """抓某日(YYYYMMDD)上市三大法人買賣超，回傳
-    [(stock_id, date_iso, 外資張, 投信張, 自營張, 三大法人合計張), ...]。缺欄位以 None 表示。"""
-    url = f"{T86_URL}?response=json&date={ymd}&selectType=ALL"
-    r = sess.get(url, timeout=CONFIG["HTTP_TIMEOUT"])
-    r.raise_for_status()
-    j = r.json()
-    if "tables" in j and j["tables"]:
-        tbl = j["tables"][0]
-        fields, data = tbl.get("fields", []), tbl.get("data", [])
-    else:
-        fields, data = j.get("fields", []), j.get("data", [])
-    if not fields or not data:
-        return []
-    idx = _t86_indices(fields)
-    if idx["code"] is None or idx["trust"] is None:
-        return []
-    iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
-
-    def lots(row, i):
-        if i is None or i >= len(row):
-            return None
-        v = to_float(row[i])
-        return None if v != v else round(v / 1000.0, 1)   # 股數 → 張
-
-    out = []
-    for row in data:
-        code = str(row[idx["code"]]).strip()
-        if not is_common_stock(code):
-            continue
-        fm, fd = lots(row, idx["fmain"]), lots(row, idx["fdeal"])
-        foreign = None if (fm is None and fd is None) else round((fm or 0) + (fd or 0), 1)
-        trust = lots(row, idx["trust"])
-        dealer = lots(row, idx["dealer"])
-        total = lots(row, idx["total"])
-        out.append((code, iso, foreign, trust, dealer, total))
-    return out
-
-
-def update_inst(con, sess):
-    """把最近 INST_LOOKBACK 個交易日的『三大法人(外資/投信/自營/合計)買賣超』補進 inst 表。
-    舊版只有 trust_lots，本版新增 foreign/dealer/total 三欄；缺這些欄位(total IS NULL)的日期會重抓一次。"""
+def _ensure_inst_tables(con):
+    """inst（三大法人買賣超）與 inst_day（該交易日該市場是否已抓過）。"""
     con.execute("CREATE TABLE IF NOT EXISTS inst("
                 "stock_id TEXT, date TEXT, trust_lots REAL, PRIMARY KEY(stock_id,date))")
     for col in ("foreign_lots", "dealer_lots", "total_lots"):
@@ -562,362 +503,230 @@ def update_inst(con, sess):
             con.execute(f"ALTER TABLE inst ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass   # 欄位已存在
+    con.execute("CREATE TABLE IF NOT EXISTS inst_day("
+                "date TEXT, market TEXT, PRIMARY KEY(date, market))")
+    con.execute("CREATE TABLE IF NOT EXISTS inst_day_miss("
+                "date TEXT, market TEXT, tries INTEGER, PRIMARY KEY(date, market))")
     con.commit()
+    _seed_inst_day(con)
+
+
+def _seed_inst_day(con):
+    """一次性：用 DB 內既有的 inst 資料回填 inst_day 完成標記。
+    舊版（FinMind 逐檔）沒有這張表，若不回填，改版後第一次跑會把 2020 年以來每個交易日
+    全部重抓一次。判定方式：該(日,市場)已有 inst 資料的個股數 ≥ 當日該市場有股價的個股數一半，
+    才視為已抓齊（上櫃過去覆蓋率參差，未達標者仍會被重抓補滿）。"""
+    if con.execute("SELECT 1 FROM inst_day WHERE date='__seeded__'").fetchone():
+        return
+    try:
+        rows = con.execute("""
+            SELECT p.date, s.market,
+                   COUNT(DISTINCT i.stock_id) AS have,
+                   COUNT(DISTINCT p.stock_id) AS tot
+              FROM price p
+              JOIN stock s ON s.stock_id = p.stock_id
+              LEFT JOIN inst i ON i.stock_id = p.stock_id AND i.date = p.date
+                              AND i.total_lots IS NOT NULL
+             WHERE s.market IN ('上市','上櫃')
+             GROUP BY p.date, s.market""").fetchall()
+    except sqlite3.Error:
+        rows = []
+    seeded = [(d, m) for d, m, have, tot in rows if tot and have >= tot * 0.5]
+    if seeded:
+        con.executemany("INSERT OR IGNORE INTO inst_day VALUES (?,?)", seeded)
+    con.execute("INSERT OR IGNORE INTO inst_day VALUES ('__seeded__','-')")
+    con.commit()
+    if seeded:
+        print(f"三大法人：以既有 DB 資料回填完成標記 {len(seeded)} 筆(日×市場)，避免重抓。")
+
+
+INST_MISS_GIVEUP = 3        # 舊日期連抓幾次都無資料就放棄（避免每天重試永遠拿不到的日子）
+INST_MISS_FRESH_DAYS = 30   # 近 N 天的日期不套用放棄規則（交易所可能只是還沒公布）
+
+
+def _fetch_inst_into_db(con, sess, dates, label):
+    """把指定交易日的三大法人買賣超（上市 T86 + 上櫃櫃買日報）寫進 inst 表。
+    以 inst_day 記錄「該日該市場已抓過」，跨次 run 不重抓；回傳實際寫入的交易日數。
+    抓不到的舊日期（例如交易所該市場當年尚無此報表）累計 INST_MISS_GIVEUP 次後放棄，
+    但近 INST_MISS_FRESH_DAYS 天內的日期永遠會重試（可能只是還沒公布）。"""
+    done = set(con.execute("SELECT date, market FROM inst_day"))
+    miss = {(d, m): t for d, m, t in con.execute("SELECT date, market, tries FROM inst_day_miss")}
+    fresh_after = (dt.date.today() - dt.timedelta(days=INST_MISS_FRESH_DAYS)).isoformat()
+    n = 0
+    for d in dates:
+        need = [m for m in ("上市", "上櫃")
+                if (d, m) not in done
+                and (d >= fresh_after or miss.get((d, m), 0) < INST_MISS_GIVEUP)]
+        if not need:
+            continue
+        rows, ok = [], set()
+        try:
+            if "上市" in need:
+                r1 = fs.fetch_twse_inst_day(sess, d)
+                if r1:
+                    rows += r1
+                    ok.add("上市")
+                time.sleep(fs.TWSE_SLEEP)
+            if "上櫃" in need:
+                r2 = fs.fetch_tpex_inst_day(sess, d)
+                if r2:
+                    rows += r2
+                    ok.add("上櫃")
+                time.sleep(fs.TPEX_SLEEP)
+        except Exception as e:
+            print(f"  {label} {d} 失敗：{e}")
+            continue
+        rows = [r for r in rows if is_common_stock(r[0])]
+        if rows:
+            con.executemany(
+                "INSERT OR REPLACE INTO inst"
+                "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
+                " VALUES (?,?,?,?,?,?)", rows)
+            n += 1
+        # 只把「確實成功取得」的市場標記完成；沒抓到的累計失敗次數，達上限就不再重試
+        if ok:
+            con.executemany("INSERT OR IGNORE INTO inst_day VALUES (?,?)", [(d, m) for m in ok])
+        for m in need:
+            if m not in ok:
+                con.execute("INSERT INTO inst_day_miss(date,market,tries) VALUES (?,?,1) "
+                            "ON CONFLICT(date,market) DO UPDATE SET tries=tries+1", (d, m))
+        con.commit()
+    return n
+
+
+def _inst_pending_dates(con, dates):
+    """挑出還需要抓三大法人的交易日（任一市場未完成、且未被判定為永久無資料）。"""
+    done = set(con.execute("SELECT date, market FROM inst_day"))
+    miss = {(d, m): t for d, m, t in con.execute("SELECT date, market, tries FROM inst_day_miss")}
+    fresh_after = (dt.date.today() - dt.timedelta(days=INST_MISS_FRESH_DAYS)).isoformat()
+    out = []
+    for d in dates:
+        for m in ("上市", "上櫃"):
+            if (d, m) in done:
+                continue
+            if d < fresh_after and miss.get((d, m), 0) >= INST_MISS_GIVEUP:
+                continue
+            out.append(d)
+            break
+    return out
+
+
+def update_inst(con, sess):
+    """把最近 INST_LOOKBACK 個交易日的『三大法人(外資/投信/自營/合計)買賣超』補進 inst 表。
+    上市＝證交所 T86、上櫃＝櫃買三大法人日報，兩者都是全市場單日端點，
+    所以上市/上櫃個股的主力副圖都能每日更新（原本上櫃要靠 FinMind 逐檔，免費版已不可行）。"""
+    _ensure_inst_tables(con)
     dates = [r[0] for r in con.execute(
         "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (INST_LOOKBACK,))]
-    have = set(r[0] for r in con.execute(
-        "SELECT DISTINCT date FROM inst WHERE total_lots IS NOT NULL"))
-    todo = [d for d in dates if d not in have]
+    todo = sorted(_inst_pending_dates(con, dates))
     if not todo:
         print("三大法人買賣超：已是最新。")
         return
-    print(f"更新三大法人買賣超：需抓 {len(todo)} 個交易日（首次含補三大法人欄位）…")
-    n = 0
-    for d in sorted(todo):
-        try:
-            rows = fetch_twse_t86(sess, d.replace("-", ""))
-        except Exception as e:
-            print(f"  T86 {d} 失敗：{e}")
-            continue
-        if rows:
-            con.executemany(
-                "INSERT OR REPLACE INTO inst"
-                "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
-                " VALUES (?,?,?,?,?,?)", rows)
-            con.commit()
-            n += 1
-        time.sleep(1.2)
+    print(f"更新三大法人買賣超：需抓 {len(todo)} 個交易日（上市 T86 ＋ 上櫃櫃買日報）…")
+    n = _fetch_inst_into_db(con, sess, todo, "三大法人")
     print(f"三大法人買賣超更新完成：新增/補齊 {n} 個交易日。")
 
 
-_INST_CAT_CACHE = {}
-
-
-def _inst_cat(name):
-    """FinMind 三大法人類別 name → 'foreign'/'trust'/'dealer'/None。
-    相容英文 token（Foreign_Investor / Foreign_Dealer_Self / Investment_Trust / Dealer*）
-    與中文（外資 / 外陸資 / 外資自營商 / 投信 / 自營商…）。
-    順序：外資優先，讓『外資自營商』歸入 foreign（與 T86 的 foreign 含外資自營商一致）。"""
-    if name in _INST_CAT_CACHE:
-        return _INST_CAT_CACHE[name]
-    s = str(name)
-    low = s.lower()
-    if "foreign" in low or "外" in s:        # 外資 + 外資自營商
-        cat = "foreign"
-    elif "trust" in low or "投信" in s:
-        cat = "trust"
-    elif "dealer" in low or "自營" in s:      # 自營商（自行 + 避險）
-        cat = "dealer"
-    else:
-        cat = None
-    _INST_CAT_CACHE[name] = cat
-    return cat
-
-
-def _inst_rows_from_finmind(sid, df):
-    """把 FinMind『TaiwanStockInstitutionalInvestorsBuySell』單檔 DataFrame 轉成 inst 表 rows：
-    [(stock_id, date, 外資張, 投信張, 自營張, 三大法人合計張), ...]。
-    全零日留白（不寫；網頁端前向填 0，省空間）。回補與上櫃近端更新共用，確保解析一致。"""
-    if df is None or df.empty or not {"date", "name", "buy", "sell"} <= set(df.columns):
-        return []
-    df = df.copy()
-    df["_net"] = (pd.to_numeric(df["buy"], errors="coerce").fillna(0)
-                  - pd.to_numeric(df["sell"], errors="coerce").fillna(0))
-    df["_cat"] = df["name"].map(_inst_cat)
-    rows = []
-    for d, g in df.groupby("date"):
-        fnet = float(g.loc[g["_cat"] == "foreign", "_net"].sum())
-        tnet = float(g.loc[g["_cat"] == "trust", "_net"].sum())
-        dnet = float(g.loc[g["_cat"] == "dealer", "_net"].sum())
-        if fnet == 0 and tnet == 0 and dnet == 0:
-            continue   # 全零：留白，網頁端前向填 0
-        tot = fnet + tnet + dnet
-        rows.append((sid, str(d), round(fnet / 1000.0, 1), round(tnet / 1000.0, 1),
-                     round(dnet / 1000.0, 1), round(tot / 1000.0, 1)))
-    return rows
-
-
-def _next_day_iso(iso):
-    """ISO 日字串 → 隔一日曆日 ISO（FinMind start_date 為含界、以日曆日計，週末自然無資料）。"""
-    return (dt.date.fromisoformat(iso) + dt.timedelta(days=1)).isoformat()
-
-
-def backfill_inst_history(con, token):
-    """把『三大法人(外資/投信/自營/合計)買賣超』逐檔回補到 INST_HISTORY_START，涵蓋上市＋上櫃。
-    ★改為『逐檔』抓取(data_id=sid)：先前用全市場單日抓取會被 FinMind 單次回傳列數上限截斷，
-    導致很多個股（尤其非權值、及全部上櫃）只剩近端 T86 的資料、歷史整段缺。逐檔抓可保證每檔完整。
-    用 inst_done 表記錄已處理個股避免重抓；只挑『歷史不足或從未抓過』者，每次 run 上限
-    INST_BACKFILL_PER_RUN 檔（deep_backfill 時調高一次補完）。近端上市仍由 update_inst(T86) 每日更新。"""
-    if not token:
-        print("主力歷史回補：無 FinMind token，略過。")
-        return
-    con.execute("CREATE TABLE IF NOT EXISTS inst("
-                "stock_id TEXT, date TEXT, trust_lots REAL, PRIMARY KEY(stock_id,date))")
-    for col in ("foreign_lots", "dealer_lots", "total_lots"):
-        try:
-            con.execute(f"ALTER TABLE inst ADD COLUMN {col} REAL")
-        except sqlite3.OperationalError:
-            pass
-    con.execute("CREATE TABLE IF NOT EXISTS inst_done(stock_id TEXT PRIMARY KEY, done_date TEXT)")
-    con.commit()
-    latest = con.execute("SELECT MAX(date) FROM price").fetchone()[0]
-    if not latest:
-        return
-    # 已足夠(min(total_lots 日期) 早於 cutoff)或已處理過(inst_done)的個股跳過，避免重抓。
-    cutoff = (dt.date.fromisoformat(INST_HISTORY_START) + dt.timedelta(days=45)).isoformat()
-    mind = {r[0]: r[1] for r in con.execute(
-        "SELECT stock_id, MIN(date) FROM inst WHERE total_lots IS NOT NULL GROUP BY stock_id")}
-    done = set(r[0] for r in con.execute("SELECT stock_id FROM inst_done"))
-    universe = sorted(r[0] for r in con.execute("SELECT DISTINCT stock_id FROM price"))
-    todo = [s for s in universe
-            if is_common_stock(s) and s not in done and (s not in mind or mind[s] > cutoff)]
+def backfill_inst_history(con, sess):
+    """把『三大法人買賣超』回補到 INST_HISTORY_START，涵蓋上市＋上櫃。
+    改為『逐交易日、全市場』抓取（上市 T86 + 上櫃櫃買日報）：一天 2 個請求就涵蓋所有個股，
+    比原本 FinMind 逐檔（1 檔 1 請求、約 1700 檔）快兩個數量級，也完全不需要付費方案。
+    以 inst_day 記錄已完成的(日期,市場)，每次 run 最多補 INST_BACKFILL_PER_RUN 個交易日。"""
+    _ensure_inst_tables(con)
+    dates = [r[0] for r in con.execute(
+        "SELECT DISTINCT date FROM price WHERE date >= ? ORDER BY date DESC",
+        (INST_HISTORY_START,))]
+    todo = _inst_pending_dates(con, dates)
     if not todo:
-        print(f"主力歷史逐檔回補：所有個股已補齊至 {INST_HISTORY_START}。")
+        print(f"主力歷史回補：已補齊至 {INST_HISTORY_START}。")
         return
     todo_total = len(todo)
-    todo = todo[:INST_BACKFILL_PER_RUN]
-    print(f"主力歷史逐檔回補(上市+上櫃)：待補 {todo_total} 檔，本次 {len(todo)} 檔"
+    todo = sorted(todo[:INST_BACKFILL_PER_RUN])   # 由新往舊挑，再依日期順序抓
+    print(f"主力歷史逐日回補(上市+上櫃全市場)：待補 {todo_total} 個交易日，本次 {len(todo)} 日"
           f"（目標 {INST_HISTORY_START}；其餘後續 run 逐步補齊）…")
-    n = 0
-    for sid in todo:
-        try:
-            df = finmind_get(INST_HIST_DATASET, token, max_retry=2,
-                             data_id=sid, start_date=INST_HISTORY_START, end_date=latest)
-        except Exception as e:
-            print(f"  三大法人 {sid} 失敗：{e}")
-            continue   # 未標記 done → 下次 run 再試
-        rows = _inst_rows_from_finmind(sid, df)
-        if rows:
-            con.executemany(
-                "INSERT OR REPLACE INTO inst"
-                "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
-                " VALUES (?,?,?,?,?,?)", rows)
-        # 不論抓到與否都標記 done（即使該股 FinMind 無資料，也不必每次重試）
-        con.execute("INSERT OR REPLACE INTO inst_done(stock_id,done_date) VALUES (?,?)", (sid, latest))
-        con.commit()
-        n += 1
-        time.sleep(0.6)
-    print(f"主力歷史逐檔回補完成：本次 {n} 檔（其餘後續 run 逐步補齊，目標 {INST_HISTORY_START}）。")
+    n = _fetch_inst_into_db(con, sess, todo, "主力歷史")
+    print(f"主力歷史逐日回補完成：本次 {n} 個交易日（尚餘約 {max(todo_total - len(todo), 0)} 日）。")
 
 
-def update_inst_otc(con, token):
-    """上櫃(OTC)股的三大法人買賣超『近端每日更新』。
-    證交所 T86（update_inst）只含上市，上櫃個股的近端主力先前只靠一次性 backfill_inst_history
-    回補、之後就凍結，導致上櫃個股K線下圖『主力買賣超』近幾天長期空白。本函式改用 FinMind
-    逐檔（data_id）補上櫃股，避免全市場單日抓被 FinMind 單次列數上限截斷。
-    以 inst_otc_done(through_date) 記錄每檔已補到哪天：每檔只從『現有最新主力日之次日』補到最新
-    股價日，故隔天只需抓新增的 1~數日；全零尾巴日也因標記推進而不會反覆重抓。深史仍由 backfill 負責。"""
-    if not token:
-        print("上櫃主力近端更新：無 FinMind token，略過。")
-        return
-    con.execute("CREATE TABLE IF NOT EXISTS inst_otc_done("
-                "stock_id TEXT PRIMARY KEY, through_date TEXT)")
-    con.commit()
-    latest = con.execute("SELECT MAX(date) FROM price").fetchone()[0]
-    if not latest:
-        return
-    # 從未有主力資料之上櫃股，近端起補的下限日（深史交給 backfill；避免此處抓過長區間）
-    floor_rows = con.execute(
-        "SELECT DISTINCT date FROM price ORDER BY date DESC LIMIT ?", (OTC_INST_LOOKBACK,)).fetchall()
-    floor = floor_rows[-1][0] if floor_rows else latest
-    otc = [r[0] for r in con.execute(
-        "SELECT DISTINCT p.stock_id FROM price p JOIN stock s ON s.stock_id=p.stock_id "
-        "WHERE s.market='上櫃'")]
-    otc = [s for s in otc if is_common_stock(s)]
-    if not otc:
-        print("上櫃主力近端更新：DB 內無上櫃普通股（可能市場別未標記），略過。")
-        return
-    # 每檔現有最新主力日、與上次已補到的日期
-    maxd = {r[0]: r[1] for r in con.execute(
-        "SELECT stock_id, MAX(date) FROM inst WHERE total_lots IS NOT NULL GROUP BY stock_id")}
-    through = {r[0]: r[1] for r in con.execute("SELECT stock_id,through_date FROM inst_otc_done")}
+def update_shareholding_and_issued(con, sess):
+    """集保股權分散 → ①『400張以上大戶持股比率(%)』週資料（個股K線副圖）
+                      ②『發行張數』（表頭發行/流通張數）。
 
-    def start_of(sid):
-        base = through.get(sid) or maxd.get(sid)   # 上次補到 / 現有最新主力日
-        return _next_day_iso(base) if base else floor  # 從未有資料：只補近端窗
-
-    todo = [s for s in otc if start_of(s) <= latest]
-    if not todo:
-        print("上櫃主力近端更新：已是最新。")
-        return
-    todo_total = len(todo)
-    # 最落後者優先（未補過 / through_date 最舊）：萬一設了上限，先補最該補的
-    todo.sort(key=lambda s: through.get(s) or "")
-    todo = todo[:OTC_INST_MAX_PER_RUN]
-    print(f"上櫃主力近端更新：{todo_total} 檔需補，本次 {len(todo)} 檔（FinMind 逐檔補至 {latest}）…")
-    n = 0
-    for sid in todo:
-        start = start_of(sid)
-        try:
-            df = finmind_get(INST_HIST_DATASET, token, max_retry=3,
-                             data_id=sid, start_date=start, end_date=latest)
-        except Exception as e:
-            print(f"  上櫃主力 {sid} 失敗：{e}")
-            continue   # 未推進 through → 下次 run 再試
-        rows = _inst_rows_from_finmind(sid, df)
-        if rows:
-            con.executemany(
-                "INSERT OR REPLACE INTO inst"
-                "(stock_id,date,foreign_lots,trust_lots,dealer_lots,total_lots)"
-                " VALUES (?,?,?,?,?,?)", rows)
-            n += 1
-        # 不論當區間是否全零都推進 through（避免全零尾巴反覆重抓）
-        con.execute("INSERT OR REPLACE INTO inst_otc_done(stock_id,through_date) VALUES (?,?)",
-                    (sid, latest))
-        con.commit()
-        time.sleep(0.6)
-    print(f"上櫃主力近端更新完成：本次 {n} 檔有新增/補齊（共處理 {len(todo)} 檔）。")
-
-
-def _is_big400_level(level):
-    """集保股權分散級距是否屬『400張(=400,000股)以上大戶』（下界 ≥ 400,001 股）。
-    相容兩種級距標記：範圍字串(如 '400,001-600,000'、'more than 1,000,001'、'1,000,001以上')
-    與純數字級距索引(1~15，其中 12~15 為 ≥400,001 股的四個大戶級距)。"""
-    s = str(level).strip()
-    if re.fullmatch(r"\d{1,2}", s):          # 純級距索引
-        return int(s) in (12, 13, 14, 15)
-    low = s.lower()
-    if "total" in low or "合計" in s or "差異" in s:
-        return False
-    m = re.search(r"([\d,]+)", s)
-    if not m:
-        return False
-    try:
-        return int(m.group(1).replace(",", "")) >= 400001
-    except ValueError:
-        return False
-
-
-def update_shareholding(con, token):
-    """集保股權分散：計算『400張以上大戶持股比率(%)』週資料，供個股K線副圖。
-    FinMind TaiwanStockHoldingSharesPer 依日期回傳全市場；回補到 HISTORY_START，
-    以『最近週優先、每次 run 上限 SHAREHOLD_MAX_PER_RUN 週』分批補齊（DB 有快取，不重抓）。
-    包在 try/except 內呼叫，失敗不影響主流程；資料週更新，多數日子只需 1 次探測即『已是最新』。"""
+    來源改為集保結算所 TDCC 開放資料（https://opendata.tdcc.com.tw/getOD.aspx?id=1-5）：
+    免費、免 token、一個請求就拿到全市場最新一週的完整級距表，取代原本 Sponsor 才有的
+    FinMind `TaiwanStockHoldingSharesPer`。
+      ● 400張大戶% = 持股分級 12~15（400,001 股以上）的「佔集保庫存比例%」加總。
+      ● 發行張數  = 合計級距的股數（集保總股數），與 400張大戶% 同源同分母，
+                    流通張數 = 發行 ×(1−400張大戶%) 於網頁端計算最一致。
+    TDCC 只提供最新一週，歷史週次無免費全市場端點；DB 既有的歷史仍保留，
+    之後每週自動累積一筆，時間拉長即恢復完整曲線。
+    失敗不影響主流程（呼叫端包 try/except）。"""
     con.execute("CREATE TABLE IF NOT EXISTS shareholding("
                 "stock_id TEXT, date TEXT, big400_pct REAL, PRIMARY KEY(stock_id,date))")
+    con.execute("CREATE TABLE IF NOT EXISTS stockmeta("
+                "stock_id TEXT PRIMARY KEY, issued_lots REAL, updated TEXT)")
     con.commit()
-    if not token:
-        print("集保大戶：無 FinMind token，略過。")
+
+    snap = fs.fetch_tdcc_shareholding(sess)
+    if not snap:
+        print("集保大戶／發行張數：TDCC 無資料或抓取失敗，沿用 DB 既有資料。")
         return
-    # 用 2330 探測「可用週日期清單」（1 call）；回補目標一路到 HISTORY_START
-    try:
-        probe = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3,
-                            data_id="2330", start_date=HISTORY_START)
-    except Exception as e:
-        print(f"集保大戶：探測失敗，略過（{e}）。")
-        return
-    if probe is None or probe.empty or "date" not in probe.columns:
-        print("集保大戶：探測無資料，略過。")
-        return
-    all_dates = sorted(str(x) for x in probe["date"].unique())
-    want = [d for d in all_dates if d >= HISTORY_START]
     have = set(r[0] for r in con.execute("SELECT DISTINCT date FROM shareholding"))
-    todo = [d for d in want if d not in have]
-    if not todo:
-        print("集保大戶：已是最新。")
-        return
-    todo_total = len(todo)
-    todo = todo[-SHAREHOLD_MAX_PER_RUN:]   # 最近週優先；其餘留待後續每日 run 補回（避免單次長跑）
-    if todo_total > len(todo):
-        print(f"集保大戶：待補 {todo_total} 週，本次先抓最近 {len(todo)} 週（其餘後續 run 逐步補齊）…")
-    else:
-        print(f"集保大戶：需抓 {len(todo)} 週（每週全市場一次）…")
-    n = 0
-    logged_levels = False
-    for d in todo:
-        try:
-            # 注意：本 dataset 需要 start_date（用 date= 會被 FinMind 回 400「start_date missing」）；
-            # 以 start_date=end_date=d 取「該週全市場」快照。max_retry=2 讓失敗週約 30s 內放棄、下次補。
-            df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2,
-                             start_date=d, end_date=d)
-        except Exception as e:
-            print(f"  集保 {d} 失敗：{e}")
-            continue
-        if df is None or df.empty or "HoldingSharesLevel" not in df.columns or "percent" not in df.columns:
-            continue
-        if not logged_levels:   # 首批印出實際級距標記，方便日後於 CI log 核對大戶判定
-            print(f"  集保級距樣本：{sorted(df['HoldingSharesLevel'].astype(str).unique())}")
-            logged_levels = True
-        big = df[df["HoldingSharesLevel"].map(_is_big400_level)].copy()
-        big["_sid"] = big["stock_id"].astype(str)
-        big["_pct"] = pd.to_numeric(big["percent"], errors="coerce")
-        rows = []
-        for sid, g in big.groupby("_sid"):
-            if len(sid) != 4 or not sid.isdigit():
-                continue
-            pct = round(float(g["_pct"].sum()), 2)
-            if pct == pct and pct > 0:   # 排除 NaN / 0
-                rows.append((sid, d, pct))
+    weeks = sorted(snap)
+    new_weeks = [d for d in weeks if d not in have][-SHAREHOLD_MAX_PER_RUN:]
+    n_big = 0
+    for d in new_weeks:
+        rows = [(sid, d, rec["big400"]) for sid, rec in snap[d].items()
+                if is_common_stock(sid) and rec.get("big400")]
         if rows:
             con.executemany(
                 "INSERT OR REPLACE INTO shareholding(stock_id,date,big400_pct) VALUES (?,?,?)", rows)
             con.commit()
-            n += 1
-        time.sleep(1.0)
-    if want:   # 只保留 HISTORY_START 之後（更舊的清掉）
-        con.execute("DELETE FROM shareholding WHERE date < ?", (HISTORY_START,))
-        con.commit()
-    print(f"集保大戶更新完成：新增/補齊 {n} 週（目標 {HISTORY_START}）。")
-
-
-def update_issued_shares(con, token):
-    """發行張數（表頭『發行 / 流通張數』）。
-    來源＝『集保股權分散 TaiwanStockHoldingSharesPer』各級距股數：取 'total'(合計) 列的 unit，
-    無 total 列則加總各級距(排除 total/差異)＝集保總股數 ≈ 發行股數。與 400張大戶% 同源同分母，
-    流通張數計算最一致；此 dataset 全市場抓取已驗證可用（400大戶即由它產生）。
-    只取最新一週、每檔一次。★刻意在深度回補『之前』呼叫，確保 FinMind 額度尚足（回補會大量用量、
-    易把後面的請求擠到限流而失敗）。1~2 次請求、失敗不影響主流程；發行數近乎不變，存 DB 快取後長期有效。
-    流通張數 = 發行 ×(1−400張大戶%) 於網頁端計算。"""
-    con.execute("CREATE TABLE IF NOT EXISTS stockmeta("
-                "stock_id TEXT PRIMARY KEY, issued_lots REAL, updated TEXT)")
+            n_big += 1
+            print(f"  集保 {d}：{len(rows)} 檔 400 張大戶%")
+    con.execute("DELETE FROM shareholding WHERE date < ?", (HISTORY_START,))
     con.commit()
-    if not token:
-        print("發行張數：無 FinMind token，略過。")
-        return
-    # 探測最新可用週（用 2330，1 call）
-    try:
-        probe = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=3,
-                            data_id="2330", start_date=HISTORY_START)
-    except Exception as e:
-        print(f"發行張數：探測失敗，略過（{e}）。")
-        return
-    if probe is None or probe.empty or "date" not in probe.columns:
-        print("發行張數：探測無資料，略過。")
-        return
-    d = sorted(str(x) for x in probe["date"].unique())[-1]
-    # 全市場最新一週（1 call）
-    try:
-        df = finmind_get("TaiwanStockHoldingSharesPer", token, max_retry=2,
-                         start_date=d, end_date=d)
-    except Exception as e:
-        print(f"發行張數：抓取失敗，略過（{e}）。")
-        return
-    if (df is None or df.empty or "unit" not in df.columns
-            or "stock_id" not in df.columns or "HoldingSharesLevel" not in df.columns):
-        print("發行張數：無資料或缺欄位，略過。")
-        return
-    df = df.copy()
-    df["_sid"] = df["stock_id"].astype(str)
-    df["_lvl"] = df["HoldingSharesLevel"].astype(str)
-    df["_unit"] = pd.to_numeric(df["unit"], errors="coerce").fillna(0)
-    rows = []
-    for sid, g in df.groupby("_sid"):
-        if len(sid) != 4 or not sid.isdigit():   # 普通股 + 00xx ETF；排除權證等
-            continue
-        low = g["_lvl"].str.lower()
-        is_total = low.str.contains("total") | g["_lvl"].str.contains("合計")
-        if is_total.any():
-            shares = float(g.loc[is_total, "_unit"].max())
-        else:   # 無 total 列：加總各級距（排除 total/合計/差異）
-            keep = ~(is_total | g["_lvl"].str.contains("差異"))
-            shares = float(g.loc[keep, "_unit"].sum())
-        if shares > 0:
-            rows.append((sid, round(shares / 1000.0), d))
+    if not new_weeks:
+        print(f"集保大戶：已是最新（最新週 {weeks[-1]}）。")
+    else:
+        print(f"集保大戶更新完成：新增 {n_big} 週（最新週 {weeks[-1]}）。")
+
+    # 發行張數：取最新一週的集保合計股數；缺漏者退回公司基本資料的已發行股數
+    latest = weeks[-1]
+    rows = [(sid, round(rec["total_shares"] / 1000.0), latest)
+            for sid, rec in snap[latest].items()
+            if len(sid) == 4 and sid.isdigit() and rec.get("total_shares")]
     if rows:
         con.executemany(
             "INSERT OR REPLACE INTO stockmeta(stock_id,issued_lots,updated) VALUES (?,?,?)", rows)
         con.commit()
-    print(f"發行張數更新完成：{len(rows)} 檔（集保總股數，週 {d}）。")
+    print(f"發行張數更新完成：{len(rows)} 檔（TDCC 集保總股數，週 {latest}）。")
+    _fill_issued_from_company_meta(con, sess, latest)
+
+
+def _fill_issued_from_company_meta(con, sess, tag):
+    """TDCC 沒涵蓋到的個股（如剛上市），用證交所／櫃買公司基本資料 t187ap03 的
+    已發行股數（或實收資本額÷面額）補上，仍是免費官方來源。"""
+    missing = [r[0] for r in con.execute(
+        "SELECT DISTINCT p.stock_id FROM price p "
+        "LEFT JOIN stockmeta m ON m.stock_id = p.stock_id "
+        "WHERE m.issued_lots IS NULL")]
+    missing = [s for s in missing if is_common_stock(s)]
+    if not missing:
+        return
+    try:
+        meta = fs.fetch_company_meta(sess)
+    except Exception as e:
+        print(f"  發行張數補漏：公司基本資料抓取失敗（{e}）。")
+        return
+    rows = [(sid, round(meta[sid]["issued_shares"] / 1000.0), f"{tag}(t187ap03)")
+            for sid in missing
+            if sid in meta and meta[sid].get("issued_shares")]
+    if rows:
+        con.executemany(
+            "INSERT OR REPLACE INTO stockmeta(stock_id,issued_lots,updated) VALUES (?,?,?)", rows)
+        con.commit()
+    print(f"  發行張數補漏：{len(rows)}/{len(missing)} 檔改由公司基本資料補上。")
 
 
 def build_trust_candidates(con):
@@ -1222,7 +1031,7 @@ def write_empty_csv(newest=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-backfill", type=int, default=0,
-                    help="本次最多回補幾檔(0=全部)；想分批跑可設小一點")
+                    help="本次最多回補幾檔(0=用 PRICE_BACKFILL_PER_RUN 預設值)")
     ap.add_argument("--skip-update", action="store_true",
                     help="略過抓當日(僅用現有 DB 選股，除錯用)")
     args = ap.parse_args()
@@ -1241,17 +1050,13 @@ def main():
         except Exception as e:
             print(f"抓當日資料失敗：{e}\n→ 改用資料庫既有最新資料選股（不影響整體流程）。")
 
-    # 1b) 個股日線『以 FinMind 為主』：逐交易日抓最近數日全市場日線覆蓋官方快照（較可靠）。
-    #     成功則 FinMind 為準；失敗/無資料則沿用上面的官方 OpenAPI 快照。名稱仍由官方快照/DB 提供。
-    if not args.skip_update and CONFIG["FINMIND_TOKEN"]:
-        fm = fetch_finmind_prices_recent(CONFIG["FINMIND_TOKEN"])
-        if fm is not None and not fm.empty:
-            upsert_price(con, fm)
-            snap_ids |= set(fm["stock_id"].astype(str))
-            ndays = fm["date"].nunique()
-            print(f"FinMind 全市場日線：更新/覆蓋 {len(fm)} 列、{ndays} 個交易日（最新日 {fm['date'].max()}）")
-        else:
-            print("FinMind 全市場日線：無資料，沿用官方 OpenAPI 快照。")
+    # 1b) 近端補洞：官方 OpenAPI 只給「最新一天」，若某天沒跑就會缺洞。
+    #     用證交所 MI_INDEX／櫃買上櫃行情（可查任一交易日的全市場）把最近數個交易日補齊。
+    if not args.skip_update:
+        try:
+            fill_recent_days(con, sess)
+        except Exception as e:
+            print(f"近端補洞失敗（不影響主流程）：{e}")
 
     # 標的清單：資料庫 ∪ 當日快照（首次執行資料庫為空，靠快照）
     info_all = pd.read_sql("SELECT * FROM stock", con)
@@ -1261,8 +1066,12 @@ def main():
         write_empty_csv(); con.close(); return
     info_map = {r.stock_id: (r.name, r.market) for r in info_all.itertuples()}
 
-    # 2) 一次性歷史回補（FinMind 免費逐檔）
-    run_backfill(con, CONFIG["FINMIND_TOKEN"], universe, args)
+    # 2) 歷史回補（官方逐檔單月；分批接續）
+    if not args.skip_update:
+        try:
+            run_backfill(con, sess, universe, args)
+        except Exception as e:
+            print(f"個股歷史回補失敗（不影響主流程）：{e}")
 
     # 3) 載入歷史、計算、選股、輸出（無論有無入選都輸出 CSV）
     hist = load_history(con, universe)
@@ -1285,31 +1094,17 @@ def main():
     except Exception as e:
         print(f"投信資料/篩選失敗（不影響爆量清單）：{e}")
 
-    # 發行張數（表頭發行/流通張數）：★放在深度回補『之前』，確保 FinMind 額度尚足（回補會大量用量、
-    # 易把後面的請求擠到限流失敗，先前 deep_backfill 就因此讓表頭發行/流通張數空白）；失敗不影響主流程
+    # 集保 400 張大戶持股% ＋ 發行張數（TDCC 開放資料，週更新；失敗不影響主流程）
     try:
-        update_issued_shares(con, CONFIG["FINMIND_TOKEN"])
+        update_shareholding_and_issued(con, sess)
     except Exception as e:
-        print(f"發行張數資料失敗（不影響主流程）：{e}")
+        print(f"集保大戶／發行張數資料失敗（不影響主流程）：{e}")
 
-    # 上櫃(OTC)主力『近端每日更新』：T86 只含上市，上櫃改用 FinMind 逐檔補近端，
-    # 讓上櫃個股K線下圖『主力買賣超』每天跟上（放在深度回補之前；失敗不影響主流程）
+    # 主力/外資/投信『深度歷史』回補到 INST_HISTORY_START（逐交易日全市場，分批；失敗不影響主流程）
     try:
-        update_inst_otc(con, CONFIG["FINMIND_TOKEN"])
-    except Exception as e:
-        print(f"上櫃主力近端更新失敗（不影響主流程）：{e}")
-
-    # 主力/外資/投信『深度歷史』回補到 HISTORY_START（FinMind，分批；失敗不影響主流程）
-    try:
-        backfill_inst_history(con, CONFIG["FINMIND_TOKEN"])
+        backfill_inst_history(con, sess)
     except Exception as e:
         print(f"主力歷史回補失敗（不影響主流程）：{e}")
-
-    # 集保 400 張大戶持股%（週更新；供個股K線副圖，失敗不影響主流程）
-    try:
-        update_shareholding(con, CONFIG["FINMIND_TOKEN"])
-    except Exception as e:
-        print(f"集保大戶資料失敗（不影響主流程）：{e}")
 
     # 資金流向 TOP10（大戶=三大法人合計 / 投信；當日 + 近5/20/60日）
     try:
@@ -1324,12 +1119,12 @@ def main():
     except Exception as e:
         print(f"法人動向資料失敗（不影響主流程）：{e}")
 
-    # ⑧ 產業分類補底：抓 FinMind TaiwanStockInfo 大分類快取進 industry 表（每天若已有快取即略過）
+    # ⑧ 產業分類補底：抓證交所／櫃買公司基本資料，大分類快取進 industry 表（有快取即略過）
     try:
         import tw_industry
-        nind = tw_industry.fetch_finmind_industry(con, CONFIG["FINMIND_TOKEN"])
+        nind = tw_industry.fetch_official_industry(con, sess)
         if nind:
-            print(f"FinMind TaiwanStockInfo：產業分類＋股名/市場 補齊 {nind} 檔。")
+            print(f"公司基本資料(t187ap03)：產業分類＋股名/市場 補齊 {nind} 檔。")
     except Exception as e:
         print(f"產業分類補底失敗（不影響主流程，curated 表仍可用）：{e}")
 

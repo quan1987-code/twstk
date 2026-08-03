@@ -21,7 +21,7 @@ r"""
   7) 風險儀表：VIX、利率變動、台股廣度、融資動向、外資期貨部位、美股廣度 → 綜合燈號。
 
 資料來源：
-  台股：twstock.db（price/inst/stock/industry，由 FinMind Sponsor 方案每日更新，與其他分頁同源）、
+  台股：twstock.db（price/inst/stock/industry，由證交所／櫃買／集保等官方免費來源每日更新，與其他分頁同源）、
         output/extras_*.json（官方三大法人 BFI82U、融資融券 MI_MARGN、期交所外資未平倉）。
   美股/總經/全球：yfinance 為主來源（實測於 GitHub Actions 覆蓋完整、可用），
         Stooq 免金鑰 CSV 作缺漏備援（供 yfinance 被限流時頂替）；加權指數同此雙來源。
@@ -413,7 +413,7 @@ def tw_quadrants(glist):
 def tw_group_flow(glist):
     """族群法人資金淨流入/流出 TOP。取『近 5 日三大法人淨額』而非單日：
     單日易被一筆大單或法人調節扭曲，5 日窗能呈現真正的資金移動方向，
-    也對 FinMind 法人資料晚一天到位的情況更穩健。UI 標題同步標註（近5日法人・億）。"""
+    也對法人資料晚一天到位的情況更穩健。UI 標題同步標註（近5日法人・億）。"""
     xs = [g for g in glist if g.get("inst5") is not None and (g["amt"] or 0) >= 3]
     inflow = sorted([g for g in xs if (g["inst5"] or 0) > 0],
                     key=lambda g: -(g["inst5"] or 0))[:FLOW_TOPN]
@@ -1190,7 +1190,7 @@ def _safe(fn, fallback, label):
 def build_payload(demo=False, no_us=False):
     flags = {"demo": demo, "tw_ok": False, "us_ok": False}
 
-    # ---- 台股（讀 FinMind 建置的 twstock.db，與其他分頁同源）----
+    # ---- 台股（讀官方來源建置的 twstock.db，與其他分頁同源）----
     tw = None
     extras = {}
     if demo:
@@ -1534,7 +1534,7 @@ TEMPLATE = r"""<!doctype html>
   </section>
 
   <footer>
-    產生時間 <span class="num" id="ftGen">—</span>（台北）・資料來源：<a href="https://finmindtrade.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline">FinMind</a>（台股價量/法人/處置）、台灣證交所、期交所、Yahoo Finance（美股/總經）。<br>
+    產生時間 <span class="num" id="ftGen">—</span>（台北）・資料來源：臺灣證券交易所／櫃買中心／集保結算所 TDCC（台股價量・法人・處置・股權分散）、期交所、Yahoo Finance（美股/總經）。<br>
     本頁為程式化統計與規則式研判，僅供研究參考，非投資建議；數據可能因來源延遲或缺漏而不完整。
   </footer>
 </div>

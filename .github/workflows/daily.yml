@@ -5,7 +5,7 @@ on:
     # cron 皆為 UTC；台北固定 UTC+8（台灣無日光節約），美股有夏令/冬令之分。
     # 依「兩地收盤後資料實際到位的時間」分兩段自動更新（非收盤瞬間就抓）：
     #
-    # ① 台股盤後 — 台股 13:30 收盤，三大法人(T86)約 15:00–16:00 公布、FinMind 傍晚到位。
+    # ① 台股盤後 — 台股 13:30 收盤，三大法人(上市 T86／上櫃櫃買日報)約 15:00–16:00 公布。
     #    10:00 UTC = 台北 18:00（週一～五），抓當日台股收盤價＋三大法人買賣超，
     #    更新爆量起漲／投信連買／處置股／資金流向／台股族群等台股區塊。
     - cron: '0 10 * * 1-5'
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_backfill:
-        description: '深度回補 主力/大戶 歷史至 2019（高上限、單次長跑；平時排程用低上限逐步補）'
+        description: '深度回補 個股價量/主力 歷史（高上限、單次長跑；平時排程用低上限逐步補）'
         type: boolean
         default: false
 
@@ -51,21 +51,19 @@ jobs:
           key: twstockdb-${{ github.run_id }}
           restore-keys: twstockdb-
       - name: Run screener
+        # 資料全部來自證交所／櫃買／集保等官方免費端點，不需要任何 API token。
         env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          # 平時排程：留空 → 程式用預設低上限(150日/12週)，每日 run 快、逐步補歷史。
-          # 手動 deep_backfill：拉高上限做一次性長跑，盡量一次補到 2019（timeout 350 分內）。
-          INST_BACKFILL_PER_RUN: ${{ inputs.deep_backfill && '4000' || '' }}
-          SHAREHOLD_MAX_PER_RUN: ${{ inputs.deep_backfill && '500' || '' }}
+          # 平時排程：留空 → 程式用預設低上限，每日 run 快、逐步補歷史。
+          # 手動 deep_backfill：拉高上限做一次性長跑（timeout 350 分內）。
+          # 註：官方端點有流量限制（證交所約 3 次/5 秒），上限不宜無限拉高。
+          INST_BACKFILL_PER_RUN: ${{ inputs.deep_backfill && '1200' || '' }}
+          PRICE_BACKFILL_PER_RUN: ${{ inputs.deep_backfill && '60' || '' }}
+          PRICE_BACKFILL_MAX_MONTHS: ${{ inputs.deep_backfill && '120' || '' }}
         run: python tw_volume_breakout_screener_v2.py
       - name: Build site
         run: python build_site.py
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       - name: Build 處置股專區
         run: python tw_disposition.py
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       - name: Build 產業資金流向（熱圖＋120日資金輪動）
         run: python tw_industry_flow.py
       - name: Build 輝哥選股（均線突破四海遊龍／盤整突破）
