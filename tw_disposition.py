@@ -6,8 +6,9 @@ r"""
 已由 build_site.py 用『三大法人合計』為每一檔股票填好（近一年）。
 與 build_site.py / tw_volume_breakout_screener_v2.py 共用 twstock.db。
 
-四狀態：watch(漲幅型估計) / confirmed(明日確定) / ongoing(處置中) / released(剛出關)
-每檔指標（仿處置神器）：連次 連量 位階 月斜 累幅 剩天 主5 主10，主力買賣超日序列。
+三狀態：confirmed(明日確定) / ongoing(處置中，含即將出關) / released(剛出關)
+每檔指標：位階 月斜 累幅 剩天 主5 主10 距峰高%，主力買賣超日序列。
+註：2026-08-10 起處置新制上路（處置期 10→5 個營業日、撮合統一約每 2 分鐘），規則說明分頁已同步更新。
 
 資料來源（皆免費、官方、免 token）：
   ● 處置名單：證交所 `announcement/punish` ＋ 櫃買 `tpex_disposal_information`（即時公告）。
@@ -46,11 +47,9 @@ HTTP_TIMEOUT = 30
 CHIP_MAX_STOCKS = 60          # 籌碼集中度最多處理幾檔
 MF_HISTORY_DAYS = 60          # 主力序列最多看回幾個交易日
 DISP_KEEP_DAYS = 400          # `disposition` 快取表保留天數（夠涵蓋「剛出關」與歷史核對）
-DISP_WINDOW_DAYS = 90         # 從快取表載入多久以內的處置期別（與原 FinMind 查詢窗一致）
+DISP_WINDOW_DAYS = 90         # 從快取表載入多久以內的處置期別（處置期新制最長 7 個營業日，窗留寬不漏）
 RELEASED_WINDOW_TD = 5
-WATCH_CUM6_MIN = 25.0
-K1_THRESHOLD = 32.0           # 注意股『漲幅型(第1款)』：近6日累積漲幅門檻 %（價格門檻）
-VOL_MULT_K = 5.0             # 注意股『量能型』：當日量 ≥ 近60日均量 × 5（量價門檻）
+K1_THRESHOLD = 32.0           # 注意股『漲幅型(第1款)』：近6日累積漲幅門檻 %（供「連次」指標計算）
 
 # ===== 小工具 =====
 def next_trading_day(today):
@@ -254,22 +253,6 @@ def compute_price_metrics(seq, idx6=0.0, disp_start=None):
         out["lf"] = out["cum6"]
     return out
 
-def watch_estimate_days(cum6, lc):
-    """最快可能進入處置的天數估計：處置約需累積 3 次漲幅型注意。
-    今日已達注意門檻(cum6>=K1)時，最快 = max(1, 3 − 連續注意次數)；尚未達門檻則無法估(None)。"""
-    if cum6 is None or cum6 < K1_THRESHOLD:
-        return None
-    return max(1, 3 - (lc or 0))
-
-def vol_multiple(seq, n=60):
-    """當日量 ÷ 近 n 日均量（含當日）。資料不足回 None。"""
-    vols = [r[4] for r in seq if r[4] is not None]
-    if len(vols) < 6:
-        return None
-    base = vols[-n:] if len(vols) >= n else vols
-    avg = sum(base) / len(base)
-    return round(vols[-1] / avg, 1) if avg > 0 else None
-
 # ===== 籌碼集中度（免費官方版）=====
 # 原本用 FinMind『券商分點日報 TaiwanStockTradingDailyReport』（Sponsor 專屬）算主力買賣超與
 # 集中度；官方端唯一的分點來源是證交所 BSR 網頁，需輸入驗證碼、無法自動化，市面上也沒有
@@ -352,6 +335,23 @@ def _pick_val(dic, keys):
             return str(dic[k]).strip()
     return ""
 
+def _method_of(measure):
+    """從處置措施文字判斷分盤撮合間隔 → '2分盤'/'5分盤'/'20分盤'（抓不到回 ''）。
+    2026-08-10 新制起一律約每 2 分鐘撮合一次；DB 快取裡的舊期別仍可能是 5／20 分鐘，
+    故三種都要能辨識。用 'N分鐘/N分盤' 的樣式比對，避免措施文字裡其他數字誤判。"""
+    t = str(measure or "")
+    m = re.search(r"(\d+)\s*分\s*(?:鐘|盤)", t)
+    if m:
+        return f"{int(m.group(1))}分盤"
+    if "二十" in t:
+        return "20分盤"
+    if "五" in t:
+        return "5分盤"
+    if "兩" in t or "二" in t:
+        return "2分盤"
+    return ""
+
+
 def _parse_official_records(rows, market, diag, tag):
     """政府 OpenAPI list[dict] → recs [{sid,start,end,round,method,name,mkt}]。
     欄位自適應：先試已知鍵名，再退回全欄位樣式偵測；把實際欄位記到 diag 供首跑核對。"""
@@ -380,7 +380,7 @@ def _parse_official_records(rows, market, diag, tag):
             s2, e2 = _extract_two_dates(period)
             start, end = start or s2, end or e2
         measure = _pick_val(d, _MEASURE_KEYS)
-        method = "20分盤" if ("20" in measure or "二十" in measure) else ("5分盤" if ("5" in measure or "五" in measure) else "")
+        method = _method_of(measure)
         rnd = 2 if any(k in measure for k in ("第二次", "二次", "第2次")) else (1 if any(k in measure for k in ("第一次", "一次", "第1次")) else "")
         if start and end: ok += 1
         recs.append({"sid": sid, "start": start, "end": end, "round": rnd,
@@ -464,29 +464,24 @@ def build_notifications(ongoing, today):
     return out
 
 # ===== 組裝/輸出 =====
-def build_payload(today, next_td, watch, confirmed, ongoing, diag):
-    notify = build_notifications(ongoing, today)   # 通知掃描全部處置中（拆分前）
-    # 依剩餘出關天數拆分：剩天(st/d2r) ≤3 → 即將出關(release_soon)；其餘(>3 或未知) → 處置中
-    def _rem(r):
-        v = r.get("st")
-        return v if v is not None else r.get("d2r")
-    release_soon = [r for r in ongoing if isinstance(_rem(r), (int, float)) and _rem(r) <= 3]
-    ongoing_disp = [r for r in ongoing if not (isinstance(_rem(r), (int, float)) and _rem(r) <= 3)]
+def build_payload(today, next_td, confirmed, ongoing, diag):
+    notify = build_notifications(ongoing, today)
+    # 處置中不再依剩餘天數拆出「即將出關」分頁：全部留在 ongoing，
+    # 由 categorize 依剩天(d2r)由小到大排序，快出關的自然排在最前面。
     # 附上概念股標籤(cpt)：供處置頁依概念分群（無概念時前端退回產業別 ind）
     try:
         import tw_concepts
         _cmap = tw_concepts.concept_map()
     except Exception:
         _cmap = {}
-    for _lst in (watch, confirmed, ongoing_disp, release_soon, notify):
+    for _lst in (confirmed, ongoing, notify):
         for _r in _lst:
             _r["cpt"] = _cmap.get(str(_r.get("sid", "")), [])
     return {"gentime": now_taipei(), "today": today, "next_td": next_td,
-            "counts": {"watch": len(watch), "confirmed": len(confirmed),
-                       "ongoing": len(ongoing_disp), "release_soon": len(release_soon),
+            "counts": {"confirmed": len(confirmed), "ongoing": len(ongoing),
                        "notify": len(notify)},
-            "diag": diag, "watch": watch, "confirmed": confirmed,
-            "ongoing": ongoing_disp, "release_soon": release_soon, "notify": notify}
+            "diag": diag, "confirmed": confirmed,
+            "ongoing": ongoing, "notify": notify}
 
 def write_outputs(out_dir, payload):
     os.makedirs(os.path.join(out_dir, "data"), exist_ok=True)
@@ -497,8 +492,7 @@ def write_outputs(out_dir, payload):
         f.write(CHUZHI_HTML.replace("__BUILDV__", build_v))
     c = payload["counts"]
     print(f"已寫出 {out_dir}/chuzhi.html 與 data/chuzhi.json "
-          f"（可能進入處置 {c['watch']}・確定 {c['confirmed']}・處置中 {c['ongoing']}"
-          f"・即將出關 {c.get('release_soon',0)}・通知 {c['notify']}）")
+          f"（明日確定 {c['confirmed']}・處置中 {c['ongoing']}・通知 {c['notify']}）")
 
 # ===== 示範資料 =====
 def make_demo():
@@ -506,27 +500,22 @@ def make_demo():
     diag = {"notes": ["[示範模式] 合成資料，非真實行情"], "disp_cols": []}
     def row(sid,name,mkt,close,chg,**kw):
         d = {"sid":sid,"name":name,"mkt":mkt,"close":close,"chg":chg}; d.update(kw); return d
-    watch = [
-        row("4129","聯合","上市",58.9,9.92,ind="生技-醫材",light="red",wj=8,yx=2.1,lf=33.8,vmult=6.4,st=1,pk60=-2.5,z5=11.2,z10=8.4),
-        row("3083","網龍","上櫃",102.0,3.55,ind="電子下游-系統組裝",light="amber",wj=6,yx=1.4,lf=26.1,vmult=3.1,st=None,pk60=-8.0,z5=-3.4,z10=-1.1),
-    ]
     confirmed = [
-        row("2618","長榮航","上市",48.6,9.95,ind="航空",round=1,method="5分盤",start="2026-06-30",end="2026-07-11",
+        row("2618","長榮航","上市",48.6,9.95,ind="航空",round=1,method="2分盤",start="2026-06-30",end="2026-07-06",
             wj=5,yx=1.6,lf=0.0,cum6=36.5,st=None,pk60=-5.0,z5=-6.4,z10=-5.2),
-        row("6187","萬潤","上櫃",121.5,6.58,ind="半導體-設備",round=2,method="20分盤",start="2026-06-30",end="2026-07-13",
+        row("6187","萬潤","上櫃",121.5,6.58,ind="半導體-設備",round=2,method="2分盤",start="2026-06-30",end="2026-07-08",
             wj=7,yx=2.4,lf=0.0,cum6=41.2,st=None,pk60=-3.1,z5=8.2,z10=5.5),
     ]
     ongoing = [
-        # 剩天 >3 → 留在「處置中」
-        row("2484","希華","上市",42.55,2.53,ind="電子上游-被動元件",round=1,method="5分盤",start="2026-06-23",end="2026-07-08",
-            day_n=4,day_total=10,release="2026-07-08",d2r=5,wj=0,yx=1.6,lf=-14.0,ma20=44.0,ma20_touch=True,st=5,pk60=-18.2,z5=-6.4,z10=-5.2),
-        # 剩天 ≤3 → 移到「即將出關」
-        row("3339","泰谷","上市",59.8,-0.33,ind="光電-LED",round=1,method="5分盤",start="2026-06-23",end="2026-07-07",
-            day_n=8,day_total=11,release="2026-07-07",d2r=2,wj=2,yx=1.9,lf=-23.0,ma20=61.0,ma20_touch=False,st=2,pk60=-24.1,z5=7.1,z10=1.3),
-        row("8289","泰藝","上市",49.35,5.45,ind="電子上游-被動元件",round=2,method="20分盤",start="2026-06-23",end="2026-07-09",
-            day_n=11,day_total=12,release="2026-07-09",d2r=1,wj=0,yx=1.5,lf=-31.0,ma20=50.2,ma20_touch=True,st=1,pk60=-30.4,z5=-6.2,z10=-7.2),
+        row("2484","希華","上市",42.55,2.53,ind="電子上游-被動元件",round=1,method="2分盤",start="2026-06-23",end="2026-06-30",
+            day_n=2,day_total=5,release="2026-06-30",d2r=3,wj=0,yx=1.6,lf=-14.0,ma20=44.0,ma20_touch=True,st=3,pk60=-18.2,z5=-6.4,z10=-5.2),
+        row("3339","泰谷","上市",59.8,-0.33,ind="光電-LED",round=1,method="2分盤",start="2026-06-22",end="2026-06-29",
+            day_n=4,day_total=5,release="2026-06-29",d2r=2,wj=2,yx=1.9,lf=-23.0,ma20=61.0,ma20_touch=False,st=2,pk60=-24.1,z5=7.1,z10=1.3),
+        # 當沖占比過高 → 處置期 7 個營業日
+        row("8289","泰藝","上市",49.35,5.45,ind="電子上游-被動元件",round=2,method="2分盤",start="2026-06-19",end="2026-06-30",
+            day_n=6,day_total=7,release="2026-06-30",d2r=1,wj=0,yx=1.5,lf=-31.0,ma20=50.2,ma20_touch=True,st=1,pk60=-30.4,z5=-6.2,z10=-7.2),
     ]
-    return build_payload(today, next_trading_day(today), watch, confirmed, ongoing, diag)
+    return build_payload(today, next_trading_day(today), confirmed, ongoing, diag)
 
 # ===== 主程式 =====
 def main():
@@ -600,21 +589,6 @@ def main():
         try: ind_map = tw_industry.label_map(con)
         except Exception: ind_map = {}
 
-    # 可能進入處置（漲幅型估計；含價格門檻 cum6 與量價門檻 量倍數）
-    watch = []
-    for sid, seq in win.items():
-        if sid in disp_sids: continue
-        if len(seq) < 7: continue
-        m = compute_price_metrics(seq, idx6)
-        if m["cum6"] is None or m["cum6"] < WATCH_CUM6_MIN: continue
-        light = "red" if m["cum6"] >= K1_THRESHOLD else "amber"
-        watch.append({"sid": sid, "name": names.get(sid,""), "mkt": mkts.get(sid,""),
-                      "ind": ind_map.get(sid,""), "close": round(seq[-1][3],2), "chg": m["chg"],
-                      "light": light, "wj": m["wj"], "yx": m["yx"], "lf": m["cum6"],
-                      "vmult": vol_multiple(seq), "st": watch_estimate_days(m["cum6"], m["lc"]),
-                      "pk60": peak60_dist(seq), "z5": None, "z10": None})
-    watch.sort(key=lambda x: (0 if x["light"]=="red" else 1, -(x["lf"] or 0)))
-
     # 處置中／明日確定：補價格指標
     for lst in (ongoing, confirmed):
         for r in lst:
@@ -636,10 +610,10 @@ def main():
     # 原本用 FinMind 券商分點（Sponsor 專屬）；免費版取不到，官方也沒有可自動化的分點 API，
     # 故改用同樣是「大戶動向」的三大法人買賣超（已由 screener 每日抓進 inst 表，上市/上櫃皆有）。
     if not args.no_chips:
-        targets = list(dict.fromkeys([r["sid"] for r in ongoing] + [r["sid"] for r in confirmed]
-                                     + [r["sid"] for r in watch]))[:CHIP_MAX_STOCKS]
+        targets = list(dict.fromkeys([r["sid"] for r in ongoing]
+                                     + [r["sid"] for r in confirmed]))[:CHIP_MAX_STOCKS]
         mf_dates = trading_dates(con, MF_HISTORY_DAYS)
-        idx_for = {r["sid"]: r for lst in (ongoing, confirmed, watch) for r in lst}
+        idx_for = {r["sid"]: r for lst in (ongoing, confirmed) for r in lst}
         filled = 0
         for sid in targets:
             ser = load_inst_mf_series(con, sid, mf_dates)
@@ -657,7 +631,7 @@ def main():
         diag["notes"].append(f"籌碼集中度（三大法人／成交量）：{filled}/{len(targets)} 檔有值"
                              f"（法人資料通常較股價晚一個交易日）")
     con.close()
-    write_outputs(args.out, build_payload(today, next_td, watch, confirmed, ongoing, diag))
+    write_outputs(args.out, build_payload(today, next_td, confirmed, ongoing, diag))
 
 CHUZHI_HTML = r"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -775,10 +749,6 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .nmcell .nrz .ntag{font-size:9.5px; font-weight:700; padding:1px 5px; border-radius:6px;}
 
   .up{color:var(--up);} .down{color:var(--down);} .flat{color:var(--muted);} .amb{color:var(--amber);}
-  .dot{display:inline-block; width:9px; height:9px; border-radius:99px; margin-right:2px; vertical-align:middle;}
-  .dot.red{background:var(--up);}
-  .dot.amber{background:var(--amber);}
-  .dot.green{background:var(--down);}
 
   .prog{height:6px; background:#000; border:1px solid var(--border); border-radius:5px; overflow:hidden; flex:1;}
   .progf{height:100%; background:var(--amber); border-radius:5px;}
@@ -786,6 +756,7 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   .progline .pt{font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap;}
 
   .chip{display:inline-block; font-size:10.5px; font-weight:700; padding:1px 7px; border-radius:5px;}
+  .chip.m2{background:var(--amber-s,rgba(255,176,32,.16)); color:var(--amber);}
   .chip.m5{background:var(--red-s); color:var(--up);} .chip.m20{background:var(--purple-s); color:var(--purple);}
   .chip.r2{background:var(--red-s); color:var(--up); margin-left:5px;}
 
@@ -831,10 +802,8 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   <div class="cztabs" id="cztabs">
     <button class="czt on" data-p="ov">總覽</button>
     <button class="czt" data-p="notify">🔔 通知</button>
-    <button class="czt" data-p="watch">可能進入處置</button>
     <button class="czt" data-p="confirmed">📌 明日確定</button>
     <button class="czt" data-p="ongoing">處置中</button>
-    <button class="czt" data-p="release">🔓 即將出關</button>
     <button class="czt" data-p="teach">實戰教學</button>
     <button class="czt" data-p="rule">規則說明</button>
   </div>
@@ -842,13 +811,11 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   <div class="pane" id="p-ov">
     <div class="stats">
       <div class="stat r"><div class="n num" id="cnt-n">—</div><div class="l">🔔 通知</div></div>
-      <div class="stat w"><div class="n num" id="cnt-w">—</div><div class="l">可能進入處置</div></div>
       <div class="stat"><div class="n num" id="cnt-c" style="color:var(--blue)">—</div><div class="l">📌 明日確定</div></div>
       <div class="stat o"><div class="n num" id="cnt-o">—</div><div class="l">處置中</div></div>
-      <div class="stat"><div class="n num" id="cnt-rs" style="color:var(--down)">—</div><div class="l">🔓 即將出關</div></div>
     </div>
     <div class="note">
-      <b>燈號</b>：<span class="dot red"></span>紅＝今日已觸發漲幅型（第1款）　<span class="dot amber"></span>黃＝接近門檻　<span class="dot green"></span>綠＝安全。<br>
+      <b>新制提醒</b>：2026/8/10 起處置期由 10 個營業日縮短為 <b>5 個營業日</b>（當沖占比過高者 12→<b>7 日</b>），分盤撮合統一加速為<b>約每 2 分鐘</b>一次。詳見「規則說明」。<br>
       點任何個股的<b style="color:var(--blue)">列</b>可跳到該股 K 線圖（K 線下方副圖可切換 MACD／主力買賣超）。清單為<b>緊湊表格</b>：可左右滑動看更多指標、點欄位標題排序。股名下方小字為<b>產業類型</b>。籌碼資料：證交所／櫃買三大法人買賣超（T+1 盤後）。
     </div>
     <div class="note" id="diagbox" style="display:none"></div>
@@ -861,13 +828,6 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
     <div id="expl-notify"></div>
   </div>
 
-  <div class="pane hidden" id="p-watch">
-    <div class="sech">📈 可能進入處置 <span class="pill">注意/處置門檻・盤後自算</span></div>
-    <div class="tblhint">點欄位標題排序（再點切換升/降冪）・表格可左右滑動看更多指標・點列看 K 線</div>
-    <div id="list-watch"></div>
-    <div id="expl-watch"></div>
-  </div>
-
   <div class="pane hidden" id="p-confirmed">
     <div class="sech">📌 明日確定 <span class="pill">交易所已公告・下一交易日起處置</span></div>
     <div class="tblhint">已公告、處置尚未開始（隔日起分盤）・點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
@@ -876,17 +836,10 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="pane hidden" id="p-ongoing">
-    <div class="sech">⛓️ 處置中（坐牢） <span class="pill">分盤交易期・剩餘 &gt;3 交易日</span></div>
-    <div class="tblhint">點欄位標題排序・左右滑動看更多指標・點列看 K 線（剩餘 ≤3 日者見「即將出關」）</div>
+    <div class="sech">⛓️ 處置中（坐牢） <span class="pill">分盤交易期・含即將出關</span></div>
+    <div class="tblhint">預設依<b>剩天</b>由少到多排序，<b>🔓 即將出關（剩餘 ≤3 日）者排在最前面</b>・點欄位標題排序・左右滑動看更多指標・點列看 K 線</div>
     <div id="list-ongoing"></div>
     <div id="expl-ongoing"></div>
-  </div>
-
-  <div class="pane hidden" id="p-release">
-    <div class="sech">🔓 即將出關 <span class="pill">剩餘 ≤3 交易日・分盤即將解除</span></div>
-    <div class="tblhint">由「處置中」自動移入（剩餘出關天數 ≤3 日）・排版與處置中相同・點欄位標題排序・點列看 K 線</div>
-    <div id="list-release"></div>
-    <div id="expl-release"></div>
   </div>
 
   <div class="pane hidden" id="p-teach">
@@ -937,30 +890,60 @@ CHUZHI_HTML = r"""<!DOCTYPE html>
 
   <div class="pane hidden" id="p-rule">
     <div class="doc">
+      <div class="warn" style="margin-bottom:12px">
+        <b>2026/8/10 起處置新制上路</b>：處置期間<b>大幅縮短</b>、分盤撮合<b>統一加速為約每 2 分鐘</b>一次，
+        並提高高價股的注意標準。新制上路當日<b>已在處置中的個股立即適用</b>新規定。
+      </div>
+
       <h3>注意股 vs 處置股</h3>
       <p><b>注意股</b>：盤後計算，達標就公告，只是提醒、交易方式不變。<b>處置股</b>：注意累積到一定次數後升級，真的有交易限制（改分盤、要預收錢、禁當沖）。先注意、再處置。</p>
-      <h3>怎樣會被「注意」？</h3>
-      <ul>
-        <li><span class="k">漲太快</span>：近6個交易日累積漲跌幅 <b>超過32%</b>（且明顯比大盤、同類股強）；或超過25%且這6天頭尾價差達50元（多為高價股）。</li>
-        <li><span class="k">量爆掉</span>：當天量是近60日均量5倍以上。</li>
-        <li><span class="k">週轉率太高</span>：當天＞10%、或近6日累積＞50%。</li>
-        <li><span class="k">當沖太兇</span>：近6日與當日當沖佔比都＞60%（會讓處置拉長到12天）。</li>
-      </ul>
-      <h3>怎樣會被「處置」？</h3>
-      <p>近期累積到門檻就升級：<b>連續3天</b>達漲幅型；或<b>連5天／近10天6天／近30天12天</b>達前述任一款。</p>
-      <h3>第一次 vs 第二次</h3>
+
+      <h3>新舊制對照（2026/8/10 起）</h3>
+      <table>
+        <tr><th></th><th>舊制</th><th>新制</th></tr>
+        <tr><td>處置期間（第一次）</td><td>10 個營業日</td><td><b>5 個營業日</b></td></tr>
+        <tr><td>處置期間（第二次以上）</td><td>10 個營業日</td><td><b>5 個營業日</b></td></tr>
+        <tr><td>當沖占比過高者</td><td>12 個營業日</td><td><b>7 個營業日</b></td></tr>
+        <tr><td>撮合頻率</td><td>第一次約 5 分鐘<br>第二次約 20 分鐘</td><td><b>一律約 2 分鐘</b><br>（比照瞬間價格穩定措施）</td></tr>
+      </table>
+      <p class="lead">白話：關禁閉時間<b>砍半以上</b>，關在裡面也<b>沒那麼難成交</b>了 —— 分盤從 5／20 分鐘一次縮到約 2 分鐘一次，流動性明顯改善，被處置期間「賣不掉、跌到底」的狀況會比舊制緩和。</p>
+
+      <h3>第一次 vs 第二次（新制差別只剩預收）</h3>
       <table>
         <tr><th></th><th>第一次</th><th>第二次以上</th></tr>
-        <tr><td>撮合</td><td>約每 <b>5分鐘</b></td><td>約每 <b>20分鐘</b></td></tr>
-        <tr><td>預收</td><td>單筆≥10張或累積≥30張</td><td><b>不論張數全額預收</b></td></tr>
-        <tr><td>信用</td><td>視個案</td><td>停融資、融券保證金100%</td></tr>
-        <tr><td>天數</td><td>10天（當沖太兇→12天）</td><td>10~12天</td></tr>
+        <tr><td>撮合</td><td colspan="2" style="text-align:center">約每 <b>2 分鐘</b>（相同）</td></tr>
+        <tr><td>天數</td><td colspan="2" style="text-align:center"><b>5 個營業日</b>（當沖占比過高 → 7 日）</td></tr>
+        <tr><td>預收款券</td><td>單筆 ≥10 張<br>或當日累積 ≥30 張</td><td><b>不論張數<br>全額預收</b></td></tr>
+        <tr><td>信用交易</td><td>視個案</td><td>停融資、融券保證金 100%</td></tr>
       </table>
+
+      <h3>怎樣會被「注意」？</h3>
+      <ul>
+        <li><span class="k">漲太快</span>：近 6 個交易日累積漲跌幅 <b>超過 32%</b>（且明顯比大盤、同類股強）；或超過 25% 且這 6 天頭尾價差達 50 元。</li>
+        <li><span class="k">高價股（新制放寬）</span>：收盤價 <b>逾 1,000 元</b>者，近 6 個交易日價差需達 <b>300 元</b>以上；<b>逾 2,000 元</b>者再以每 1,000 元級距往上調整 —— 避免高價股因絕對價差大而動輒被列注意。</li>
+        <li><span class="k">量爆掉</span>：當天量是近 60 日均量 5 倍以上。</li>
+        <li><span class="k">週轉率太高</span>：當天 ＞10%、或近 6 日累積 ＞50%。</li>
+        <li><span class="k">當沖太兇</span>：近 6 日與當日當沖占比都 ＞60%（會讓處置期拉長到 <b>7 個營業日</b>）。</li>
+      </ul>
+
+      <h3>怎樣會被「處置」？</h3>
+      <p>注意次數在近期累積到門檻就升級：<b>連續 3 個營業日</b>、<b>連續 5 個營業日</b>、<b>近 10 個營業日內達 6 次</b>、或<b>近 30 個營業日內達 12 次</b>符合注意標準。</p>
+
       <h3>處置期間限制</h3>
-      <ul><li><b>不能現股／資券當沖</b>。</li><li>只能掛<b>限價單</b>，分盤集合競價，每5秒揭示模擬價量與五檔。</li><li>對應的<b>股票期貨不受限</b>（保證金調高）。</li></ul>
+      <ul>
+        <li><b>不能現股／資券當沖</b>。</li>
+        <li>只能掛<b>限價單</b>，分盤集合競價（新制約每 2 分鐘一次），每 5 秒揭示模擬價量與五檔。</li>
+        <li>達門檻須<b>預收款券</b>（見上表）。</li>
+        <li>對應的<b>股票期貨不受限</b>（保證金調高）。</li>
+      </ul>
+
       <h3>上市／上櫃／興櫃</h3>
-      <p>上市與上櫃標準幾乎一樣。<b>興櫃完全不同</b>：無漲跌幅、議價，均價較前一日差50%就熔斷停到收盤，波動極端。</p>
-      <p class="discl">以上為簡化說明，量化門檻以證交所與櫃買中心最新公告為準。</p>
+      <p>上市與上櫃標準幾乎一樣（櫃買中心同步修正）。<b>興櫃完全不同</b>：無漲跌幅、議價，均價較前一日差 50% 就熔斷停到收盤，波動極端。</p>
+
+      <h3>後續</h3>
+      <p>證交所表示將建立<b>每半年定期檢討</b>機制，依市場狀況再調整；本頁數字若與最新公告不符，以交易所公告為準。</p>
+
+      <p class="discl">以上為簡化說明（新制內容整理自 2026/8 證交所公告與媒體報導），量化門檻一律以證交所與櫃買中心最新公告為準。</p>
     </div>
   </div>
 </div>
@@ -977,9 +960,11 @@ function pctSpan(v){ if(!isNum(v)) return '<span class="flat">—</span>';
 function priceTxt(p){ return isNum(p)?Number(p).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):"—"; }
 function signCls(v){ return !isNum(v)?"flat":(Number(v)>0?"up":(Number(v)<0?"down":"flat")); }
 function fx(v,d=1){ return isNum(v)?Number(v).toFixed(d):"—"; }
-function dotFor(l){ const c=l==="red"?"red":(l==="amber"?"amber":"green"); return `<span class="dot ${c}"></span>`; }
-function methodChip(m){ if(!m)return""; if(String(m).indexOf("20")>=0)return`<span class="chip m20">20分盤</span>`;
-  if(String(m).indexOf("5")>=0)return`<span class="chip m5">5分盤</span>`; return`<span class="chip m5">${esc(m)}</span>`; }
+function methodChip(m){ if(!m)return""; const t=String(m);
+  if(t.indexOf("20")>=0)return`<span class="chip m20">20分盤</span>`;          /* 舊制第二次 */
+  if(t.indexOf("5")>=0)return`<span class="chip m5">5分盤</span>`;             /* 舊制第一次 */
+  if(t.indexOf("2")>=0)return`<span class="chip m2">2分盤</span>`;             /* 2026/8/10 新制 */
+  return`<span class="chip m2">${esc(t)}</span>`; }
 function roundChip(r){ return (isNum(r)&&Number(r)>=2)?`<span class="chip r2">第${Number(r)}次</span>`:""; }
 
 function mcellPair(la, va, clsa, lb, vb, clsb){
@@ -995,18 +980,13 @@ function metricGrid(r, opt){
     ${mcellPair("位階", isNum(r.wj)?r.wj:"—", "", "月斜", isNum(yx)?fx(yx,1)+"%":"—", signCls(yx))}
     ${mcellPair("累幅", isNum(lf)?(lf>0?"+":"")+fx(lf,1)+"%":"—", signCls(lf), "剩天", isNum(r.st)?r.st:"—", "")}
     ${mcellPair("主5", isNum(z5)?fx(z5,1)+"%":"—", signCls(z5), "主10", isNum(z10)?fx(z10,1)+"%":"—", signCls(z10))}`;
-  if(opt.watch){
-    const pOk=isNum(lf)&&lf>=32, vOk=isNum(r.vmult)&&r.vmult>=5;
-    rows += mcellPair("價格門檻≥32%", isNum(lf)?(lf>0?"+":"")+fx(lf,1)+"%":"—", pOk?"up":"amb",
-                      "量價門檻≥5x", isNum(r.vmult)?fx(r.vmult,1)+"x":"—", vOk?"up":"amb");
-  }
   return `<div class="mgrid">${rows}</div>`;
 }
-function cardHead(r, withLight){
+function cardHead(r){
   const chg=r.chg;
   return `<div class="top">
     <div class="lhs" onclick="goChart('${esc(r.sid)}')">
-      <span>${withLight?dotFor(r.light):""}<span class="sid">${esc(r.sid)}</span><span class="nm">${esc(r.name||"")} ›</span>${r.mkt?`<span class="mkt">${esc(r.mkt)}</span>`:""}</span>
+      <span><span class="sid">${esc(r.sid)}</span><span class="nm">${esc(r.name||"")} ›</span>${r.mkt?`<span class="mkt">${esc(r.mkt)}</span>`:""}</span>
       ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
       <div class="period">${(r.start||r.end)?`處置 ${esc(r.start||"?")} ~ ${esc(r.end||"?")}`:""}</div>
     </div>
@@ -1026,23 +1006,21 @@ function renderList(elId, arr, opt){
   const el=$(elId); opt=opt||{};
   if(!arr||!arr.length){ el.innerHTML=`<div class="empty">${opt.empty||"目前沒有資料。"}</div>`; return; }
   el.innerHTML=arr.map(r=>`<div class="card">
-    ${cardHead(r, opt.light)}
+    ${cardHead(r)}
     ${metricGrid(r, opt)}
     ${opt.prog?progRow(r):""}
   </div>`).join("");
 }
 
 /* ---- 緊湊表格（仿處置神器）：凍結首欄、可左右滑動、點欄位標題排序 ---- */
-const sortState = { notify:{key:null,asc:false}, watch:{key:null,asc:false}, confirmed:{key:null,asc:false}, ongoing:{key:null,asc:false}, release:{key:null,asc:false} };
-const LISTDATA = { notify:[], watch:[], confirmed:[], ongoing:[], release:[] };
+const sortState = { notify:{key:null,asc:false}, confirmed:{key:null,asc:false}, ongoing:{key:null,asc:false} };
+const LISTDATA = { notify:[], confirmed:[], ongoing:[] };
 const LISTOPT = {
   notify:{prog:true, empty:"目前沒有達到通知標準的處置中個股。<br><span style=\"color:var(--dim)\">標準：月斜&gt;1% 且（累計跌幅破 -10/-20/-30%，或當日K棒觸及20MA月線）</span>"},
-  watch:{light:true, empty:"目前沒有接近處置門檻的個股。"},
   confirmed:{empty:"目前沒有『已公告、明日起處置』的個股。<br><span style=\"color:var(--dim)\">交易所處置公告多在盤後傍晚發布；若今日剛公告，最快本次或次日盤後建置後出現。</span>"},
-  ongoing:{prog:true, empty:"目前沒有剩餘 &gt;3 交易日的處置中個股。"},
-  release:{prog:true, empty:"目前沒有即將出關（剩餘 ≤3 交易日）的處置中個股。"}
+  ongoing:{prog:true, empty:"目前沒有處置中的個股。"}
 };
-// 每欄堆疊 1~2 個(標籤,key)指標；watch 多一欄門檻、處置中/通知多一欄進度
+// 每欄堆疊 1~2 個(標籤,key)指標；處置中/通知多一欄進度
 function colSpec(name){
   // 明日確定：處置尚未開始 → 無「進度/剩天/累幅」，改看「近6漲」(近6日累積漲幅，被處置主因)
   if(name==="confirmed") return [
@@ -1059,8 +1037,7 @@ function colSpec(name){
     [["累幅","lf"],["剩天","st"]],
     [["主5","z5"],["主10","z10"]],
   ];
-  if(name==="watch") c.push([["量倍","vmult"],["價門檻","lf"]]);
-  if(name==="ongoing"||name==="notify"||name==="release") c.push([["進度","day_n"],["剩","d2r"]]);
+  if(name==="ongoing"||name==="notify") c.push([["進度","day_n"],["剩","d2r"]]);
   return c;
 }
 function fmtCell(key,v,r){
@@ -1072,12 +1049,11 @@ function fmtCell(key,v,r){
     case "chg":   return {t:(n>0?"+":"")+n.toFixed(2)+"%",c:signCls(n)};
     case "wj":    return {t:String(Math.round(n)),c:""};
     case "yx":    return {t:n.toFixed(1)+"%",c:signCls(n)};
-    case "lf":    return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:(r.light!=null&&n>=32)?"up":signCls(n)};
+    case "lf":    return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
     case "st": case "d2r": return {t:String(Math.round(n)),c:""};
     case "z5": case "z10": return {t:n.toFixed(1)+"%",c:signCls(n)};
     case "cum6": return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
     case "pk60": return {t:(n>0?"+":"")+n.toFixed(1)+"%", c:signCls(n)};
-    case "vmult": return {t:n.toFixed(1)+"x", c:(n>=5?"up":"amb")};
   }
   return {t:String(n),c:""};
 }
@@ -1110,7 +1086,7 @@ function dispRowHtml(r,cols){
     const per=(r.start||r.end)?`${esc((r.start||"").slice(5))}~${esc((r.end||"").slice(5))}`:"";
     return `<tr class="side-${sc}" onclick="goChart('${esc(r.sid)}')">
       <td class="frz nmcell">
-        <div class="nm">${r.light?dotFor(r.light):""}${esc(r.name||"")}${methodChip(r.method)}${roundChip(r.round)}</div>
+        <div class="nm">${esc(r.name||"")}${methodChip(r.method)}${roundChip(r.round)}</div>
         <div class="sub">${esc(r.sid)}${r.mkt?" "+esc(r.mkt):""}</div>
         ${r.ind?`<div class="cind">${esc(r.ind)}</div>`:""}
         ${per?`<div class="per">${per}</div>`:""}
@@ -1144,13 +1120,13 @@ const EXPL = `
 <span class="k">距峰高%</span><span>目前收盤價 相對「近 60 日內『最高收盤價』那天的<b>盤中最高價</b>」的距離%。公式＝(今收 ÷ 該峰日最高價 − 1)×100，多為負值(收盤低於該峰高)；<b>越負代表距近期高點回檔越深</b>，處置中被錯殺時常是低接觀察點。</span>
 <span class="k">位階</span><span>20日布林通道整數級距：<b>+10</b>＝上軌(基期偏高、較適放空)、<b>0</b>＝月線(中線)、<b>-10</b>＝下軌(基期偏低、較適做多)。公式＝round((收盤−MA20)÷(2×20日標準差)×10)，夾在 ±10。</span>
 <span class="k">月斜</span><span>月線(20MA)1日斜率%＝(MA20今−MA20昨)÷MA20昨×100。<b>&gt;1%＝強勢、&gt;3%＝妖股</b>。</span>
-<span class="k">累幅</span><span>處置中＝(今收−處置前一日收)÷處置前一日收×100；可能進入處置＝近6日累積漲幅%。</span>
-<span class="k">剩天</span><span>處置中＝距出關交易日數；可能進入處置＝最快可能進入處置的天數。</span>
+<span class="k">累幅</span><span>(今收 − 處置前一日收) ÷ 處置前一日收 ×100，也就是「坐牢期間」的累積漲跌幅。</span>
+<span class="k">剩天</span><span>距出關的交易日數。新制處置期為 5 個營業日（當沖占比過高者 7 日），剩天越小代表越快解除分盤。</span>
 <span class="k">主5／主10</span><span>近5/10日籌碼集中度%＝該區間<b>三大法人合計淨買超(張)</b>÷同區間成交量(張)×100。正(紅)＝法人買超集中；負(綠)＝法人派發。（券商分點無免費官方 API，改以三大法人買賣超衡量大戶動向。）</span>
 <span class="k">價格門檻</span><span>注意股漲幅型(第1款)：近6日累積漲幅 ≥ <b>32%</b>。值達標轉紅。</span>
 <span class="k">量價門檻</span><span>注意股量能型：當日量 ≥ 近60日均量 × <b>5倍</b>。值達標轉紅。</span>
 </div>
-<div style="margin-top:9px; color:var(--dim)">點名稱可跳到該股 K 線；K 線下方副圖可切「主力買賣超」看逐日紅綠柱＋累計線。「可能進入處置」為本站用收盤價/量自算的注意/處置門檻估計，實際以證交所、櫃買最新公告為準。</div>
+<div style="margin-top:9px; color:var(--dim)">點名稱可跳到該股 K 線；K 線下方副圖可切「主力買賣超」看逐日紅綠柱＋累計線。處置名單與起迄日以證交所、櫃買中心公告為準。</div>
 </div></details>`;
 const NOTIFY_EXPL = `
 <details class="expl"><summary>通知規則（點開）</summary><div class="expbody">
@@ -1166,7 +1142,7 @@ function goChart(sid){ location.href = "index.html?stk=" + encodeURIComponent(si
 
 function switchTab(p){
   document.querySelectorAll(".czt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  ["ov","notify","watch","confirmed","ongoing","release","teach","rule"].forEach(x=>{
+  ["ov","notify","confirmed","ongoing","teach","rule"].forEach(x=>{
     const n=$("p-"+x); if(n) n.classList.toggle("hidden", x!==p);
   });
   try{ window.scrollTo({top:0,behavior:"smooth"}); }catch(e){ window.scrollTo(0,0); }
@@ -1176,30 +1152,31 @@ document.querySelectorAll(".czt").forEach(b=>b.addEventListener("click",()=>swit
 async function boot(){
   let d=null;
   try{ const r=await fetch("data/chuzhi.json?v="+BUILD_V,{cache:"default"}); if(r.ok) d=await r.json(); }catch(e){}
-  ["watch","confirmed","ongoing","release"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
+  ["confirmed","ongoing"].forEach(k=>{ const e=$("expl-"+k); if(e) e.innerHTML=EXPL; });
   const en=$("expl-notify"); if(en) en.innerHTML=NOTIFY_EXPL;
   if(!d){
     $("today").textContent="資料尚未產生";
-    ["notify","watch","confirmed","ongoing","release"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
+    ["notify","confirmed","ongoing"].forEach(k=>{ const el=$("list-"+k); if(el) el.innerHTML=`<div class="empty">尚未取得處置資料。<br>請先在 GitHub Actions 跑一次工作流程產生 data/chuzhi.json。</div>`; });
     return;
   }
   $("today").textContent=d.today||"—";
   $("gentime").textContent=d.gentime||"—";
   const c=d.counts||{};
   $("cnt-n").textContent=c.notify!=null?c.notify:((d.notify||[]).length);
-  $("cnt-w").textContent=c.watch!=null?c.watch:((d.watch||[]).length);
   const _cc=$("cnt-c"); if(_cc) _cc.textContent=c.confirmed!=null?c.confirmed:((d.confirmed||[]).length);
   $("cnt-o").textContent=c.ongoing!=null?c.ongoing:((d.ongoing||[]).length);
-  const _rs=$("cnt-rs"); if(_rs) _rs.textContent=c.release_soon!=null?c.release_soon:((d.release_soon||[]).length);
-  LISTDATA.notify=d.notify||[]; LISTDATA.watch=d.watch||[]; LISTDATA.confirmed=d.confirmed||[]; LISTDATA.ongoing=d.ongoing||[]; LISTDATA.release=d.release_soon||[];
-  ["notify","watch","confirmed","ongoing","release"].forEach(renderTbl);
+  // 舊版 chuzhi.json 會把快出關的個股拆在 release_soon，合併回處置中（避免快取到舊 JSON 時漏股）
+  LISTDATA.notify=d.notify||[]; LISTDATA.confirmed=d.confirmed||[];
+  LISTDATA.ongoing=(d.ongoing||[]).concat(d.release_soon||[]).sort((a,b)=>(a.d2r==null?999:a.d2r)-(b.d2r==null?999:b.d2r));
+  $("cnt-o").textContent=LISTDATA.ongoing.length;
+  ["notify","confirmed","ongoing"].forEach(renderTbl);
   if(d.diag && (d.diag.notes||[]).length){
     const box=$("diagbox"); box.style.display="block";
     box.innerHTML="<b>資料診斷</b>："+(d.diag.notes||[]).map(esc).join("；");
   }
 }
 const _dgt=document.getElementById("dispGtog");
-if(_dgt) _dgt.addEventListener("click",e=>{ dispGroup=!dispGroup; e.currentTarget.classList.toggle("on",dispGroup); ["notify","watch","confirmed","ongoing"].forEach(n=>renderTbl(n)); });
+if(_dgt) _dgt.addEventListener("click",e=>{ dispGroup=!dispGroup; e.currentTarget.classList.toggle("on",dispGroup); ["notify","confirmed","ongoing"].forEach(n=>renderTbl(n)); });
 boot();
 </script>
 </body>
